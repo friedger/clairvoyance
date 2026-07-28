@@ -199,8 +199,9 @@ impl Halt {
         self
     }
 
-    pub fn var(mut self, var_name: &str, var_value: Box<SymOp>) -> Self {
-        self.vars.push(VarOp::Set(var_name.try_into().unwrap(), *var_value));
+    pub fn var(mut self, contract_id: QualifiedContractIdentifier, var_name: &str, var_value: Box<SymOp>) -> Self {
+        let var_name = FullName(contract_id, ClarityName::try_from(var_name).unwrap());
+        self.vars.push(VarOp::Set(var_name, *var_value));
         self
     }
 
@@ -682,6 +683,36 @@ fn test_consolidate_subtract() {
     let simplified = symop.clone().simplify();
     info!("symop = {symop:?}, simplifed = {simplified:?}");
     assert_eq!(simplified, Ok(*vi("foo")));
+
+    // 0 - foo == Ok(0 - foo)
+    let symop = sub(vec![cu(0), vu("foo")]);
+    let simplified = symop.clone().simplify();
+    info!("symop = {symop:?}, simplifed = {simplified:?}");
+    assert_eq!(simplified, Ok(*symop));
+    
+    // foo - 0 - 0 == Ok(foo)
+    let symop = sub(vec![vi("foo"), ci(0), ci(0)]);
+    let simplified = symop.clone().simplify();
+    info!("symop = {symop:?}, simplifed = {simplified:?}");
+    assert_eq!(simplified, Ok(*vi("foo")));
+    
+    // 0 - 0 - foo == Ok(0 - foo)
+    let symop = sub(vec![cu(0), cu(0), vu("foo")]);
+    let simplified = symop.clone().simplify();
+    info!("symop = {symop:?}, simplifed = {simplified:?}");
+    assert_eq!(simplified, Ok(*sub(vec![cu(0), vu("foo")])));
+    
+    // 0 - foo - 0 == Ok(0 - foo)
+    let symop = sub(vec![cu(0), vu("foo"), cu(0)]);
+    let simplified = symop.clone().simplify();
+    info!("symop = {symop:?}, simplifed = {simplified:?}");
+    assert_eq!(simplified, Ok(*sub(vec![cu(0), vu("foo")])));
+    
+    // 0 - 0 - foo - 0 - 0 == Ok(0 - foo)
+    let symop = sub(vec![cu(0), cu(0), vu("foo"), cu(0), cu(0)]);
+    let simplified = symop.clone().simplify();
+    info!("symop = {symop:?}, simplifed = {simplified:?}");
+    assert_eq!(simplified, Ok(*sub(vec![cu(0), vu("foo")])));
 }
 
 #[test]
@@ -1796,7 +1827,7 @@ fn test_bind_symbol() {
 
 
     info!("symop = {symop:?}, simplifed = {simplified:?}");
-    assert_eq!(simplified, *cu(11));
+    assert_eq!(simplified, *co(valu(11)));
 }
 
 
@@ -1996,8 +2027,8 @@ fn test_halt_begin() {
                 pi(var_get(sb("y")))
             ]))
             .formula(cb(true))
-            .var("x", lv("x", cb(false)))
-            .var("y", lv("y", cb(false))),
+            .var(contract_id.clone(), "x", lv("x", cb(false)))
+            .var(contract_id.clone(), "y", lv("y", cb(false))),
 
         Halt::new()
             .pred(pand(vec![
@@ -2005,7 +2036,7 @@ fn test_halt_begin() {
                 pi(var_get(sb("y")))
             ]))
             .formula(cb(true))
-            .var("y", lv("y", cb(false))),
+            .var(contract_id.clone(), "y", lv("y", cb(false))),
 
         Halt::new()
             .pred(pand(vec![
@@ -2013,7 +2044,7 @@ fn test_halt_begin() {
                 pnot(pi(var_get(sb("y"))))
             ]))
             .formula(cb(true))
-            .var("x", lv("x", cb(false))),
+            .var(contract_id.clone(), "x", lv("x", cb(false))),
 
         Halt::new()
             .pred(pand(vec![
@@ -2423,7 +2454,7 @@ fn test_halt_symop_if_sym_var() {
 #[test]
 fn test_halt_symop_var_set_if_sym_var() {
     let contract_id = default_contract_id();
-    let mut symbex = Symbex::from_contract(contract_id,
+    let mut symbex = Symbex::from_contract(contract_id.clone(),
         "(define-data-var x bool true) (define-data-var y uint u0) (if (var-get x) (var-set y u2) (var-set y u3))",
     ).unwrap();
     let termination_states = symbex.eval_all().unwrap();
@@ -2435,12 +2466,12 @@ fn test_halt_symop_var_set_if_sym_var() {
         Halt::new()
             .pred(pi(var_get(sb("x"))))
             .formula(cb(true))
-            .var("y", lv("y", cu(2))),
+            .var(contract_id.clone(), "y", lv("y", cu(2))),
 
         Halt::new()
             .pred(pnot(pi(var_get(sb("x")))))
             .formula(cb(true))
-            .var("y", lv("y", cu(3)))
+            .var(contract_id.clone(), "y", lv("y", cu(3)))
     ]);
 }
 
@@ -2470,14 +2501,14 @@ fn test_halt_symop_multiple_var_set_if_sym_var() {
         Halt::new()
             .pred(pi(var_get(sb("x"))))
             .formula(cb(true))
-            .var("y", lv("y", cu(2)))
-            .var("z", lv("z", cu(20))),
+            .var(contract_id.clone(), "y", lv("y", cu(2)))
+            .var(contract_id.clone(), "z", lv("z", cu(20))),
 
         Halt::new()
             .pred(pnot(pi(var_get(sb("x")))))
             .formula(cb(true))
-            .var("y", lv("y", cu(3)))
-            .var("z", lv("z", cu(30)))
+            .var(contract_id.clone(), "y", lv("y", cu(3)))
+            .var(contract_id.clone(), "z", lv("z", cu(30)))
     ]);
 }
 
@@ -2846,12 +2877,12 @@ fn test_halt_function_call_if_branch_pre_post_vars() {
         Halt::new()
             .pred(peq(rem(var_get(su("v")), cu(2)), cu(0)))
             .formula(cb(true))
-            .var("v", add(vec![cu(1), var_get(su("v"))])),
+            .var(contract_id.clone(), "v", add(vec![cu(1), var_get(su("v"))])),
 
         Halt::new()
             .pred(pnot(peq(rem(var_get(su("v")), cu(2)), cu(0))))
             .formula(cb(true))
-            .var("v", add(vec![cu(3), var_get(su("v"))]))
+            .var(contract_id.clone(), "v", add(vec![cu(3), var_get(su("v"))]))
     ]);
 }
 
@@ -2883,8 +2914,8 @@ fn test_halt_var_get_set_tower() {
         Halt::new()
             .pred(pt())
             .formula(add(vec![cu(6), var_get(su("w"))]))
-            .var("w", add(vec![cu(5), var_get(su("w"))]))
-            .var("v", add(vec![cu(6), var_get(su("w"))]))
+            .var(contract_id.clone(), "w", add(vec![cu(5), var_get(su("w"))]))
+            .var(contract_id.clone(), "v", add(vec![cu(6), var_get(su("w"))]))
     ]);
 }
 
@@ -2927,26 +2958,26 @@ fn test_halt_var_get_set_if_tree() {
                 cu(0)
             ]))
             .formula(cl(vec![valu(101), valu(101)]))
-            .var("v", cu(101))
-            .var("w", cu(101)),
+            .var(contract_id.clone(), "v", cu(101))
+            .var(contract_id.clone(), "w", cu(101)),
 
         Halt::new()
             .pred(pand(vec![peq(rem(var_get(su("v")), cu(2)), cu(0)), pnot(peq(rem(var_get(su("w")), cu(2)), cu(0)))]))
             .formula(cl(vec![valu(201), valu(200)]))
-            .var("v", cu(201))
-            .var("w", cu(200)),
+            .var(contract_id.clone(), "v", cu(201))
+            .var(contract_id.clone(), "w", cu(200)),
 
         Halt::new()
             .pred(pand(vec![pnot(peq(rem(var_get(su("v")), cu(2)), cu(0))), peq(rem(var_get(su("w")), cu(2)), cu(0))]))
             .formula(cl(vec![valu(300), valu(301)]))
-            .var("v", cu(300))
-            .var("w", cu(301)),
+            .var(contract_id.clone(), "v", cu(300))
+            .var(contract_id.clone(), "w", cu(301)),
             
         Halt::new()
             .pred(pand(vec![pnot(peq(rem(var_get(su("v")), cu(2)), cu(0))), pnot(peq(rem(var_get(su("w")), cu(2)), cu(0)))]))
             .formula(cl(vec![valu(400), valu(400)]))
-            .var("v", cu(400))
-            .var("w", cu(400))
+            .var(contract_id.clone(), "v", cu(400))
+            .var(contract_id.clone(), "w", cu(400))
     ]);
 }
 
@@ -2982,26 +3013,26 @@ fn test_halt_var_get_set_tower_if_tree() {
                 cu(0)
             ]))
             .formula(add(vec![cu(6), var_get(su("w"))]))
-            .var("v", add(vec![cu(6), var_get(su("w"))]))
-            .var("w", add(vec![cu(5), var_get(su("w"))])),
+            .var(contract_id.clone(), "v", add(vec![cu(6), var_get(su("w"))]))
+            .var(contract_id.clone(), "w", add(vec![cu(5), var_get(su("w"))])),
 
         Halt::new()
             .pred(pand(vec![peq(rem(var_get(su("v")), cu(2)), cu(0)), pnot(peq(rem(var_get(su("w")), cu(2)), cu(0)))]))
             .formula(add(vec![cu(24), var_get(su("w"))]))
-            .var("v", add(vec![cu(24), var_get(su("w"))]))
-            .var("w", add(vec![cu(23), var_get(su("w"))])),
+            .var(contract_id.clone(), "v", add(vec![cu(24), var_get(su("w"))]))
+            .var(contract_id.clone(), "w", add(vec![cu(23), var_get(su("w"))])),
 
         Halt::new()
             .pred(pand(vec![pnot(peq(rem(var_get(su("v")), cu(2)), cu(0))), peq(rem(var_get(su("w")), cu(2)), cu(0))]))
             .formula(add(vec![cu(42), var_get(su("w"))]))
-            .var("v", add(vec![cu(42), var_get(su("w"))]))
-            .var("w", add(vec![cu(32), var_get(su("w"))])),
+            .var(contract_id.clone(), "v", add(vec![cu(42), var_get(su("w"))]))
+            .var(contract_id.clone(), "w", add(vec![cu(32), var_get(su("w"))])),
 
         Halt::new()
             .pred(pand(vec![pnot(peq(rem(var_get(su("v")), cu(2)), cu(0))), pnot(peq(rem(var_get(su("w")), cu(2)), cu(0)))]))
             .formula(add(vec![cu(60), var_get(su("w"))]))
-            .var("v", add(vec![cu(60), var_get(su("w"))]))
-            .var("w", add(vec![cu(50), var_get(su("w"))]))
+            .var(contract_id.clone(), "v", add(vec![cu(60), var_get(su("w"))]))
+            .var(contract_id.clone(), "w", add(vec![cu(50), var_get(su("w"))]))
     ]);
 }
 
@@ -3041,7 +3072,7 @@ fn test_halt_var_get_set_if_sequence() {
                 cu(0)
             ]))
             .formula(lcons(vec![var_get(su("v")), cu(40)]))
-            .var("w", cu(40)),
+            .var(contract_id.clone(), "w", cu(40)),
 
         Halt::new()
             .pred(pand(vec![
@@ -3053,8 +3084,8 @@ fn test_halt_var_get_set_if_sequence() {
                 pnot(peq(rem(var_get(su("v")), cu(5)), cu(0)))
             ]))
             .formula(cl(vec![valu(6), valu(30)]))
-            .var("v", cu(6))
-            .var("w", cu(30)),
+            .var(contract_id.clone(), "v", cu(6))
+            .var(contract_id.clone(), "w", cu(30)),
 
         Halt::new()
             .pred(pand(vec![
@@ -3062,20 +3093,22 @@ fn test_halt_var_get_set_if_sequence() {
                 pnot(peq(rem(var_get(su("v")), cu(3)), cu(0))),
             ]))
             .formula(cl(vec![valu(5), valu(40)]))
-            .var("v", cu(5))
-            .var("w", cu(40)),
+            .var(contract_id.clone(), "v", cu(5))
+            .var(contract_id.clone(), "w", cu(40)),
 
         Halt::new()
             .pred(pnot(peq(rem(var_get(su("v")), cu(2)), cu(0))))
             .formula(cl(vec![valu(5), valu(40)]))
-            .var("v", cu(5))
-            .var("w", cu(40)),
+            .var(contract_id.clone(), "v", cu(5))
+            .var(contract_id.clone(), "w", cu(40)),
     ])
 }
 
 #[test]
 fn test_halt_simplify_var_get_const() {
-    let symop = SymOp::LoadedDataVariable("foo".try_into().unwrap(), Box::new(SymOp::Constant(Value::UInt(3))));
+    let contract_id = default_contract_id();
+    let var_name = FullName(contract_id, "foo".try_into().unwrap());
+    let symop = SymOp::LoadedDataVariable(var_name, Box::new(SymOp::Constant(Value::UInt(3))));
     let simplified = symop.clone().simplify().unwrap();
     info!("symop = {symop:?}, simplifed = {simplified:?}");
     assert_eq!(simplified, *cu(3));
@@ -3114,7 +3147,7 @@ fn test_halt_let_bind() {
         Halt::new()
             .pred(pt())
             .formula(cb(true))
-            .var("v", add(vec![cu(3), var_get(su("v"))]))
+            .var(contract_id.clone(), "v", add(vec![cu(3), var_get(su("v"))]))
     ]);
 }
 
@@ -3140,12 +3173,12 @@ fn test_halt_if_let_bind() {
         Halt::new()
             .pred(peq(rem(var_get(su("v")), cu(2)), cu(0)))
             .formula(cb(true))
-            .var("v", add(vec![cu(1), var_get(su("v"))])),
+            .var(contract_id.clone(), "v", add(vec![cu(1), var_get(su("v"))])),
         
         Halt::new()
             .pred(pnot(peq(rem(var_get(su("v")), cu(2)), cu(0))))
             .formula(cb(true))
-            .var("v", add(vec![cu(2), var_get(su("v"))]))
+            .var(contract_id.clone(), "v", add(vec![cu(2), var_get(su("v"))]))
     ]);
 }
 
@@ -3173,12 +3206,12 @@ fn test_halt_if_let_var_set_bind() {
         Halt::new()
             .pred(peq(rem(var_get(su("v")), cu(2)), cu(0)))
             .formula(cb(true))
-            .var("v", cu(10)),
+            .var(contract_id.clone(), "v", cu(10)),
 
         Halt::new()
             .pred(pnot(peq(rem(var_get(su("v")), cu(2)), cu(0))))
             .formula(cb(true))
-            .var("v", add(vec![cu(2), var_get(su("v"))]))
+            .var(contract_id.clone(), "v", add(vec![cu(2), var_get(su("v"))]))
     ]);
 }
 
@@ -4172,7 +4205,7 @@ fn test_halt_limit_function_exploration() {
     assert_halts(termination_states, vec![
         Halt::new()
             .pred(pt())
-            .formula(fcall(&format!("{contract_id}.store-squares"), vec![cu(2), cu(3)]))
+            .formula(fcall(&format!("{contract_id}.ignored-function"), vec![cu(3), cu(2)]))
             .reachable_map_write(contract_id.clone(), "squares")
     ]);
 }
@@ -4497,6 +4530,79 @@ fn test_halt_trait_contract_call() {
                 (define-trait calc
                     (
                         (add (uint uint) (response uint uint))
+                    )
+                )
+                "#.to_string(),
+                None
+            ),
+            (
+                library_contract_id.clone(),
+                r#"
+                (impl-trait .library-trait.calc)
+
+                (define-public (add (x uint) (y uint))
+                    (ok (+ x y)))
+                "#.to_string(),
+                None
+            ),
+            (
+                client_contract_id.clone(),
+                r#"
+                (use-trait calc-trait .library-trait.calc)
+
+                (define-constant OP_ADD u0)
+
+                (define-constant ERR_NO_SUCH_OP u2000)
+
+                (define-public (compute (calc <calc-trait>) (op uint) (a uint) (b uint))
+                    (if (is-eq op OP_ADD)
+                        (contract-call? calc add a b)
+                        (err ERR_NO_SUCH_OP)))
+
+                "#.to_string(),
+                None
+            )
+        ],
+        2
+    )
+    .unwrap()
+    .skip_causally_independent(false)
+    .skip_pure(false) 
+    .concretize_trait(FullName(client_contract_id.clone(), "compute".try_into().unwrap()), "calc".try_into().unwrap(), library_contract_id.clone())
+    .init()
+    .unwrap();
+
+    let termination_states = symbex.eval_user_function("compute").unwrap();
+    for t in termination_states.iter() {
+        info!("{}", t.trace());
+        info!("termination state: ==================================\n{}\n", &t.clone().rollup());
+    }
+
+    assert_halts(termination_states, vec![
+        Halt::new()
+            .pred(peq(vu("op"), cu(0)))
+            .formula(ok(add2(vu("a"), vu("b")))),
+        
+        Halt::new()
+            .pred(pnot(peq(vu("op"), cu(0))))
+            .formula(cerr(valu(2000)))
+    ]);
+}
+
+
+#[test]
+fn test_callgraph_reachability_trait_contract_call() {
+    let trait_contract_id = make_contract_id("library-trait");
+    let library_contract_id = make_contract_id("library");
+    let client_contract_id = make_contract_id("client");
+
+    let symbex = Symbex::from_contracts(vec![
+            (
+                trait_contract_id.clone(),
+                r#"
+                (define-trait calc
+                    (
+                        (add (uint uint) (response uint uint))
                         (sub (uint uint) (response uint uint))
                         (mul (uint uint) (response uint uint))
                         (div (uint uint) (response uint uint))
@@ -4572,11 +4678,22 @@ fn test_halt_trait_contract_call() {
         2
     )
     .unwrap()
-    .skip_causally_independent(false);
+    .skip_causally_independent(false)
+    .concretize_trait(FullName(client_contract_id.clone(), "compute".try_into().unwrap()), "calc".try_into().unwrap(), library_contract_id.clone())
+    .init()
+    .unwrap();
 
     let fq_name = FullName(client_contract_id.clone(), "compute".try_into().unwrap());
-    let reachable = symbex.callgraph.reachable_from(&fq_name).unwrap();
+    let reachable = symbex.callgraph().reachable_from(&fq_name).unwrap();
     info!("reachable from 'compute': {:?}", &reachable);
+
+    assert_eq!(reachable, vec![
+        FullName(library_contract_id.clone(), "do-op-and-log".try_into().unwrap()),
+        FullName(library_contract_id.clone(), "div".try_into().unwrap()),
+        FullName(library_contract_id.clone(), "mul".try_into().unwrap()),
+        FullName(library_contract_id.clone(), "sub".try_into().unwrap()),
+        FullName(library_contract_id.clone(), "add".try_into().unwrap())
+    ]);
 }
 
         
@@ -4607,10 +4724,12 @@ fn test_callgraph_reachability_functions() {
         (compute u20 u4)
         "#,
     )
+    .unwrap()
+    .init()
     .unwrap();
 
     let fq_name = FullName(contract_id.clone(), "compute".try_into().unwrap());
-    let reachable = symbex.callgraph.reachable_from(&fq_name).unwrap();
+    let reachable = symbex.callgraph().reachable_from(&fq_name).unwrap();
     info!("reachable from 'compute': {:?}", &reachable);
 
     // call order is preserved, and no duplicates
@@ -4622,11 +4741,11 @@ fn test_callgraph_reachability_functions() {
     ]);
 
     let fq_name = FullName(contract_id.clone(), "div".try_into().unwrap());
-    let reachable = symbex.callgraph.reachable_from(&fq_name).unwrap();
+    let reachable = symbex.callgraph().reachable_from(&fq_name).unwrap();
     assert_eq!(reachable, vec![]);
 
     let fq_name = FullName(contract_id.clone(), "nope".try_into().unwrap());
-    let reachable = symbex.callgraph.reachable_from(&fq_name).unwrap_err();
+    let reachable = symbex.callgraph().reachable_from(&fq_name).unwrap_err();
     assert_eq!(reachable, Error::NotFound(format!("{fq_name}")));
 }
     
@@ -4687,10 +4806,13 @@ fn test_callgraph_reachability_contract_functions() {
             )
         ],
         1
-    ).unwrap();
+    )
+    .unwrap()
+    .init()
+    .unwrap();
 
     let fq_name = FullName(client_contract_id.clone(), "compute".try_into().unwrap());
-    let reachable = symbex.callgraph.reachable_from(&fq_name).unwrap();
+    let reachable = symbex.callgraph().reachable_from(&fq_name).unwrap();
     info!("reachable from 'compute': {:?}", &reachable);
 
     assert_eq!(reachable, vec![
@@ -4701,7 +4823,7 @@ fn test_callgraph_reachability_contract_functions() {
     ]);
     
     let fq_name = FullName(client_contract_id.clone(), "add-div".try_into().unwrap());
-    let reachable = symbex.callgraph.reachable_from(&fq_name).unwrap();
+    let reachable = symbex.callgraph().reachable_from(&fq_name).unwrap();
     info!("reachable from 'add-div': {:?}", &reachable);
 
     assert_eq!(reachable, vec![
@@ -4709,7 +4831,7 @@ fn test_callgraph_reachability_contract_functions() {
     ]);
     
     let fq_name = FullName(client_contract_id.clone(), "double".try_into().unwrap());
-    let reachable = symbex.callgraph.reachable_from(&fq_name).unwrap();
+    let reachable = symbex.callgraph().reachable_from(&fq_name).unwrap();
     info!("reachable from 'double': {:?}", &reachable);
     
     assert_eq!(reachable, vec![
@@ -4782,10 +4904,13 @@ fn test_callgraph_reachability_contract_map_reads() {
             )
         ],
         1
-    ).unwrap();
+    )
+    .unwrap()
+    .init()
+    .unwrap();
 
     let fq_name = FullName(client_contract_id.clone(), "compute".try_into().unwrap());
-    let map_accesses = symbex.callgraph.reachable_map_accesses_from(&fq_name).unwrap();
+    let map_accesses = symbex.callgraph().reachable_map_accesses_from(&fq_name).unwrap();
 
     let map_access_set : HashSet<_> = map_accesses.into_iter().collect();
     let expected_accesses : HashSet<_> = vec![
@@ -4797,7 +4922,7 @@ fn test_callgraph_reachability_contract_map_reads() {
     assert_eq!(map_access_set, expected_accesses);
     
     let fq_name = FullName(client_contract_id.clone(), "get-square".try_into().unwrap());
-    let map_accesses = symbex.callgraph.reachable_map_accesses_from(&fq_name).unwrap();
+    let map_accesses = symbex.callgraph().reachable_map_accesses_from(&fq_name).unwrap();
 
     let map_access_set : HashSet<_> = map_accesses.into_iter().collect();
     let expected_accesses : HashSet<_> = vec![
@@ -4808,7 +4933,7 @@ fn test_callgraph_reachability_contract_map_reads() {
     assert_eq!(map_access_set, expected_accesses);
     
     let fq_name = FullName(client_contract_id.clone(), "compute-quint".try_into().unwrap());
-    let map_accesses = symbex.callgraph.reachable_map_accesses_from(&fq_name).unwrap();
+    let map_accesses = symbex.callgraph().reachable_map_accesses_from(&fq_name).unwrap();
 
     let map_access_set : HashSet<_> = map_accesses.into_iter().collect();
     let expected_accesses : HashSet<_> = vec![
@@ -4820,7 +4945,7 @@ fn test_callgraph_reachability_contract_map_reads() {
     assert_eq!(map_access_set, expected_accesses);
     
     let fq_name = FullName(client_contract_id.clone(), "insert-quint".try_into().unwrap());
-    let map_accesses = symbex.callgraph.reachable_map_accesses_from(&fq_name).unwrap();
+    let map_accesses = symbex.callgraph().reachable_map_accesses_from(&fq_name).unwrap();
 
     let map_access_set : HashSet<_> = map_accesses.into_iter().collect();
     let expected_accesses : HashSet<_> = HashSet::new();
@@ -4859,10 +4984,12 @@ fn test_callgraph_reachability_map_reads() {
         (compute u21)
         "#,
     )
+    .unwrap()
+    .init()
     .unwrap();
 
     let fq_name = FullName(contract_id.clone(), "compute".try_into().unwrap());
-    let map_accesses = symbex.callgraph.reachable_map_accesses_from(&fq_name).unwrap();
+    let map_accesses = symbex.callgraph().reachable_map_accesses_from(&fq_name).unwrap();
 
     let map_access_set : HashSet<_> = map_accesses.into_iter().collect();
     let expected_accesses : HashSet<_> = vec![
@@ -4873,7 +5000,7 @@ fn test_callgraph_reachability_map_reads() {
     assert_eq!(map_access_set, expected_accesses);
     
     let fq_name = FullName(contract_id.clone(), "get-square".try_into().unwrap());
-    let map_accesses = symbex.callgraph.reachable_map_accesses_from(&fq_name).unwrap();
+    let map_accesses = symbex.callgraph().reachable_map_accesses_from(&fq_name).unwrap();
 
     let map_access_set : HashSet<_> = map_accesses.into_iter().collect();
     let expected_accesses : HashSet<_> = vec![
@@ -4883,7 +5010,7 @@ fn test_callgraph_reachability_map_reads() {
     assert_eq!(map_access_set, expected_accesses);
     
     let fq_name = FullName(contract_id.clone(), "get-cube".try_into().unwrap());
-    let map_accesses = symbex.callgraph.reachable_map_accesses_from(&fq_name).unwrap();
+    let map_accesses = symbex.callgraph().reachable_map_accesses_from(&fq_name).unwrap();
 
     let map_access_set : HashSet<_> = map_accesses.into_iter().collect();
     let expected_accesses : HashSet<_> = vec![
@@ -4894,7 +5021,7 @@ fn test_callgraph_reachability_map_reads() {
     assert_eq!(map_access_set, expected_accesses);
     
     let fq_name = FullName(contract_id.clone(), "insert-cube".try_into().unwrap());
-    let map_accesses = symbex.callgraph.reachable_map_accesses_from(&fq_name).unwrap();
+    let map_accesses = symbex.callgraph().reachable_map_accesses_from(&fq_name).unwrap();
 
     let map_access_set : HashSet<_> = map_accesses.into_iter().collect();
     let expected_accesses : HashSet<_> = HashSet::new();
@@ -4967,10 +5094,13 @@ fn test_callgraph_reachability_contract_map_writes() {
             )
         ],
         1
-    ).unwrap();
+    )
+    .unwrap()
+    .init()
+    .unwrap();
 
     let fq_name = FullName(client_contract_id.clone(), "compute".try_into().unwrap());
-    let map_mutations = symbex.callgraph.reachable_map_mutations_from(&fq_name).unwrap();
+    let map_mutations = symbex.callgraph().reachable_map_mutations_from(&fq_name).unwrap();
 
     let map_mutation_set : HashSet<_> = map_mutations.into_iter().collect();
     let expected_mutations : HashSet<_> = vec![
@@ -4982,7 +5112,7 @@ fn test_callgraph_reachability_contract_map_writes() {
     assert_eq!(map_mutation_set, expected_mutations);
     
     let fq_name = FullName(client_contract_id.clone(), "insert-quint".try_into().unwrap());
-    let map_mutations = symbex.callgraph.reachable_map_mutations_from(&fq_name).unwrap();
+    let map_mutations = symbex.callgraph().reachable_map_mutations_from(&fq_name).unwrap();
 
     let map_mutation_set : HashSet<_> = map_mutations.into_iter().collect();
     let expected_mutations : HashSet<_> = vec![
@@ -5021,10 +5151,12 @@ fn test_callgraph_reachability_map_writes() {
         (compute u21)
         "#,
     )
+    .unwrap()
+    .init()
     .unwrap();
 
     let fq_name = FullName(contract_id.clone(), "compute".try_into().unwrap());
-    let map_mutations = symbex.callgraph.reachable_map_mutations_from(&fq_name).unwrap();
+    let map_mutations = symbex.callgraph().reachable_map_mutations_from(&fq_name).unwrap();
 
     let map_mutation_set : HashSet<_> = map_mutations.into_iter().collect();
     let expected_mutations : HashSet<_> = vec![
@@ -5036,7 +5168,7 @@ fn test_callgraph_reachability_map_writes() {
     assert_eq!(map_mutation_set, expected_mutations);
     
     let fq_name = FullName(contract_id.clone(), "set-square".try_into().unwrap());
-    let map_mutations = symbex.callgraph.reachable_map_mutations_from(&fq_name).unwrap();
+    let map_mutations = symbex.callgraph().reachable_map_mutations_from(&fq_name).unwrap();
 
     let map_mutation_set : HashSet<_> = map_mutations.into_iter().collect();
     let expected_mutations : HashSet<_> = vec![
@@ -5074,10 +5206,12 @@ fn test_callgraph_reachability_var_writes() {
         (compute u21)
         "#,
     )
+    .unwrap()
+    .init()
     .unwrap();
 
     let fq_name = FullName(contract_id.clone(), "compute".try_into().unwrap());
-    let var_mutations = symbex.callgraph.reachable_var_mutations_from(&fq_name).unwrap();
+    let var_mutations = symbex.callgraph().reachable_var_mutations_from(&fq_name).unwrap();
     
     let var_mutation_set : HashSet<_> = var_mutations.into_iter().collect();
     let expected_mutations : HashSet<_> = vec![
@@ -5089,7 +5223,7 @@ fn test_callgraph_reachability_var_writes() {
     assert_eq!(var_mutation_set, expected_mutations);
     
     let fq_name = FullName(contract_id.clone(), "set-square".try_into().unwrap());
-    let var_mutations = symbex.callgraph.reachable_var_mutations_from(&fq_name).unwrap();
+    let var_mutations = symbex.callgraph().reachable_var_mutations_from(&fq_name).unwrap();
     
     let var_mutation_set : HashSet<_> = var_mutations.into_iter().collect();
     let expected_mutations : HashSet<_> = vec![
@@ -5129,10 +5263,12 @@ fn test_callgraph_reachability_var_reads() {
         (compute u21)
         "#,
     )
+    .unwrap()
+    .init()
     .unwrap();
 
     let fq_name = FullName(contract_id.clone(), "compute".try_into().unwrap());
-    let var_accesses = symbex.callgraph.reachable_var_accesses_from(&fq_name).unwrap();
+    let var_accesses = symbex.callgraph().reachable_var_accesses_from(&fq_name).unwrap();
     
     let var_access_set : HashSet<_> = var_accesses.into_iter().collect();
     let expected_accesses : HashSet<_> = vec![
@@ -5143,7 +5279,7 @@ fn test_callgraph_reachability_var_reads() {
     assert_eq!(var_access_set, expected_accesses);
     
     let fq_name = FullName(contract_id.clone(), "get-square".try_into().unwrap());
-    let var_accesses = symbex.callgraph.reachable_var_accesses_from(&fq_name).unwrap();
+    let var_accesses = symbex.callgraph().reachable_var_accesses_from(&fq_name).unwrap();
     
     let var_access_set : HashSet<_> = var_accesses.into_iter().collect();
     let expected_accesses : HashSet<_> = vec![
