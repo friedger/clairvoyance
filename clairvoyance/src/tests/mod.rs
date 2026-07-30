@@ -67,6 +67,7 @@ fn cl(fields: Vec<Value>) -> Box<SymOp> { Box::new(SymOp::Constant(vall(fields))
 fn co(val: Value) -> Box<SymOp> { Box::new(SymOp::Constant(Value::some(val).unwrap())) }
 fn cok(val: Value) -> Box<SymOp> { Box::new(SymOp::Constant(Value::okay(val).unwrap())) }
 fn cerr(val: Value) -> Box<SymOp> { Box::new(SymOp::Constant(Value::error(val).unwrap())) }
+fn csb(val: Vec<u8>) -> Box<SymOp> { Box::new(SymOp::Constant(Value::buff_from(val).unwrap())) }
 
 fn si(name: &str) -> Sym { Sym::Int(name.into()) }
 fn su(name: &str) -> Sym { Sym::UInt(name.into()) }
@@ -101,6 +102,7 @@ fn mul(ops: Vec<Box<SymOp>>) -> Box<SymOp> { Box::new(SymOp::Multiply(ops)) }
 fn mul2(op1: Box<SymOp>, op2: Box<SymOp>) -> Box<SymOp> { mul(vec![op1, op2]) }
 fn div(ops: Vec<Box<SymOp>>) -> Box<SymOp> { Box::new(SymOp::Divide(ops)) }
 fn rem(op1: Box<SymOp>, op2: Box<SymOp>) -> Box<SymOp> { Box::new(SymOp::Modulo(op1, op2)) }
+fn concat(ops: Vec<Box<SymOp>>) -> Box<SymOp> { Box::new(SymOp::Concat(ops)) }
 fn and(ops: Vec<Box<SymOp>>) -> Box<SymOp> { Box::new(SymOp::And(ops)) }
 fn or(ops: Vec<Box<SymOp>>) -> Box<SymOp> { Box::new(SymOp::Or(ops)) }
 fn not(op: Box<SymOp>) -> Box<SymOp> { Box::new(SymOp::Not(op)) }
@@ -828,6 +830,39 @@ fn test_consolidate_modulus() {
     let simplified = symop.clone().simplify();
     info!("symop = {symop:?}, simplifed = {simplified:?}");
     assert_eq!(simplified, Ok(*symop));
+}
+
+#[test]
+fn test_consolidate_concat() {
+    // (concat 0x01 0x02) == 0x0102
+    let symop = concat(vec![csb(vec![1]), csb(vec![2])]);
+    let simplified = symop.clone().simplify();
+    info!("symop = {symop:?}, simplifed = {simplified:?}");
+    assert_eq!(simplified, Ok(*csb(vec![1, 2])));
+    
+    // (concat 0x01 0x02 0x03 0x04) == 0x01020304
+    let symop = concat(vec![csb(vec![1]), csb(vec![2]), csb(vec![3]), csb(vec![4])]);
+    let simplified = symop.clone().simplify();
+    info!("symop = {symop:?}, simplifed = {simplified:?}");
+    assert_eq!(simplified, Ok(*csb(vec![1, 2, 3, 4])));
+
+    // (concat 0x01 (concat 0x02 0x03) 0x04) = 0x01020304
+    let symop = concat(vec![csb(vec![1]), concat(vec![csb(vec![2]), csb(vec![3])]), csb(vec![4])]);
+    let simplified = symop.clone().simplify();
+    info!("symop = {symop:?}, simplifed = {simplified:?}");
+    assert_eq!(simplified, Ok(*csb(vec![1, 2, 3, 4])));
+
+    // (cocnat 0x01 x 0x02) = (concat 0x01 x 0x02)
+    let symop = concat(vec![csb(vec![1]), vsb("x", 1), csb(vec![2])]);
+    let simplified = symop.clone().simplify();
+    info!("symop = {symop:?}, simplifed = {simplified:?}");
+    assert_eq!(simplified, Ok(*symop));
+
+    // (concat 0x01 (concat 0x02 x 0x03) 0x04) = (concat 0x0102 x 0x0304)
+    let symop = concat(vec![csb(vec![1]), concat(vec![csb(vec![2]), vsb("x", 1), csb(vec![3])]), csb(vec![4])]);
+    let simplified = symop.clone().simplify();
+    info!("symop = {symop:?}, simplifed = {simplified:?}");
+    assert_eq!(simplified, Ok(*concat(vec![csb(vec![1, 2]), vsb("x", 1), csb(vec![3, 4])])));
 }
 
 #[test]

@@ -43,6 +43,7 @@ use clarity::vm::errors::RuntimeError;
 use clarity::vm::analysis::errors::SyntaxBindingErrorType;
 use clarity::vm::types::signatures::parse_name_type_pairs;
 use clarity::vm::analysis::type_checker::contexts::TypeMap;
+use clarity::vm::types::TypeSignatureExt;
 
 use clarity_types::types::SequencedValue;
 use clarity_types::types::signatures::{SequenceSubtype, TupleTypeSignature, CallableSubtype, StringSubtype, ListTypeData};
@@ -2059,6 +2060,8 @@ impl SymOp {
     }
 
     /// Fold and propagate constants in a Divide(..)
+    /// TODO: use GCD for constants
+    /// TODO: polynomial division?
     fn simplify_divide(ops: Vec<Box<SymOp>>) -> Result<SymOp, Error> {
         // don't do fraction reduction, but do remove constant multiplication if the
         // numerator is a multiple of the denominator
@@ -4293,14 +4296,53 @@ impl SymOp {
                 }
             },
             Self::Concat(ops) => {
-                let mut simplified_ops = vec![];
+                let mut simplified_ops : Vec<Box<SymOp>> = vec![];
                 for op in ops.into_iter() {
                     simplified_ops.push(Box::new(op.simplify()?));
                 }
-               
-                // TODO: flatten nested concats
-                // TODO: merge constants
-                Ok(Self::Concat(simplified_ops))
+                let mut flattened_ops : Vec<Box<SymOp>> = vec![];
+                for op in simplified_ops.into_iter() {
+                    if let Self::Concat(inner) = *op {
+                        flattened_ops.extend(inner.into_iter());
+                    }
+                    else {
+                        flattened_ops.push(op);
+                    }
+                }
+                let mut folded_ops : Vec<Box<SymOp>> = vec![];
+                let mut cur_constant = None;
+                for op in flattened_ops.into_iter() {
+                    if let Self::Constant(c) = *op {
+                        if let Some(cur_c) = cur_constant.take() {
+                            let v = Self::context_free_clarity_eval_mainnet(vec![
+                                SymbolicExpression::atom("concat".try_into()?),
+                                SymbolicExpression::literal_value(cur_c),
+                                SymbolicExpression::literal_value(c),
+                            ])?
+                            .ok_or_else(|| Error::Bug("Clarity VM evaluated to None".into()))?;
+                            cur_constant = Some(v);
+                        }
+                        else {
+                            cur_constant = Some(c);
+                        }
+                    }
+                    else {
+                        if let Some(cur_constant) = cur_constant.take() {
+                            folded_ops.push(Box::new(Self::Constant(cur_constant)));
+                        }
+                        folded_ops.push(op);
+                    }
+                }
+                if let Some(cur_constant) = cur_constant.take() {
+                    if folded_ops.len() == 0 {
+                        return Ok(Self::Constant(cur_constant));
+                    }
+
+                    folded_ops.push(Box::new(Self::Constant(cur_constant)));
+                }
+
+                assert!(folded_ops.len() > 1, "Too few folded ops");
+                Ok(Self::Concat(folded_ops))
             },
             Self::AsMaxLen(op1, op2) => {
                 Self::simplify_native_2args("as-max-len?", op1, op2, |x, y| Self::AsMaxLen(x, y))
@@ -5692,6 +5734,14 @@ impl Continuation {
         cont
     }
 
+    /// Bind this continuation's global constants to symbols
+    fn bind_globals(&self, symop: SymOp) -> SymOp {
+        *symop
+            .bind_symbol("tx-sender".into(), self.get_tx_sender())
+            .bind_symbol("contract-caller".into(), self.get_contract_caller())
+            .bind_symbol("tx-sponsor?".into(), self.get_tx_sponsor())
+    }
+
     /// Given a pre-evaluated "free" continuation representing a function (i.e. where all input and output
     /// variables are free), and given a parent continuation which "calls" this function (i.e.
     /// it binds all of the input symbols), compute a new continuation from the free continuation
@@ -5701,8 +5751,6 @@ impl Continuation {
     pub fn from_evaluated(free: &Continuation, function_path: String, parent: Rc<Continuation>) -> Result<Self, Error> {
         assert!(!parent.panicking, "BUG: tried to continue from a panic");
 
-        // TODO: bind contract-caller and tx-sender
-       
         assert_eq!(free.bound_formulae.len(), 0);
         let mut bound_formulae = free.bound_formulae.clone();
         bound_formulae.extend(parent.bound_formulae.clone().into_iter());
@@ -5712,6 +5760,7 @@ impl Continuation {
             debug!("Bind predicate symbol {sym_id} = {symop}");
             free_predicate = *free_predicate.bind_symbol(sym_id.clone(), symop.clone());
         }
+        free_predicate = parent.bind_globals(free_predicate);
         let predicate = free_predicate.and(parent.predicate.clone().as_symop()).try_as_predicate()?;
 
         let mut final_formula = free.final_formula.clone();
@@ -5719,6 +5768,7 @@ impl Continuation {
             debug!("Bind final formula symbol {sym_id} = {symop}");
             final_formula = *final_formula.bind_symbol(sym_id.clone(), symop.clone());
         }
+        final_formula = parent.bind_globals(final_formula);
         
         let mut post_vars = vec![];
         for op in free.post_vars.iter() {
@@ -5731,6 +5781,7 @@ impl Continuation {
                         debug!("Bind (var-set {n}) symbol {sym_id} = {symop}");
                         new_op = new_op.bind_symbol(sym_id.clone(), symop).simplify()?;
                     }
+                    new_op = parent.bind_globals(new_op);
                     VarOp::Set(n.clone(), new_op)
                 }
             };
@@ -5746,6 +5797,7 @@ impl Continuation {
                     debug!("Bind (pre-map-write {map_name} {key_sym}) symbol {sym_id} = {symop}");
                     new_key_sym = new_key_sym.bind_symbol(sym_id.clone(), symop.clone()).simplify()?;
                 }
+                new_key_sym = parent.bind_globals(new_key_sym);
                 if let Some(new_map_info) = pre_map_state.get_mut(map_name) {
                     new_map_info.insert(new_key_sym);
                 }
@@ -5768,6 +5820,8 @@ impl Continuation {
                     new_key_sym = new_key_sym.bind_symbol(sym_id.clone(), symop.clone()).simplify()?;
                     new_val_sym = new_val_sym.bind_symbol(sym_id.clone(), symop.clone()).simplify()?;
                 }
+                new_key_sym = parent.bind_globals(new_key_sym);
+                new_val_sym = parent.bind_globals(new_val_sym);
                 if let Some(new_map_info) = map_state.get_mut(map_name) {
                     new_map_info.insert(new_key_sym, new_val_sym);
                 }
@@ -5788,6 +5842,7 @@ impl Continuation {
                     debug!("Bind (map-delete {map_name} {key_sym}) symbol {sym_id} = {symop}");
                     new_key_sym = new_key_sym.bind_symbol(sym_id.clone(), symop.clone()).simplify()?;
                 }
+                new_key_sym = parent.bind_globals(new_key_sym);
                 if let Some(new_map_info) = map_tombstones.get_mut(map_name) {
                     new_map_info.insert(new_key_sym);
                 }
@@ -6297,7 +6352,7 @@ impl Continuation {
 
         let old_cont_str = self.to_string();
         let old_trace = self.trace();
-        
+
         let merged = Self {
             id: next_cont_id(),
             bound_formulae: self.bound_formulae.clone(),
@@ -6342,7 +6397,7 @@ impl Continuation {
             "".to_string()
         };
         debug!("Roll up continuation {} to ancestor {:?} to create continuation {} {} {}", self.id, ancestor_id, merged.id, &bound_formulae_str, &unbound_formulae_str);
-        debug!("Continuation name: {}", merged.function_path.as_ref().map(|s| s.as_str()).unwrap_or(""));
+        debug!("Continuation name: {}", merged.get_function_path());
         debug!("Continuation:\n{}", &merged);
         debug!("Trace:\n{}", &merged.trace());
         debug!("Old continuation:\n{old_cont_str}");
@@ -6525,6 +6580,11 @@ impl Continuation {
         self.reachable_var_reads.extend(reachable_var_accesses.into_iter());
         self.reachable_var_writes.extend(reachable_var_mutations.into_iter());
         Ok(())
+    }
+
+    /// Get the function path for this continuation
+    pub fn get_function_path(&self) -> String {
+        self.function_path.as_ref().unwrap_or(&"".to_string()).to_string()
     }
 }
 
@@ -6791,7 +6851,8 @@ impl Callgraph {
                 continue;
             };
             let Some(first) = lv.first() else {
-                return Err(Error::Bug(format!("empty list in {func_name}")));
+                // this can happen with `as-contract?`, for example
+                continue;
             };
             if let Some(function_base_name) = first.match_atom() {
                 match function_base_name.as_str() {
@@ -7205,6 +7266,7 @@ impl Symbex {
            })
            .filter(|c| {
                if SymOp::Panic == c.final_formula {
+                   info!("Continuation {} ({}) always panics", c.id, c.get_function_path());
                    debug!("Continuation always panics:\n{c}");
                }
 
@@ -7213,6 +7275,7 @@ impl Symbex {
                    true
                }
                else {
+                   info!("Continuation {} ({}) is unreachable", c.id, c.get_function_path());
                    debug!("Continuation is unreachable:\n{c}");
                    false
                }
@@ -7289,6 +7352,7 @@ impl Symbex {
                     new_conts.push(cont);
                     continue;
                 }
+
                 // have exactly one child. Merge them.
                 let merged = cont.rollup_to(Some(parent_id));
                 considered.insert(parent_id);
@@ -7648,75 +7712,6 @@ impl Symbex {
         let fq_name = FullName(cur_contract.clone(), function_base_name.clone());
 
         if let Some(_func) = self.contract_context(&cur_contract)?.functions.get(function_base_name) {
-            /*
-            // can we skip this, or shorten our consideration?
-            let is_pure = self.callgraph().is_pure(&fq_name)?;
-            let is_root = continuation.caller.is_none();
-
-            let is_causally_independent = continuation.is_causally_independent(&fq_name, &self.callgraph())?;
-            if !self.explore_function_calls
-                || self.skip_function_calls.contains(&fq_name)
-                || (!is_root && is_pure && self.skip_pure_calls)
-                || (!is_root && is_causally_independent && self.skip_causally_independent_calls)
-            {
-                if !is_root && is_pure && self.skip_pure_calls {
-                    info!("Will not evaluate function {fq_name} from continuation {}, since it is pure", continuation.id);
-                }
-                if !is_root && is_causally_independent && self.skip_causally_independent_calls {
-                    info!("Will not evaluate function {fq_name} from continuation {}, since it is causally independent", continuation.id);
-                }
-
-                // skip this; treat this function call as a symbol
-                let parent_rc = Rc::new(continuation);
-                let skip_cont = Continuation::from_parent(parent_rc, format!("{function_name}/skipped"), start_line);
-                let mut skip_conts = vec![vec![(skip_cont, vec![])]];
-
-                // evaluate each argument 
-                for (i, arg) in lv.get(1..).unwrap_or(&[]).iter().enumerate() {
-                    let mut next_skip_conts = vec![];
-                    for skip_cont_set in skip_conts.into_iter() {
-                        let mut next_skip_cont_set = vec![];
-                        for (skip_cont, args_so_far) in skip_cont_set.into_iter() {
-                            if skip_cont.halted() {
-                                let mut args = args_so_far.clone();
-                                args.push(Box::new(skip_cont.final_formula.clone()));
-                                next_skip_cont_set.push(vec![(skip_cont, args)]);
-                                continue;
-                            }
-                            let next_conts = self.eval(Continuation::from_parent(Rc::new(skip_cont), format!("{function_name}/skipped/arg[{i}]"), arg.span.start_line), arg)?;
-                            let next_conts_and_args : Vec<_> = next_conts
-                                .into_iter()
-                                .map(|cont| {
-                                    let mut args = args_so_far.clone();
-                                    args.push(Box::new(cont.final_formula.clone()));
-                                    (cont, args)
-                                })
-                                .collect();
-
-                            next_skip_cont_set.push(next_conts_and_args);
-                        }
-                        next_skip_conts.extend(next_skip_cont_set.into_iter());
-                    }
-                    skip_conts = next_skip_conts;
-                }
-
-                // final continuation treats the function as a symbol
-                let mut final_conts = vec![];
-                for skip_cont_set in skip_conts.into_iter() {
-                    for (skip_cont, args) in skip_cont_set.into_iter() {
-                        if skip_cont.halted() {
-                            final_conts.push(skip_cont);
-                            continue;
-                        }
-                        let mut final_cont = Continuation::from_parent(Rc::new(skip_cont), format!("{function_name}/skipped/return"), start_line);
-                        final_cont.add_reachable_storage_accesses(&fq_name, &self.callgraph())?;
-                        final_cont.final_formula = SymOp::FunctionCall(fq_name.clone(), args);
-                        final_conts.push(final_cont);
-                    }
-                }
-                return Ok(Ok(Self::reduce_continuations(final_conts)));
-            }
-            */
             let continuation = match self.try_eval_causally_independent_contract_function(function_base_name, continuation, Some(lv), start_line) {
                 Ok(Ok(conts)) => {
                     return Ok(Ok(conts));
@@ -7730,96 +7725,6 @@ impl Symbex {
             if let Some(conts) = self.evaluated_functions.get(&fq_name) {
                 let evaled_conts = self.eval_precomputed_contract_function(function_base_name, continuation, conts, Some(lv), start_line)?;
                 Ok(Ok(evaled_conts))
-                /*
-                // going to evaluate a pre-evaluated function.
-                // bind each bound formula in this continuation to the simplified
-                // final formula and simplified final predicate.
-                let is_root = continuation.caller.is_none();
-                let mut evaled_conts = vec![vec![(continuation, vec![])]];
-                let mut final_conts = vec![];
-                for (i, arg) in lv.get(1..).unwrap_or(&[]).iter().enumerate() {
-                    let mut next_evaled_conts = vec![];
-                    for evaled_cont_set in evaled_conts.into_iter() {
-                        let mut next_evaled_cont_set = vec![];
-                        for (evaled_cont, args_so_far) in evaled_cont_set.into_iter() {
-                            if evaled_cont.halted() {
-                                final_conts.push(evaled_cont);
-                                continue;
-                            }
-                            let next_conts = self.eval(Continuation::from_parent(Rc::new(evaled_cont), format!("{function_name}/evaled/arg[{i}]"), arg.span.start_line), arg)?;
-                            let next_conts_and_args : Vec<_> = next_conts
-                                .into_iter()
-                                .map(|cont| {
-                                    let mut args = args_so_far.clone();
-                                    args.push(Box::new(cont.final_formula.clone()));
-                                    (cont, args)
-                                })
-                                .collect();
-
-                            next_evaled_cont_set.push(next_conts_and_args);
-                        }
-                        next_evaled_conts.extend(next_evaled_cont_set.into_iter());
-                    }
-                    evaled_conts = next_evaled_conts;
-                }
-                for evaled_cont_set in evaled_conts.into_iter() {
-                    for (evaled_cont, args) in evaled_cont_set.into_iter() {
-                        if evaled_cont.halted() {
-                            final_conts.push(evaled_cont);
-                            continue;
-                        }
-                        if args.len() != func.arguments.len() {
-                            return Err(Error::Bug(format!("Computed arguments ({}) does not match function type signature ({})", args.len(), func.arguments.len())));
-                        }
-
-                        let mut binding_cont = Continuation::from_parent(Rc::new(evaled_cont), format!("{function_name}/evaled/bind"), start_line);
-                        // NOTE: no need to unbind these symbols later, since the
-                        // continuation produced by Continuation::from_evaluated()
-                        // will not have any bound formulae (its final formula,
-                        // predicate, and state will instead have their free
-                        // variables bound to symops in the binding continuation)
-                        for (arg_name, arg_symop) in func.arguments.iter().zip(args.iter()) {
-                            binding_cont.bind_symop(arg_name, (*arg_symop.clone()).simplify()?);
-                        }
-
-                        let binding_cont_id = binding_cont.id;
-                        let binding_cont_rc = Rc::new(binding_cont);
-                        let mut pushed = 0;
-                        for cont in conts.iter() {
-                            let eval_cont = Continuation::from_evaluated(cont, format!("{function_name}/evaled"), binding_cont_rc.clone())?;
-                            if eval_cont.panicking {
-                                final_conts.push(eval_cont);
-                                continue;
-                            }
-
-                            if !is_root && self.skip_causally_independent_calls && binding_cont_rc.is_read_independent(&eval_cont)? && cont.is_read_only_so_far() {
-                                info!("Will not evaluate function {fq_name} free continuation {}, since it is causally read-independent of binding continuation {}", cont.id, binding_cont_rc.id);
-                                continue;
-                            }
-
-                            if self.drop_early_returns.contains(&fq_name) && eval_cont.early_return {
-                                info!("Will not evaluate early-return continuation {} of {fq_name}", cont.id);
-                                continue;
-                            }
-
-                            let return_cont = Continuation::from_callee(Rc::new(eval_cont), format!("{function_name}/evaled/return"), func.body.span.start_line);
-                            final_conts.push(return_cont);
-                            pushed += 1;
-                        }
-                        if pushed == 0 {
-                            // all continuations are read-independent of the
-                            // binding continuation, so we can skip
-                            info!("All continuations of {fq_name} are read-independent of continuation {}", binding_cont_id);
-                            let mut final_cont = Continuation::from_parent(binding_cont_rc, format!("{function_name}/eval-skipped/return"), start_line);
-                            final_cont.add_reachable_storage_accesses(&fq_name, &self.callgraph())?;
-                            final_cont.final_formula = SymOp::FunctionCall(fq_name.clone(), args);
-                            final_conts.push(final_cont);
-                        }
-                    }
-                }
-
-                return Ok(Ok(Self::reduce_continuations(final_conts)));
-                */
             }
             else {
                 return self.apply_user_function(continuation, function_base_name, lv.get(1..).unwrap_or(&[]))
@@ -7827,10 +7732,14 @@ impl Symbex {
             }
         }
         else {
+            if function_base_name.len() > 20 {
+                info!("Not a contract function: {fq_name}");
+            }
             return Ok(Err(continuation));
         }
     }
 
+    /// Call a user function in the contract as part of a map, filter, or fold
     fn eval_shortcircuit_higher_order_contract_function(&self, function_base_name: &ClarityName, binding_cont: Continuation, start_line: u32) -> Result<Result<Vec<Continuation>, Continuation>, Error> {
         let cur_contract = binding_cont.get_current_contract_id();
         let fq_name = FullName(cur_contract.clone(), function_base_name.clone());
@@ -7864,7 +7773,7 @@ impl Symbex {
             // this is unreachable anyway
             return Ok(vec![]);
         }
-        info!("Evaluating continuation {}\n   function name: {}\n            body: {}\n       predicate: {}\n", continuation.id, &continuation.function_path.as_ref().map(|s| s.as_str()).unwrap_or(""), &body.expr, &pred);
+        info!("Evaluating continuation {}\ncurrent contract: {}\n   function name: {}\n            body: {}\n       predicate: {}\n", continuation.id, &continuation.get_current_contract_id(), continuation.get_function_path(), &body.expr, &pred);
         if continuation.id <= last_cont_id() {
             return Err(Error::Bug(format!("Tried to evaluate a continuation twice: {}", continuation.id)));
         }
@@ -9206,17 +9115,26 @@ impl Symbex {
                                     };
                                     let target_func_name_and_args = lv.get(2..).ok_or_else(|| Error::Bug("No function args".into()))?;
 
-                                    let fname = format!("{function_name}/contract-call?");
-                                    let mut cc_cont = Continuation::from_parent(Rc::new(continuation), fname.clone(), body.span.start_line);
+                                    let mut cc_cont = Continuation::from_parent(Rc::new(continuation), function_name.clone(), body.span.start_line);
+
+                                    let old_contract_caller = cc_cont.get_contract_caller();
+                                    let old_current_contract = cc_cont.get_current_contract();
+
                                     cc_cont.contract_caller = Some(SymOp::Constant(Value::Principal(cc_cont.get_current_contract())));
                                     cc_cont.current_contract = Some(contract_principal.clone());
 
-                                    match self.eval_contract_function(cc_cont, target_func_name, target_func_name_and_args, body.span.start_line)? {
+                                    let mut conts = match self.eval_contract_function(cc_cont, target_func_name, target_func_name_and_args, body.span.start_line)? {
                                         Ok(conts) => conts,
                                         Err(_) => {
                                             return Err(Error::Bug(format!("contract-call? to unknown user-defined function {target_func_name} in {contract_principal}")));
                                         }
+                                    };
+
+                                    for cont in conts.iter_mut() {
+                                        cont.contract_caller = Some(old_contract_caller.clone());
+                                        cont.current_contract = Some(old_current_contract.clone());
                                     }
+                                    conts
                                 }
                                 "as-contract" => {
                                     return Err(Error::Bug("`as-contract` is deprecated and not supported by this tool".into()));
@@ -10108,6 +10026,7 @@ impl Symbex {
                                         success.predicate = pred.clone().and(Predicate::IsSome(formula.clone()));
                                         success.final_formula = formula.clone();
 
+                                        // failed to serialize
                                         let mut failure = Continuation::from_parent(cont_rc.clone(), format!("{function_name}/expr-too-big"), exp_sym.span.end_line);
                                         failure.predicate = pred.clone().and(Predicate::IsNone(formula.clone()));
                                         failure.final_formula = SymOp::none();
@@ -10116,6 +10035,44 @@ impl Symbex {
                                         ret.push(failure);
                                     }
 
+                                    ret
+                                }
+                                "from-consensus-buff?" => {
+                                    let Some(ts_sym) = lv.get(1) else {
+                                        return Err(Error::Bug(format!("Missing argument 1 to {function_name}")));
+                                    };
+                                    let ts = TypeSignature::parse_type_repr(DEFAULT_STACKS_EPOCH, ts_sym, &mut ())?;
+                                    let Some(buf_sym) = lv.get(2) else {
+                                        return Err(Error::Bug(format!("Missing argument 2 to {function_name}")));
+                                    };
+                                    
+                                    let buff_cont = Continuation::from_parent(Rc::new(continuation), format!("{function_name}/buff-eval"), buf_sym.span.start_line);
+                                    let conts = self.eval(buff_cont, buf_sym)?;
+                                    let mut ret = vec![];
+                                    for cont in conts.into_iter() {
+                                        if cont.halted() {
+                                            ret.push(cont);
+                                            continue;
+                                        }
+                                        
+                                        let pred = cont.predicate.clone();
+                                        let formula = SymOp::FromConsensusBuff(ts.clone(), Box::new(cont.final_formula.clone()));
+
+                                        let cont_rc = Rc::new(cont);
+
+                                        // successfully deserialized
+                                        let mut success = Continuation::from_parent(cont_rc.clone(), format!("{function_name}/buff-deserialized"), buf_sym.span.start_line);
+                                        success.predicate = pred.clone().and(Predicate::IsSome(formula.clone()));
+                                        success.final_formula = formula.clone();
+
+                                        // failed to deserialize
+                                        let mut failure = Continuation::from_parent(cont_rc.clone(), format!("{function_name}/buff-deserialize-failed"), buf_sym.span.end_line);
+                                        failure.predicate = pred.clone().and(Predicate::IsNone(formula.clone()));
+                                        failure.final_formula = SymOp::none();
+
+                                        ret.push(success);
+                                        ret.push(failure);
+                                    }
                                     ret
                                 }
                                 "slice" | "slice?" => {
@@ -10695,7 +10652,6 @@ impl Symbex {
             }
 
             info!("Evaluating function '{contract_func}'");
-            // TODO: contract ID
             let conts : Vec<_> = self.eval_user_function(contract_func.name().as_str())?
                 .into_iter()
                 .map(|cont| cont.rollup())

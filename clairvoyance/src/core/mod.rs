@@ -24,6 +24,7 @@ use clarity::vm::database::ClarityDatabase;
 use clarity::vm::database::MemoryBackingStore;
 use clarity::vm::analysis::AnalysisDatabase;
 use clarity::vm::analysis::ContractAnalysis;
+use clarity::vm::analysis::errors::CommonCheckErrorKind;
 use clarity::vm::errors::StaticCheckError;
 use clarity::vm::errors::ClarityEvalError;
 use clarity::vm::errors::VmExecutionError;
@@ -102,6 +103,8 @@ pub enum Error {
     VM(VmExecutionError),
     /// Clarity type error
     Type(ClarityTypeError),
+    /// Clarity typecheck error
+    Check(CommonCheckErrorKind),
     /// Analysis error
     Analysis(StaticCheckError),
     /// Generic error message
@@ -152,3 +155,8 @@ impl From<StaticCheckError> for Error {
     }
 }
 
+impl From<CommonCheckErrorKind> for Error {
+    fn from(ccek: CommonCheckErrorKind) -> Self {
+        Self::Check(ccek)
+    }
+}
