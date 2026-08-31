@@ -1,0 +1,180 @@
+# Clairvoyance
+
+A symbolic execution engine for [Clarity](https://clarity-lang.org), the smart
+contract language of the [Stacks](https://stacks.co) blockchain.
+
+Clairvoyance runs a Clarity function over *symbolic* inputs — exploring every
+reachable path at once instead of one concrete call at a time — and checks each
+terminating state against a specification you write in the contract's comments.
+It reports the paths that violate the spec, the states you did not account for,
+and the state writes that differ from what you claimed.
+
+It is built directly on the production Clarity VM (the `clarity` crate from
+`stacks-core`), so it reads the same bytes the chain does.
+
+> **Status: early / experimental.** The engine handles a large subset of
+> Clarity — arithmetic, booleans, sequences, principals, tuples, options,
+> responses, maps, fungible and non-fungible tokens, `as-contract`, and
+> post-condition allowances — and can verify specifications on self-contained
+> contracts today. Cross-contract `contract-call?`, traits, and some builtins
+> are still in progress (see [Limitations](#limitations)). Expect rough edges.
+
+## Building
+
+Clairvoyance vendors `stacks-core` as a submodule and builds against it, so
+clone recursively:
+
+```sh
+git clone --recurse-submodules https://github.com/jcnelson/clairvoyance
+cd clairvoyance
+cargo build            # debug build at target/debug/clairvoyance
+```
+
+If you already cloned without submodules:
+
+```sh
+git submodule update --init --depth 1 stacks-core
+```
+
+Requires a recent Rust toolchain (the crate uses edition 2024).
+
+## Quickstart
+
+There is a worked contract in [`examples/counter.clar`](examples/counter.clar):
+a counter whose `bump` is correctly specified, whose `reset` carries a
+deliberately wrong specification, and whose `peek` has no specification at all.
+
+Check every function in it:
+
+```sh
+$ clairvoyance sym check SP000000000000000000002Q6VF78.counter examples/counter.clar --all
+Checked 3 function(s) in SP000000000000000000002Q6VF78.counter:
+
+  PASS      bump  (1 state(s))
+  VIOLATED  reset
+  PASS      peek  (1 state(s))
+
+Summary: 2 passed, 1 violated, 0 spec-error, 0 error, 0 no-spec
+```
+
+The command exits non-zero when anything it checked failed, so it drops
+straight into CI. Re-run on a single function to see the full report:
+
+```sh
+$ clairvoyance sym check SP000000000000000000002Q6VF78.counter examples/counter.clar reset
+VIOLATED: `reset` does not satisfy its (@clairvoyance ...) specification.
+
+Incorrect var-set:
+      Path: reset.return
+   Formula: (ok true)
+  Variable: SP000000000000000000002Q6VF78.counter.count
+  Expected: u0
+     Given: u1
+```
+
+`CODE` may be a file path or `-` to read the contract from stdin.
+
+## Commands
+
+Run `clairvoyance help`, `clairvoyance sym help`, or `clairvoyance contract help`
+for the full option list.
+
+| command | what it does |
+| --- | --- |
+| `sym check CONTRACT_ID CODE [FUNCTION]` | Verify a function against its specification and report **PASS / VIOLATED / SPEC ERROR / NO SPEC**, with a meaningful exit code. Omit `FUNCTION`, or pass `--all`, to check every public and read-only function and print a summary. |
+| `sym exec-func CONTRACT_ID CODE FUNCTION` | Symbolically execute a function and print every terminating state — its path predicate, return value, and state writes. Also enforces any specification. |
+| `sym reachable CONTRACT_ID CODE FUNCTION` | Print the call graph reachable from a function: which data vars and maps it may read and write, transitively. |
+| `contract ast\|context\|analyze CONTRACT_ID CODE` | Inspect the parsed AST, the contract context, or the analysis of a contract. |
+
+Common options: `--dep CONTRACT_ID:PATH` loads a dependency contract (repeatable,
+instantiated in order); `--concretized-trait C.f.v:IMPL` binds a trait argument
+to a concrete implementation for dynamic dispatch; `--tx-sender`,
+`--contract-caller`, and `--tx-sponsor` fix those runtime values (each defaults
+to a fresh symbol); `-v` / `-vv` turn up the engine's log level (quiet by
+default).
+
+## Writing a specification
+
+A specification lives in a Clarity comment directly above the function, inside a
+`(@clairvoyance ...)` block. The engine reads it off the function's comments,
+runs the function, and checks it. A function with no block is explored but not
+judged (reported as `NO SPEC`).
+
+The two core commands are `invariant` and `halt`:
+
+```clarity
+;; (@clairvoyance
+;;     ;; Every state that returns (err u0) must have taken the odd branch.
+;;     (invariant (err u0)
+;;         (not (is-eq (mod (x uint) u2) u0)))
+;;     ;; The even branch returns (ok true) and inserts (x -> x) into `m`.
+;;     (halt
+;;         (result (ok true))
+;;         (condition (is-eq (mod (x uint) u2) u0))
+;;         (map-write 'SP8H248...ARTQ82.contract.m (x uint) (x uint))))
+(define-public (set-if-even (x uint))
+    (if (is-eq (mod x u2) u0)
+        (ok (map-insert m x x))
+        (err u0)))
+```
+
+- A free input is written `(name type)`, e.g. `(x uint)`.
+- `(invariant RESULT CONCLUSION)` requires that every terminating state whose
+  return value is `RESULT` has a path predicate that implies `CONCLUSION`.
+- `(halt ...)` is the same, plus the exact state the matching path must leave
+  behind: `(var-write ...)`, `(map-write ...)`, `(map-delete ...)`,
+  `(early-return)`, `(panicking)`, and the `reachable-*` sets.
+- To name a var or map entry's value *on entry* (before the call ran), use
+  `(loaded-var 'ADDR.c.v (v uint))` rather than `(var-get ...)`.
+
+The full grammar is in
+[`clairvoyance/src/sym/command.clar`](clairvoyance/src/sym/command.clar).
+
+The engine reports four kinds of failure, so a mismatch tells you *which* half is
+wrong:
+
+| report | meaning |
+| --- | --- |
+| unchecked continuation | a reachable terminating state no command accounted for |
+| unmatched halting condition | a command that matched no terminating state |
+| halting condition failed | a matched state whose predicate does not imply the conclusion |
+| incorrect / missing / unchecked var or map write | a state write that differs from, is absent from, or is not covered by the spec |
+
+## Limitations
+
+Clairvoyance is young, and it is honest about what it cannot yet do:
+
+- **Cross-contract calls and traits are in progress.** A contract that calls
+  into another contract (including protocol contracts such as `pox-5` or the
+  sBTC contracts) cannot yet be fully reasoned about. Provide callees with
+  `--dep` where they are self-contained; concretize traits with
+  `--concretized-trait`.
+- **No SMT solver.** Path feasibility and term equality are decided by a
+  built-in algebraic simplifier, not a complete decision procedure. Nonlinear
+  arithmetic (multiplying or dividing two symbolic values) is where it gives
+  out. When the simplifier cannot reduce a term it now leaves it unsimplified
+  and carries on, rather than aborting — so a hard term shows up as an
+  unresolved formula, not a crash.
+- **Some builtins are unmodelled**, including the Bitcoin transaction reader
+  (`get-bitcoin-tx-output?`) and the signature-verification builtins.
+
+If the engine cannot evaluate a function it says so and exits non-zero, rather
+than reporting a false pass.
+
+## Repository layout
+
+```
+clairvoyance/src/
+  main.rs             entry point and log configuration
+  cli/                the command-line front end (sym, contract)
+  core/               contract loading, the Error type, the proof-failure report
+  sym/                the symbolic engine: SymOp, the simplifier, continuations
+    command.rs        the (@clairvoyance ...) command interpreter
+    command.clar      the command-language reference grammar
+  tests/              unit and command tests
+examples/             worked example contracts
+```
+
+## License
+
+GNU Affero General Public License v3.0. See [LICENSE](LICENSE).
