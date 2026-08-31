@@ -193,13 +193,14 @@ Clairvoyance is young, and it is honest about what it cannot yet do:
   unresolved formula, not a crash.
 - **Some builtins are unmodelled**, including the Bitcoin transaction reader
   (`get-bitcoin-tx-output?`) and the signature-verification builtins.
-- **Cross-function composition is partial.** A callee's data-var reads and
-  writes now compose into the caller correctly; map reads a callee makes of a
-  map the caller wrote are not yet composed. `sym induct` therefore reasons
-  best about invariants over data vars.
-- **The test suite is not yet deterministic.** Parts of the engine iterate
-  hash maps in a nondeterministic order, so some tests pass or fail run to run.
-  The arithmetic simplifier has been made deterministic; other sites remain.
+- **Cross-function composition covers data vars and concrete map keys.** A
+  callee's data-var reads/writes and its `map-get?` of a key the caller wrote
+  compose into the caller. What is not resolved is a read of an *uninitialized*
+  slot the caller did not write, and symbolic-key aliasing, so `sym induct`
+  reasons best about invariants over data vars and fixed map keys.
+- **Precision is bounded by the simplifier, not an SMT solver.** Equalities
+  cancel common terms (`(is-eq (+ a k) (+ b k))` reduces to `(is-eq a b)`), but
+  inequalities and nonlinear relations may still read as NOT PROVEN.
 
 If the engine cannot evaluate a function it says so and exits non-zero, rather
 than reporting a false pass.

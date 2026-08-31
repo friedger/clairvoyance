@@ -311,6 +311,14 @@ pub enum Command {
     DefineSymbol(ClarityName, SymOp),
     Halt(Halt),
     Invariant(SymOp, Predicate),
+    // Top-level state-write assertions, the write-side siblings of `invariant`:
+    // the continuation returning the given result must leave this write behind.
+    // result, map, key, value
+    MapWrite(SymOp, FullName, SymOp, SymOp),
+    // result, var, value
+    VarWrite(SymOp, FullName, SymOp),
+    // result, map, key
+    MapDelete(SymOp, FullName, SymOp),
 }
 
 impl fmt::Display for Command {
@@ -320,6 +328,9 @@ impl fmt::Display for Command {
             Self::DefineSymbol(name, op) => write!(f, "(define-symbol {name} {op})"),
             Self::Halt(halt) => write!(f, "{halt}"),
             Self::Invariant(formula, pred) => write!(f, "(invariant {formula} {pred})"),
+            Self::MapWrite(result, map, key, value) => write!(f, "(map-write {result} {map} {key} {value})"),
+            Self::VarWrite(result, var, value) => write!(f, "(var-write {result} {var} {value})"),
+            Self::MapDelete(result, map, key) => write!(f, "(map-delete {result} {map} {key})"),
         }
     }
 }
@@ -397,6 +408,34 @@ impl CommandContext {
                 let final_formula = self.parse_symop(&exprs[0])?;
                 let conclusion = self.parse_symop(&exprs[1])?;
                 Ok(Command::Invariant(final_formula, conclusion.try_as_predicate()?))
+            }
+            "map-write" => {
+                if exprs.len() != 4 {
+                    return Err(Error::new_program_error(format!("`{command_name}` expects 4 arguments (result map key value), got {}", exprs.len())));
+                }
+                let result = self.parse_symop(&exprs[0])?;
+                let map_name = SymOp::match_fullname(&exprs[1])?;
+                let key = self.parse_symop(&exprs[2])?;
+                let value = self.parse_symop(&exprs[3])?;
+                Ok(Command::MapWrite(result, map_name, key, value))
+            }
+            "var-write" => {
+                if exprs.len() != 3 {
+                    return Err(Error::new_program_error(format!("`{command_name}` expects 3 arguments (result var value), got {}", exprs.len())));
+                }
+                let result = self.parse_symop(&exprs[0])?;
+                let var_name = SymOp::match_fullname(&exprs[1])?;
+                let value = self.parse_symop(&exprs[2])?;
+                Ok(Command::VarWrite(result, var_name, value))
+            }
+            "map-delete" => {
+                if exprs.len() != 3 {
+                    return Err(Error::new_program_error(format!("`{command_name}` expects 3 arguments (result map key), got {}", exprs.len())));
+                }
+                let result = self.parse_symop(&exprs[0])?;
+                let map_name = SymOp::match_fullname(&exprs[1])?;
+                let key = self.parse_symop(&exprs[2])?;
+                Ok(Command::MapDelete(result, map_name, key))
             }
             _ => {
                 Err(Error::NotFound(format!("Unrecognized command '{command_name}'")))

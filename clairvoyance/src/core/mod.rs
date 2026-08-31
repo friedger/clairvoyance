@@ -475,14 +475,23 @@ impl ProofFailures {
         // each continuation must have reached exactly one halt
         for h in halts.iter() {
             let mut found_cont = None;
+            // A continuation whose result matches this halt but whose predicate
+            // does not imply the halt's condition: the halt was reached, but its
+            // stated condition does not hold there. That is a failed condition,
+            // distinct from a halt no continuation reaches at all.
+            let mut formula_match: Option<Continuation> = None;
             for (i, cont) in conts.iter().enumerate() {
+                let formula_eq = cont.final_formula.clone().simplify()? == h.formula.clone().simplify()?;
                 let matches = if let Some(cond) = h.condition.as_ref() {
                     let implication = cont.predicate.clone().not().or(*cond.clone()).simplify()?;
-                    cont.final_formula.clone().simplify()? == h.formula.clone().simplify()? && implication == Predicate::True
+                    formula_eq && implication == Predicate::True
                 }
                 else {
-                    cont.final_formula.clone().simplify()? == h.formula.clone().simplify()? && cont.predicate.clone().simplify()? == h.predicate.clone().simplify()?
+                    formula_eq && cont.predicate.clone().simplify()? == h.predicate.clone().simplify()?
                 };
+                if !matches && formula_eq && formula_match.is_none() {
+                    formula_match = Some(cont.clone());
+                }
                 if matches {
                     // check nature of the halt -- did it panic? did it early-return?
                     if cont.early_return != h.early_return {
@@ -581,8 +590,15 @@ impl ProofFailures {
             }
 
             let Some(i) = found_cont.take() else {
-                // this halting condition does match any continuation 
-                failures.unmatched_halting_condition(*h.predicate.clone());
+                match formula_match {
+                    // the result was reached, but the halt's condition failed there
+                    Some(cont) => {
+                        let cond = h.condition.clone().map(|c| *c).unwrap_or_else(|| *h.predicate.clone());
+                        failures.halting_condition_failed(cont, cond);
+                    }
+                    // no continuation reaches this halt's result at all
+                    None => failures.unmatched_halting_condition(*h.predicate.clone()),
+                }
                 continue;
             };
             conts.remove(i);
