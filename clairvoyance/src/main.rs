@@ -30,6 +30,8 @@ extern crate clarity_types;
 extern crate serde;
 extern crate serde_json;
 
+extern crate num;
+
 pub mod cli;
 pub mod core;
 pub mod sym;

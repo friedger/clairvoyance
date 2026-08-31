@@ -30,7 +30,7 @@ fn exec_user_function(
     contract_id: QualifiedContractIdentifier,
     src: &str,
     user_function: &str,
-    prelude: &[(QualifiedContractIdentifier, String)],
+    deps: &[(QualifiedContractIdentifier, String)],
     concretized_traits: HashMap<FullName, HashMap<ClarityName, QualifiedContractIdentifier>>,
     default_concretized_traits: HashMap<TraitIdentifier, QualifiedContractIdentifier>,
     drop_early_returns: HashSet<FullName>,
@@ -42,7 +42,7 @@ fn exec_user_function(
     skip_function_list: Vec<FullName>,
     explore_all: bool
 ) -> Result<Vec<Continuation>, Error> {
-    let mut contracts : Vec<_> = prelude
+    let mut contracts : Vec<_> = deps 
         .iter()
         .map(|(contract_id, src)| {
             (
@@ -94,11 +94,11 @@ fn cli_get_callgraph(
     contract_id: QualifiedContractIdentifier,
     src: &str,
     user_function: &str,
-    prelude: &[(QualifiedContractIdentifier, String)],
+    deps: &[(QualifiedContractIdentifier, String)],
     concretized_traits: HashMap<FullName, HashMap<ClarityName, QualifiedContractIdentifier>>,
     default_concretized_traits: HashMap<TraitIdentifier, QualifiedContractIdentifier>,
 ) -> Result<(Callgraph, FullName), Error> {
-    let mut contracts : Vec<_> = prelude
+    let mut contracts : Vec<_> = deps
         .iter()
         .map(|(contract_id, src)| {
             (
@@ -132,24 +132,24 @@ fn cli_get_callgraph(
     ))
 }
 
-/// Load the prelude -- i.e. dependent contracts
-/// format is `--prelude CONTRACT_ID:/PATH/TO/CLARITY/CODE`
+/// Load the dependent contracts
+/// format is `--dep CONTRACT_ID:/PATH/TO/CLARITY/CODE`
 /// Contracts will be instantiated in the order given
-fn load_prelude(remaining_args: &mut Vec<String>) -> Result<Vec<(QualifiedContractIdentifier, String)>, (i32, String)> {
-    let mut prelude = vec![];
+fn load_deps(remaining_args: &mut Vec<String>) -> Result<Vec<(QualifiedContractIdentifier, String)>, (i32, String)> {
+    let mut deps = vec![];
     loop {
-        let contract_id_and_file = cli::consume_arg(remaining_args, &["--prelude", "-p"], true);
+        let contract_id_and_file = cli::consume_arg(remaining_args, &["--dep", "-c"], true);
         let (contract_id, src) = match contract_id_and_file {
             Ok(Some(contract_id_and_file)) => {
                 let mut parts = contract_id_and_file.split(":");
                 let Some(contract_id) = parts.next() else {
-                    return Err((1, format!("prelude '{contract_id_and_file}' missing ':' delimiter")));
+                    return Err((1, format!("dependency '{contract_id_and_file}' missing ':' delimiter")));
                 };
                 let Some(src_file) = parts.next() else {
-                    return Err((1, format!("prelude '{contract_id_and_file}' missing source file")));
+                    return Err((1, format!("dependency '{contract_id_and_file}' missing source file")));
                 };
                 let Ok(contract_id) = QualifiedContractIdentifier::parse(&contract_id) else {
-                    return Err((1, format!("Invalid prelude contract ID '{contract_id}'")));
+                    return Err((1, format!("Invalid dependency contract ID '{contract_id}'")));
                 };
                 let src = match cli::load_from_file_or_stdin(src_file) {
                     Ok(s) => match str::from_utf8(&s) {
@@ -158,7 +158,7 @@ fn load_prelude(remaining_args: &mut Vec<String>) -> Result<Vec<(QualifiedContra
                             src.to_string()
                         }
                         Err(_) => {
-                            return Err((1, format!("Prelude code in '{src_file}' is not UTF-8")));
+                            return Err((1, format!("Dependency code in '{src_file}' is not UTF-8")));
                         }
                     }
                     Err(e) => {
@@ -174,10 +174,10 @@ fn load_prelude(remaining_args: &mut Vec<String>) -> Result<Vec<(QualifiedContra
                 return Err((1, e_str));
             }
         };
-        debug!("Prelude: {contract_id}");
-        prelude.push((contract_id, src));
+        debug!("Dependency: {contract_id}");
+        deps.push((contract_id, src));
     }
-    Ok(prelude)
+    Ok(deps)
 }
 
 /// Load concretized traits
@@ -407,8 +407,8 @@ fn cli_eval_user_function(argv: &[String]) -> (i32, String) {
         skip_functions.push(name);
     }
 
-    let prelude = match load_prelude(&mut remaining_args) {
-        Ok(prelude) => prelude,
+    let deps = match load_deps(&mut remaining_args) {
+        Ok(deps) => deps,
         Err(x) => {
             return x;
         }
@@ -467,7 +467,7 @@ fn cli_eval_user_function(argv: &[String]) -> (i32, String) {
         contract_id,
         &src,
         user_function,
-        &prelude,
+        &deps,
         concretized_traits,
         default_concretized_traits,
         drop_early_returns,
@@ -526,8 +526,8 @@ fn cli_reachability_graph(argv: &[String]) -> (i32, String) {
     
     let mut remaining_args = argv.to_vec();
 
-    let prelude = match load_prelude(&mut remaining_args) {
-        Ok(prelude) => prelude,
+    let deps = match load_deps(&mut remaining_args) {
+        Ok(deps) => deps,
         Err(x) => {
             return x;
         }
@@ -547,7 +547,7 @@ fn cli_reachability_graph(argv: &[String]) -> (i32, String) {
         }
     };
 
-    let (callgraph, user_function) = match cli_get_callgraph(contract_id, &src, user_function, &prelude, concretized_traits, default_concretized_traits) {
+    let (callgraph, user_function) = match cli_get_callgraph(contract_id, &src, user_function, &deps, concretized_traits, default_concretized_traits) {
         Ok((cg, uf)) => (cg, uf),
         Err(e) => {
             return (2, format!("Failed to build callgraph for function {user_function}: {e:?}"));

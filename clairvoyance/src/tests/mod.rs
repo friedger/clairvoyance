@@ -1,3 +1,18 @@
+// Copyright (C) 2026 Trust Machines
+// 
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+// 
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+// 
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
 use std::collections::HashMap;
 use std::collections::HashSet;
 
@@ -16,6 +31,7 @@ use clarity::vm::ast;
 use clarity::vm::eval_all;
 use clarity::vm::errors::ClarityEvalError;
 use clarity_types::types::StandardPrincipalData;
+use clarity_types::types::PrincipalData;
 use clarity_types::ClarityName;
 use clarity_types::types::TupleData;
 use clarity_types::types::signatures::{TypeSignature as TS, ListTypeData, TupleTypeSignature};
@@ -31,9 +47,13 @@ use clarity_types::Value;
 
 use serde_json;
 
-use crate::sym::{Sym, SymOp, Symbex, SymId, Predicate, VarOp, MapOp, Continuation, FullName, Callgraph};
+use crate::sym::{Sym, SymOp, Symbex, SymId, Predicate, Continuation, FullName, Callgraph};
 use crate::core::Error;
 use crate::core::DEFAULT_STACKS_EPOCH;
+use crate::core::ProofFailures;
+use crate::sym::command::Halt;
+
+pub mod command;
 
 fn default_contract_id() -> QualifiedContractIdentifier {
     make_contract_id("contract")
@@ -53,14 +73,15 @@ fn vall(x: Vec<Value>) -> Value { Value::cons_list(x, &DEFAULT_STACKS_EPOCH).unw
 fn ci(x: i128) -> Box<SymOp> { Box::new(SymOp::Constant(Value::Int(x))) }
 fn cu(x: u128) -> Box<SymOp> { Box::new(SymOp::Constant(Value::UInt(x))) }
 fn cb(x: bool) -> Box<SymOp> { Box::new(SymOp::Constant(Value::Bool(x))) }
+fn cp(x: PrincipalData) -> Box<SymOp> { Box::new(SymOp::Constant(Value::Principal(x))) }
 fn ct(fields: Vec<(&str, Value)>) -> Box<SymOp> {
     let consts : Vec<(ClarityName, Value)> = fields
         .into_iter()
         .map(|(name, v)| {
             (name.try_into().unwrap(), v)
         })
-        .collect();
-            
+    .collect();
+
     Box::new(SymOp::Constant(Value::Tuple(TupleData::from_data(consts).unwrap())))
 }
 fn cl(fields: Vec<Value>) -> Box<SymOp> { Box::new(SymOp::Constant(vall(fields))) }
@@ -68,6 +89,8 @@ fn co(val: Value) -> Box<SymOp> { Box::new(SymOp::Constant(Value::some(val).unwr
 fn cok(val: Value) -> Box<SymOp> { Box::new(SymOp::Constant(Value::okay(val).unwrap())) }
 fn cerr(val: Value) -> Box<SymOp> { Box::new(SymOp::Constant(Value::error(val).unwrap())) }
 fn csb(val: Vec<u8>) -> Box<SymOp> { Box::new(SymOp::Constant(Value::buff_from(val).unwrap())) }
+fn cssa(val: &str) -> Box<SymOp> { Box::new(SymOp::Constant(Value::string_ascii_from_bytes(val.as_bytes().to_vec()).unwrap())) }
+fn cssu(val: &str) -> Box<SymOp> { Box::new(SymOp::Constant(Value::string_utf8_from_string_utf8_literal(val.to_string()).unwrap())) }
 
 fn si(name: &str) -> Sym { Sym::Int(name.into()) }
 fn su(name: &str) -> Sym { Sym::UInt(name.into()) }
@@ -80,16 +103,18 @@ fn vi(name: &str) -> Box<SymOp> { Box::new(SymOp::Variable(Sym::Int(name.into())
 fn vu(name: &str) -> Box<SymOp> { Box::new(SymOp::Variable(Sym::UInt(name.into()))) }
 fn vb(name: &str) -> Box<SymOp> { Box::new(SymOp::Variable(Sym::Bool(name.into()))) }
 fn vo(name: &str, ts: TS) -> Box<SymOp> { Box::new(SymOp::Variable(so(name, ts))) }
+fn vr(name: &str, ts_ok: TS, ts_err: TS) -> Box<SymOp> { Box::new(SymOp::Variable(Sym::Response(name.into(), ts_ok, ts_err))) }
 fn vt(name: &str, field_ts: Vec<(&str, TS)>) -> Box<SymOp> {
     let fields : Vec<(ClarityName, TS)> = field_ts
         .into_iter()
         .map(|(name, ts)| {
             (name.try_into().unwrap(), ts)
         })
-        .collect();
+    .collect();
 
     Box::new(SymOp::Variable(Sym::Tuple(name.into(), fields.try_into().unwrap())))
 }
+fn vl(name: &str, ts: TS, len: u32) -> Box<SymOp> { Box::new(SymOp::Variable(sl(name, ts, len))) }
 fn vp(name: &str) -> Box<SymOp> { Box::new(SymOp::Variable(Sym::Principal(name.into()))) }
 fn vsb(name: &str, len: u32) -> Box<SymOp> { Box::new(SymOp::Variable(Sym::Sequence(name.into(), SequenceSubtype::BufferType(len.try_into().unwrap())))) }
 fn vssa(name: &str, len: u32) -> Box<SymOp> { Box::new(SymOp::Variable(Sym::Sequence(name.into(), SequenceSubtype::StringType(StringSubtype::ASCII(len.try_into().unwrap()))))) }
@@ -102,6 +127,8 @@ fn mul(ops: Vec<Box<SymOp>>) -> Box<SymOp> { Box::new(SymOp::Multiply(ops)) }
 fn mul2(op1: Box<SymOp>, op2: Box<SymOp>) -> Box<SymOp> { mul(vec![op1, op2]) }
 fn div(ops: Vec<Box<SymOp>>) -> Box<SymOp> { Box::new(SymOp::Divide(ops)) }
 fn rem(op1: Box<SymOp>, op2: Box<SymOp>) -> Box<SymOp> { Box::new(SymOp::Modulo(op1, op2)) }
+fn pow(base: Box<SymOp>, exp: Box<SymOp>) -> Box<SymOp> { Box::new(SymOp::Power(base, exp)) }
+fn log2(op: Box<SymOp>) -> Box<SymOp> { Box::new(SymOp::Log2(op)) }
 fn concat(ops: Vec<Box<SymOp>>) -> Box<SymOp> { Box::new(SymOp::Concat(ops)) }
 fn and(ops: Vec<Box<SymOp>>) -> Box<SymOp> { Box::new(SymOp::And(ops)) }
 fn or(ops: Vec<Box<SymOp>>) -> Box<SymOp> { Box::new(SymOp::Or(ops)) }
@@ -160,26 +187,13 @@ fn pis_none(s: Box<SymOp>) -> Box<Predicate> { Box::new(Predicate::IsNone(*s)) }
 fn pis_ok(s: Box<SymOp>) -> Box<Predicate> { Box::new(Predicate::IsOkay(*s)) }
 fn pis_err(s: Box<SymOp>) -> Box<Predicate> { Box::new(Predicate::IsErr(*s)) }
 
-pub struct Halt {
-    predicate: Box<Predicate>,
-    formula: Box<SymOp>,
-    vars: Vec<VarOp>,
-    map_state: HashMap<FullName, HashMap<SymOp, SymOp>>,
-    map_tombstones: HashMap<FullName, HashSet<SymOp>>,
-    reachable_var_reads: HashSet<FullName>,
-    reachable_var_writes: HashSet<FullName>,
-    reachable_map_reads: HashSet<FullName>,
-    reachable_map_writes: HashSet<FullName>,
-    early_return: bool,
-    panicking: bool
-}
-
 impl Halt {
-    pub fn new() -> Self {
+    pub fn new_test() -> Self {
         Self {
             predicate: pf(),
             formula: cb(false),
-            vars: vec![],
+            condition: None,
+            vars: HashMap::new(),
             map_state: HashMap::new(),
             map_tombstones: HashMap::new(),
             early_return: false,
@@ -188,6 +202,7 @@ impl Halt {
             reachable_map_writes: HashSet::new(),
             reachable_var_reads: HashSet::new(),
             reachable_var_writes: HashSet::new(),
+            analyze_write_reachability: true,
         }
     }
 
@@ -203,12 +218,12 @@ impl Halt {
 
     pub fn var(mut self, contract_id: QualifiedContractIdentifier, var_name: &str, var_value: Box<SymOp>) -> Self {
         let var_name = FullName(contract_id, ClarityName::try_from(var_name).unwrap());
-        self.vars.push(VarOp::Set(var_name, *var_value));
+        self.vars.insert(var_name, *var_value);
         self
     }
 
-    pub fn map(mut self, contract_id: QualifiedContractIdentifier, map_name: &str, key_sym: Box<SymOp>, value_sym: Box<SymOp>) -> Self {
-        let map_name = FullName(contract_id, ClarityName::try_from(map_name).unwrap());
+    pub fn map(mut self, contract_id: QualifiedContractIdentifier, map_basename: &str, key_sym: Box<SymOp>, value_sym: Box<SymOp>) -> Self {
+        let map_name = FullName(contract_id.clone(), ClarityName::try_from(map_basename).unwrap());
         if let Some(state) = self.map_state.get_mut(&map_name) {
             state.insert(*key_sym, *value_sym);
         }
@@ -220,8 +235,8 @@ impl Halt {
         self
     }
 
-    pub fn mapd(mut self, contract_id: QualifiedContractIdentifier, map_name: &str, key_sym: Box<SymOp>) -> Self {
-        let map_name = FullName(contract_id, ClarityName::try_from(map_name).unwrap());
+    pub fn mapd(mut self, contract_id: QualifiedContractIdentifier, map_basename: &str, key_sym: Box<SymOp>) -> Self {
+        let map_name = FullName(contract_id.clone(), ClarityName::try_from(map_basename).unwrap());
         if let Some(state) = self.map_tombstones.get_mut(&map_name) {
             state.insert(*key_sym);
         }
@@ -245,7 +260,7 @@ impl Halt {
         self.reachable_var_reads.insert(var_full_name);
         self
     }
-    
+
     pub fn reachable_map_write(mut self, contract_id: QualifiedContractIdentifier, map_name: &str) -> Self {
         let map_name = FullName(contract_id, ClarityName::try_from(map_name).unwrap());
         self.reachable_map_writes.insert(map_name);
@@ -270,183 +285,11 @@ impl Halt {
     }
 }
 
-fn assert_halts(mut conts: Vec<Continuation>, halts: Vec<Halt>) {
-    let rolled_up_conts : Vec<_> = conts
-        .into_iter()
-        .map(|c| c.rollup())
-        .collect();
-    conts = rolled_up_conts;
-
-    info!("Expected halting states:");
-    for h in halts.iter() {
-        info!("   Condition: {}", &h.predicate.clone().simplify().unwrap());
-        info!("   Formula:   {}", &h.formula.clone().simplify().unwrap());
-        for v in h.vars.iter() {
-            info!("   Var:       {}", v.clone().simplify().unwrap());
-        }
-        for (map_name, map) in h.map_state.iter() {
-            info!("   Map state: {map_name}");
-            for (key, value) in map.iter() {
-                info!("      key:   {key}");
-                info!("      value: {value}");
-            }
-        }
-        for (map_name, map) in h.map_tombstones.iter() {
-            info!("   Map deletes: {map_name}");
-            for key in map.iter() {
-                info!("      key:   {key}");
-            }
-        }
-        for var_name in h.reachable_var_reads.iter() {
-            info!("   Reachable var read: {var_name}");
-        }
-        for map_name in h.reachable_map_reads.iter() {
-            info!("   Reachable map read: {map_name}");
-        }
-        for var_name in h.reachable_var_writes.iter() {
-            info!("   Reachable var write: {var_name}");
-        }
-        for map_name in h.reachable_map_writes.iter() {
-            info!("   Reachable map write: {map_name}");
-        }
-    }
-
-    info!("Computed halting states:");
-    for c in conts.iter() {
-        info!("   Condition: {}", &c.predicate.clone().simplify().unwrap());
-        info!("   Formula:   {}", &c.final_formula.clone().simplify().unwrap());
-        for v in c.post_vars.iter() {
-            info!("   Var:       {}", v.clone().simplify().unwrap());
-        }
-        for (map_name, map) in c.map_state.iter() {
-            info!("   Map state: {map_name}");
-            for (key, value) in map.iter() {
-                let key = key.clone().simplify().unwrap();
-                let value = value.clone().simplify().unwrap();
-                info!("      key:   {key}");
-                info!("      value: {value}");
-            }
-            for (map_name, map) in c.map_tombstones.iter() {
-                info!("   Map deletes: {map_name}");
-                for key in map.iter() {
-                    info!("      key:   {key}");
-                }
-            }
-        }
-        for var_name in c.reachable_var_reads.iter() {
-            info!("   Reachable var read: {var_name}");
-        }
-        for map_name in c.reachable_map_reads.iter() {
-            info!("   Reachable map read: {map_name}");
-        }
-        for var_name in c.reachable_var_writes.iter() {
-            info!("   Reachable var write: {var_name}");
-        }
-        for map_name in c.reachable_map_writes.iter() {
-            info!("   Reachable map write: {map_name}");
-        }
-    }
-
-    // each continuation must have reached exactly one halt
-    for h in halts.iter() {
-        let mut found_cont = None;
-        for (i, cont) in conts.iter().enumerate() {
-            if cont.predicate.clone().simplify().unwrap() == *h.predicate && cont.final_formula.clone().simplify().unwrap() == *h.formula {
-
-                // this halting state might match
-                assert_eq!(cont.early_return, h.early_return);
-                assert_eq!(cont.panicking, h.panicking);
-
-                let mut post_vars = cont.post_vars.clone();
-                for v in h.vars.iter() {
-                    let mut found_var = None;
-                    for (j, var) in post_vars.iter().enumerate() {
-                        if var.clone().simplify().unwrap() == v.clone().simplify().unwrap() {
-                            found_var = Some(j);
-                            break;
-                        }
-                    }
-                    let j = found_var.expect(&format!("Did not find expected variable {v:?} in continuation {cont:?}"));
-                    post_vars.remove(j);
-                }
-                assert_eq!(post_vars.len(), 0, "continuation had unaccounted final variables {:?}", &post_vars);
-
-                if cont.map_state != h.map_state {
-                    error!("computed map state does not match given map state");
-                    error!("predicate: {}", &h.predicate);
-                    error!("formula:   {}", &h.formula);
-                    error!("computed map state:");
-                    for (map_name, map_vals) in cont.map_state.iter() {
-                        error!("   map: {map_name}");
-                        for (key_sym, val_sym) in map_vals.iter() {
-                            error!("      key: {key_sym}");
-                            error!("      val: {val_sym}");
-                        }
-                    }
-                    error!("given map state:");
-                    for (map_name, map_vals) in h.map_state.iter() {
-                        error!("   map: {map_name}");
-                        for (key_sym, val_sym) in map_vals.iter() {
-                            error!("      key: {key_sym}");
-                            error!("      val: {val_sym}");
-                        }
-                    }
-                    panic!();
-                }
-
-                if cont.map_tombstones != h.map_tombstones {
-                    error!("computed map tombstones do not match given map tombstones");
-                    error!("predicate: {}", &h.predicate);
-                    error!("formula:   {}", &h.formula);
-                    error!("computed map tombstones:");
-                    for (map_name, deleted_syms) in cont.map_tombstones.iter() {
-                        error!("   map: {map_name}");
-                        for sym in deleted_syms {
-                            error!("      deleted: {sym}");
-                        }
-                    }
-                    error!("given map tombstones:");
-                    for (map_name, deleted_syms) in h.map_tombstones.iter() {
-                        error!("   map: {map_name}");
-                        for sym in deleted_syms {
-                            error!("      deleted: {sym}");
-                        }
-                    }
-                    panic!();
-                }
-                assert_eq!(cont.reachable_var_writes, h.reachable_var_writes);
-                assert_eq!(cont.reachable_map_writes, h.reachable_map_writes);
-
-                found_cont = Some(i);
-                break;
-            }
-            else if cont.predicate.clone().simplify().unwrap() == *h.predicate {
-                let formula_str = h.formula.to_string();
-                let cont_formula_str = cont.final_formula.clone().simplify().unwrap().to_string();
-                info!("Predicate {} matches, but not final formula:\n   Computed: {:?}\n      Given: {:?}\n", &h.predicate, cont.final_formula.clone().simplify().unwrap(), &h.formula);
-                if formula_str == cont_formula_str {
-                    panic!("formula strings match: {}", &formula_str);
-                }
-            }
-            else {
-                let pred_str = h.predicate.to_string();
-                let cont_pred_str = cont.predicate.clone().simplify().unwrap().to_string();
-                info!("Final formula {} matches, but not predicate:\n   Computed: {}\n      Given: {}\n", &h.formula, cont.predicate.clone().simplify().unwrap(), &h.predicate);
-                if pred_str == cont_pred_str {
-                    panic!("predicate strings match: {}", &pred_str);
-                }
-            }
-        }
-
-        let i = found_cont.expect(&format!("halting condition {} state {} not found in continuations", h.predicate.clone().simplify().unwrap(), h.formula.clone().simplify().unwrap()));
-        conts.remove(i);
-    }
-
-    if conts.len() > 0 {
-        for c in conts {
-            error!("Unaccounted continuation {} state {}", &c.predicate, &c.final_formula.clone().simplify().unwrap());
-        }
-        panic!();
+fn assert_halts(conts: Vec<Continuation>, halts: Vec<Halt>) {
+    let failures = ProofFailures::from_continuations_and_halts(conts, halts).unwrap();
+    if !failures.is_empty() {
+        error!("assert_halts() failed, Proof failures:\n{failures}\n");
+        panic!()
     }
 }
 
@@ -460,7 +303,7 @@ fn test_consolidate_add() {
 
     let symop = add(vec![cu(u128::MAX), cu(1)]);
     let Err(Error::Arithmetic(_s)) = symop.simplify() else { panic!(); };
-    
+
     let symop = add(vec![ci(i128::MAX), ci(1)]);
     let Err(Error::Arithmetic(_s)) = symop.simplify() else { panic!(); };
 
@@ -472,7 +315,7 @@ fn test_consolidate_add() {
 
     let symop = add(vec![vu("x"), cu(0)]);
     assert_eq!(symop.simplify(), Ok(*vu("x")));
-    
+
     let symop = add(vec![cu(0), vu("x")]);
     assert_eq!(symop.simplify(), Ok(*vu("x")));
 
@@ -490,7 +333,7 @@ fn test_consolidate_multiply() {
 
     let symop = mul(vec![cu(u128::MAX), cu(2)]);
     let Err(Error::Arithmetic(_s)) = symop.simplify() else { panic!(); };
-    
+
     let symop = mul(vec![ci(i128::MAX), ci(2)]);
     let Err(Error::Arithmetic(_s)) = symop.simplify() else { panic!(); };
 
@@ -502,32 +345,54 @@ fn test_consolidate_multiply() {
 
     let symop = mul(vec![cu(1), vu("x")]);
     assert_eq!(symop.simplify(), Ok(*vu("x")));
-    
+
     let symop = mul(vec![vu("x"), cu(1)]);
     assert_eq!(symop.simplify(), Ok(*vu("x")));
-    
+
     let symop = mul(vec![vu("x"), cu(0)]);
     assert_eq!(symop.simplify(), Ok(*cu(0)));
-    
+
     let symop = mul(vec![cu(0), vu("x")]);
     assert_eq!(symop.simplify(), Ok(*cu(0)));
-    
-    // (x - 1) * (x - 2) == (x*x + 2) - (x * 3)
+
+    // (x - 1) * (x - 2) == ((pow x u2) + 2) - (x * 3)
     let symop = mul(vec![sub2(vu("x"), cu(1)), sub2(vu("x"), cu(2))]);
     let simplified = symop.clone().simplify().unwrap();
     info!("symop = {symop:?}, simplifed = {simplified:?}");
     info!("symop = {symop}, simplifed = {simplified}");
-    assert_eq!(simplified, *sub2(add2(mul2(vu("x"), vu("x")), cu(2)), mul2(vu("x"), cu(3))));
+    assert_eq!(simplified, *sub2(add2(pow(vu("x"), cu(2)), cu(2)), mul2(vu("x"), cu(3))));
 
     // (x - 1) * (x - 2) * (x - 3)
     // (x*x - 3*x + 2) * (x - 3)
-    // (x*x*x - 3*x*x + 2*x - 3*x*x + 9*x - 6
+    // (x*x*x - 3*x*x + 2*x - 3*x*x + 9*x - 6)
     // (x*x*x + 11*x) - (6*x*x + 6)
+    // ((pow x u3) + (* u11 x)) - (+ (* u6 (pow x u2)) u6)
     let symop = mul(vec![sub2(vu("x"), cu(1)), sub2(vu("x"), cu(2)), sub2(vu("x"), cu(3))]);
     let simplified = symop.clone().simplify().unwrap();
     info!("symop = {symop:?}, simplifed = {simplified:?}");
     info!("symop = {symop}, simplifed = {simplified}");
-    assert_eq!(simplified, *sub2(add2(mul(vec![vu("x"), vu("x"), vu("x")]), mul2(vu("x"), cu(11))), add2(mul(vec![cu(6), vu("x"), vu("x")]), cu(6))));
+    assert_eq!(simplified, *sub2(add2(pow(vu("x"), cu(3)), mul2(vu("x"), cu(11))), add2(mul(vec![cu(6), pow(vu("x"), cu(2))]), cu(6))));
+
+    // (pow u2 x) * (pow u2 y) * z * (pow u3 w) = (pow u2 (+ x y)) * (pow u3 w) * z
+    let symop = mul(vec![pow(cu(2), vu("x")), pow(cu(2), vu("y")), vu("z"), pow(cu(3), vu("w"))]);
+    let simplified = symop.clone().simplify().unwrap();
+    info!("symop = {symop}, simplifed = {simplified}");
+    assert_eq!(simplified, *mul(vec![pow(cu(2), add2(vu("x"), vu("y"))), pow(cu(3), vu("w")), vu("z")]));
+}
+
+#[test]
+fn test_consolidate_pow() {
+    // (pow (pox x y) z) == (pow x (* y z))
+    let symop = pow(pow(vu("x"), vu("y")), vu("z"));
+    let simplified = symop.clone().simplify().unwrap();
+    info!("symop = {symop}, simplifed = {simplified}");
+    assert_eq!(simplified, *pow(vu("x"), mul2(vu("y"), vu("z"))));
+
+    // (pow u2 (log2 x)) = x
+    let symop = pow(cu(2), log2(vu("x"))); 
+    let simplified = symop.clone().simplify().unwrap();
+    info!("symop = {symop}, simplifed = {simplified}");
+    assert_eq!(simplified, *vu("x"));
 }
 
 #[test]
@@ -791,6 +656,31 @@ fn test_consolidate_divide() {
     let simplified = symop.clone().simplify();
     info!("symop = {symop:?}, simplifed = {simplified:?}");
     assert_eq!(simplified, Ok(*div(vec![ci(1), mul(vec![ci(5), vi("foo")])])));
+    
+    // (u12 / (u30 * foo)) = u2 / (u5 * foo)
+    let symop = div(vec![cu(12), mul(vec![vu("foo"), cu(30)])]);
+    let simplified = symop.clone().simplify();
+    info!("symop = {symop:?}, simplifed = {simplified:?}");
+    assert_eq!(simplified, Ok(*div(vec![cu(2), mul(vec![cu(5), vu("foo")])])));
+    
+    // (12 / (30 * foo)) = 2 / (5 * foo)
+    let symop = div(vec![ci(12), mul(vec![vi("foo"), ci(30)])]);
+    let simplified = symop.clone().simplify();
+    info!("symop = {symop:?}, simplifed = {simplified:?}");
+    assert_eq!(simplified, Ok(*div(vec![ci(2), mul(vec![ci(5), vi("foo")])])));
+    
+    // (u12 * foo / u30) == 2 * foo / u5
+    let symop = div(vec![mul(vec![vu("foo"), cu(12)]), cu(30)]);
+    let simplified = symop.clone().simplify();
+    info!("symop = {symop:?}, simplifed = {simplified:?}");
+    assert_eq!(simplified, Ok(*div(vec![mul(vec![cu(2), vu("foo")]), cu(5)])));
+    
+    // (12 * foo / 30) == 2 * foo / 5
+    let symop = div(vec![mul(vec![vi("foo"), ci(12)]), ci(30)]);
+    let simplified = symop.clone().simplify();
+    info!("symop = {symop:?}, simplifed = {simplified:?}");
+    assert_eq!(simplified, Ok(*div(vec![mul(vec![ci(2), vi("foo")]), ci(5)])));
+
 }
 
 #[test]
@@ -1379,6 +1269,76 @@ fn test_consolidate_or() {
     let simplified = symop.clone().simplify();
     info!("symop = {symop:?}, simplifed = {simplified:?}");
     assert_eq!(simplified, Ok(*cb(true)));
+
+    // doesn't reduce (already in SoP form)
+    // (a && b) || c 
+    let symop = or(vec![and(vec![vb("a"), vb("b")]), vb("c")]);
+    let simplified = symop.clone().simplify();
+    info!("symop = {symop:?}, simplifed = {simplified:?}");
+    assert_eq!(simplified, Ok(*symop));
+
+    // distributes
+    // (a || b) && c == (a && c) || (b && c)
+    let symop = and(vec![or(vec![vb("a"), vb("b")]), vb("c")]);
+    let simplified = symop.clone().simplify();
+    info!("symop = {symop:?}, simplifed = {simplified:?}");
+    assert_eq!(simplified, Ok(*or(vec![and(vec![vb("a"), vb("c")]), and(vec![vb("b"), vb("c")])])));
+
+    // or lifted out
+    // (a && b) || ((c && d) || e) ==> (a && b) || (c && d) || e
+    let symop = or(vec![and(vec![vb("a"), vb("b")]), or(vec![and(vec![vb("c"), vb("d")]), vb("e")])]);
+    let simplified = symop.clone().simplify();
+    info!("symop = {symop:?}, simplifed = {simplified:?}");
+    assert_eq!(simplified, Ok(*or(vec![and(vec![vb("a"), vb("b")]), and(vec![vb("c"), vb("d")]), vb("e")])));
+
+    // doesn't reduce
+    // (a == 0) || (a == 1) || (a == 2)
+    let symop = or(vec![eq(vu("a"), cu(0)), eq(vu("a"), cu(1)), eq(vu("a"), cu(2))]);
+    let simplified = symop.clone().simplify();
+    info!("symop = {symop:?}, simplifed = {simplified:?}");
+    assert_eq!(simplified, Ok(*symop));
+
+    // redundant term elimination
+    // (a == 0) || (a == 1) || (a == 0) ==> (a == 0) || (a == 1)
+    let symop = or(vec![eq(vu("a"), cu(0)), eq(vu("a"), cu(1)), eq(vu("a"), cu(0))]);
+    let simplified = symop.clone().simplify();
+    info!("symop = {symop:?}, simplifed = {simplified:?}");
+    assert_eq!(simplified, Ok(*or(vec![eq(vu("a"), cu(0)), eq(vu("a"), cu(1))])));
+    
+    // or gets lifted
+    // (a == 0 || (a == 1 || a == 2)) == (a == 0) || (a == 1) || (a == 2)
+    let symop = or(vec![eq(vu("a"), cu(0)), or(vec![eq(vu("a"), cu(1)), eq(vu("a"), cu(2))])]);
+    let simplified = symop.clone().simplify();
+    info!("symop = {symop:?}, simplifed = {simplified:?}");
+    assert_eq!(simplified, Ok(*or(vec![eq(vu("a"), cu(0)), eq(vu("a"), cu(1)), eq(vu("a"), cu(2))])));
+   
+    // doesn't reduce
+    // (is-eq (len a) u10) || (is-eq (len a) u9)
+    let symop = or(vec![eq(llen(vl("a", TS::UIntType, 10)), cu(10)), eq(llen(vl("a", TS::UIntType, 10)), cu(9))]);
+    let simplified = symop.clone().simplify();
+    info!("symop = {symop:?}, simplifed = {simplified:?}");
+    assert_eq!(simplified, Ok(*symop));
+
+    // and-absorption
+    // (a == 0 || a == 1) && (a == 0 || a == 2) ==> a == 0 
+    let symop = and(vec![or(vec![eq(vu("a"), cu(0)), eq(vu("a"), cu(1))]), or(vec![eq(vu("a"), cu(0)), eq(vu("a"), cu(2))])]);
+    let simplified = symop.clone().simplify();
+    info!("symop = {symop:?}, simplifed = {simplified:?}");
+    assert_eq!(simplified, Ok(*eq(vu("a"), cu(0))));
+
+    // or-absorption
+    // A || (A && B) == A
+    let symop = or(vec![vb("a"), and(vec![vb("a"), vb("b")])]);
+    let simplified = symop.clone().simplify();
+    info!("symop = {symop:?}, simplifed = {simplified:?}");
+    assert_eq!(simplified, Ok(*vb("a")));
+
+    // consensus 
+    // (!A && B) || (A && C) || (B && C) == (!A && B) || (A && C)
+    let symop = or(vec![and(vec![not(vb("a")), vb("b")]), and(vec![vb("a"), vb("c")]), and(vec![vb("b"), vb("c")])]);
+    let simplified = symop.clone().simplify();
+    info!("symop = {symop:?}, simplifed = {simplified:?}");
+    assert_eq!(simplified, Ok(*or(vec![and(vec![not(vb("a")), vb("b")]), and(vec![vb("a"), vb("c")])])));
 }
 
 #[test]
@@ -1529,6 +1489,48 @@ fn test_consolidate_tuple_get() {
     let simplified = symop.clone().simplify();
     info!("symop = {symop:?}, simplifed = {simplified:?}");
     assert_eq!(simplified, Ok(*symop));
+    
+    // (get x (merge { y : u2 } { x : u1 })) == Ok(u1)
+    let symop = tget("x", tmerge(ct(vec![("y", valu(2))]), ct(vec![("x", valu(1))])));
+    let simplified = symop.clone().simplify();
+    info!("symop = {symop:?}, simplifed = {simplified:?}");
+    assert_eq!(simplified, Ok(*cu(1)));
+
+    // (get x (merge { z : w } { x : y }) == Ok(y)
+    let symop = tget("x", tmerge(tcons(vec![("z", vu("w"))]), tcons(vec![("x", vu("y"))])));
+    let simplified = symop.clone().simplify();
+    info!("symop = {symop:?}, simplifed = {simplified:?}");
+    assert_eq!(simplified, Ok(*vu("y")));
+
+    // (get x (merge { z : w } (loaded-var z { x : y }))) == Ok(y)
+    let symop = tget("x", tmerge(tcons(vec![("z", vu("w"))]), lv("z", tcons(vec![("x", vu("y"))]))));
+    let simplified = symop.clone().simplify();
+    info!("symop = {symop:?}, simplifed = {simplified:?}");
+    assert_eq!(simplified, Ok(*vu("y")));
+    
+    // (get x (merge { z : w } (loaded-var z (some { x : y })))) == Ok((some y))
+    let symop = tget("x", tmerge(tcons(vec![("z", vu("w"))]), lv("z", some(tcons(vec![("x", vu("y"))])))));
+    let simplified = symop.clone().simplify();
+    info!("symop = {symop:?}, simplifed = {simplified:?}");
+    assert_eq!(simplified, Ok(*some(vu("y"))));
+    
+    // (get x (merge { z : w } (loaded-var z (some { x : u1 })))) == Ok((some u1))
+    let symop = tget("x", tmerge(tcons(vec![("z", vu("w"))]), lv("z", some(tcons(vec![("x", cu(1))])))));
+    let simplified = symop.clone().simplify();
+    info!("symop = {symop:?}, simplifed = {simplified:?}");
+    assert_eq!(simplified, Ok(*co(valu(1))));
+    
+    // (get x (some (merge { z : w } (loaded-var z { x : y })))) == Ok((some y))
+    let symop = tget("x", some(tmerge(tcons(vec![("z", vu("w"))]), lv("z", tcons(vec![("x", vu("y"))])))));
+    let simplified = symop.clone().simplify();
+    info!("symop = {symop:?}, simplifed = {simplified:?}");
+    assert_eq!(simplified, Ok(*some(vu("y"))));
+    
+    // (get x (some (merge { z : w } (loaded-var z { x : u1 })))) == Ok((some u1))
+    let symop = tget("x", some(tmerge(tcons(vec![("z", vu("w"))]), lv("z", tcons(vec![("x", cu(1))])))));
+    let simplified = symop.clone().simplify();
+    info!("symop = {symop:?}, simplifed = {simplified:?}");
+    assert_eq!(simplified, Ok(*co(valu(1))));
 }
 
 #[test]
@@ -1883,11 +1885,11 @@ fn test_halt_if_sym() {
     
     // two halting states
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(pi(var_get(sb("x"))))
             .formula(cu(2)),
 
-        Halt::new()
+        Halt::new_test()
             .pred(pnot(pi(var_get(sb("x")))))
             .formula(cu(3)),
     ]);
@@ -1909,12 +1911,12 @@ fn test_halt_as_max_len_sym_shrink() {
 
     // two halting states -- one where the shrink works, and one where it doesn't
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(pleq(llen(var_get(sl("x", TS::BoolType, 3))), cu(2)))
             .formula(some(var_get(sl("x", TS::BoolType, 3)))),
         
         // TODO: propagate new length
-        Halt::new()
+        Halt::new_test()
             .pred(pgreater(llen(var_get(sl("x", TS::BoolType, 3))), cu(2)))
             .formula(none())
     ]);
@@ -1937,7 +1939,7 @@ fn test_halt_as_max_len_sym_grow() {
     // one halting state, since the new length exceeds the type's max length
     assert_halts(termination_states, vec![
         // TODO: propagate new length
-        Halt::new()
+        Halt::new_test()
             .pred(pleq(llen(var_get(sl("x", TS::BoolType, 3))), cu(4)))
             .formula(some(var_get(sl("x", TS::BoolType, 3)))),
     ]);
@@ -1960,7 +1962,7 @@ fn test_halt_tuple_cons() {
     }
     
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(pi(var_get(sb("x"))))
             .formula(tcons(vec![
                 ("x", var_get(sb("x"))),
@@ -1968,7 +1970,7 @@ fn test_halt_tuple_cons() {
                 ("z", var_get(sl("z", TS::UIntType, 4)))
             ])),
 
-        Halt::new()
+        Halt::new_test()
             .pred(pi(not(var_get(sb("x")))))
             .formula(tcons(vec![
                 ("x", var_get(sb("x"))),
@@ -1992,11 +1994,11 @@ fn test_halt_tuple_get() {
     }
    
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(pi(var_get(sb("x"))))
             .formula(cu(1)),
 
-        Halt::new()
+        Halt::new_test()
             .pred(pnot(pi(var_get(sb("x")))))
             .formula(cu(2))
     ]);
@@ -2017,14 +2019,14 @@ fn test_halt_tuple_merge() {
     }
    
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(pi(var_get(sb("x"))))
             .formula(tcons(vec![
                 ("x", var_get(sb("x"))),
                 ("y", cu(1))
             ])),
 
-        Halt::new()
+        Halt::new_test()
             .pred(pnot(pi(var_get(sb("x")))))
             .formula(tcons(vec![
                 ("x", var_get(sb("x"))),
@@ -2056,32 +2058,32 @@ fn test_halt_begin() {
     }
 
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(pand(vec![
                 pi(var_get(sb("x"))),
                 pi(var_get(sb("y")))
             ]))
             .formula(cb(true))
-            .var(contract_id.clone(), "x", lv("x", cb(false)))
-            .var(contract_id.clone(), "y", lv("y", cb(false))),
+            .var(contract_id.clone(), "x", cb(false))
+            .var(contract_id.clone(), "y", cb(false)),
 
-        Halt::new()
+        Halt::new_test()
             .pred(pand(vec![
                 pnot(pi(var_get(sb("x")))),
                 pi(var_get(sb("y")))
             ]))
             .formula(cb(true))
-            .var(contract_id.clone(), "y", lv("y", cb(false))),
+            .var(contract_id.clone(), "y", cb(false)),
 
-        Halt::new()
+        Halt::new_test()
             .pred(pand(vec![
                 pi(var_get(sb("x"))),
                 pnot(pi(var_get(sb("y"))))
             ]))
             .formula(cb(true))
-            .var(contract_id.clone(), "x", lv("x", cb(false))),
+            .var(contract_id.clone(), "x", cb(false)),
 
-        Halt::new()
+        Halt::new_test()
             .pred(pand(vec![
                 pnot(pi(var_get(sb("x")))),
                 pnot(pi(var_get(sb("y"))))
@@ -2105,11 +2107,11 @@ fn test_halt_default_to() {
     }
     
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(pi(is_some(var_get(so("x", TS::BoolType)))))
             .formula(unwrap_panic(var_get(so("x", TS::BoolType)))),
 
-        Halt::new()
+        Halt::new_test()
             .pred(pi(is_none(var_get(so("x", TS::BoolType)))))
             .formula(cb(false))
     ]);
@@ -2130,11 +2132,11 @@ fn test_halt_asserts() {
     }
    
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(pi(var_get(sb("x"))))
             .formula(cb(true)),
 
-        Halt::new()
+        Halt::new_test()
             .pred(pnot(pi(var_get(sb("x")))))
             .formula(Box::new(err(cu(0)).simplify().unwrap()))
             .early_return()
@@ -2157,11 +2159,11 @@ fn test_halt_unwrap_opt() {
     }
    
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(pi(is_some(var_get(so("x", TS::BoolType)))))
             .formula(unwrap_panic(var_get(so("x", TS::BoolType)))),
 
-        Halt::new()
+        Halt::new_test()
             .pred(pi(is_none(var_get(so("x", TS::BoolType)))))
             .formula(Box::new(err(cu(0)).simplify().unwrap()))
             .early_return()
@@ -2184,11 +2186,11 @@ fn test_halt_unwrap_res() {
     }
    
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(pi(is_ok(var_get(sr("x", TS::BoolType, TS::UIntType)))))
             .formula(unwrap_panic(var_get(sr("x", TS::BoolType, TS::UIntType)))),
 
-        Halt::new()
+        Halt::new_test()
             .pred(pi(is_err(var_get(sr("x", TS::BoolType, TS::UIntType)))))
             .formula(Box::new(err(cu(0)).simplify().unwrap()))
             .early_return()
@@ -2211,11 +2213,11 @@ fn test_halt_unwrap_err() {
     }
    
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(pi(is_err(var_get(sr("x", TS::BoolType, TS::UIntType)))))
             .formula(unwrap_err_panic(var_get(sr("x", TS::BoolType, TS::UIntType)))),
 
-        Halt::new()
+        Halt::new_test()
             .pred(pi(is_ok(var_get(sr("x", TS::BoolType, TS::UIntType)))))
             .formula(Box::new(err(cu(0)).simplify().unwrap()))
             .early_return()
@@ -2238,11 +2240,11 @@ fn test_halt_unwrap_panic_opt() {
     }
    
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(pi(is_some(var_get(so("x", TS::BoolType)))))
             .formula(unwrap_panic(var_get(so("x", TS::BoolType)))),
 
-        Halt::new()
+        Halt::new_test()
             .pred(pi(is_none(var_get(so("x", TS::BoolType)))))
             .formula(panic())
             .early_return()
@@ -2266,11 +2268,11 @@ fn test_halt_unwrap_panic_res() {
     }
    
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(pi(is_ok(var_get(sr("x", TS::BoolType, TS::UIntType)))))
             .formula(unwrap_panic(var_get(sr("x", TS::BoolType, TS::UIntType)))),
 
-        Halt::new()
+        Halt::new_test()
             .pred(pi(is_err(var_get(sr("x", TS::BoolType, TS::UIntType)))))
             .formula(panic())
             .early_return()
@@ -2294,11 +2296,11 @@ fn test_halt_unwrap_err_panic() {
     }
    
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(pi(is_err(var_get(sr("x", TS::BoolType, TS::UIntType)))))
             .formula(unwrap_err_panic(var_get(sr("x", TS::BoolType, TS::UIntType)))),
 
-        Halt::new()
+        Halt::new_test()
             .pred(pi(is_ok(var_get(sr("x", TS::BoolType, TS::UIntType)))))
             .formula(panic())
             .early_return()
@@ -2324,11 +2326,11 @@ fn test_halt_match_opt() {
     }
 
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(pi(is_some(var_get(so("x", TS::UIntType)))))
             .formula(add2(cu(1), unwrap_panic(var_get(so("x", TS::UIntType))))),
 
-        Halt::new()
+        Halt::new_test()
             .pred(pi(is_none(var_get(so("x", TS::UIntType)))))
             .formula(cu(2))
     ]);
@@ -2351,11 +2353,11 @@ fn test_halt_match_res() {
     }
 
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(pi(is_ok(var_get(sr("x", TS::UIntType, TS::UIntType)))))
             .formula(add2(cu(1), unwrap_panic(var_get(sr("x", TS::UIntType, TS::UIntType))))),
 
-        Halt::new()
+        Halt::new_test()
             .pred(pi(is_err(var_get(sr("x", TS::UIntType, TS::UIntType)))))
             .formula(sub2(unwrap_err_panic(var_get(sr("x", TS::UIntType, TS::UIntType))), cu(1)))
     ]);
@@ -2376,11 +2378,11 @@ fn test_halt_try_opt() {
     }
 
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(pi(is_some(var_get(so("x", TS::UIntType)))))
             .formula(unwrap_panic(var_get(so("x", TS::UIntType)))),
 
-        Halt::new()
+        Halt::new_test()
             .pred(pi(is_none(var_get(so("x", TS::UIntType)))))
             .formula(none())
             .early_return()
@@ -2402,11 +2404,11 @@ fn test_halt_try_res() {
     }
 
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(pi(is_ok(var_get(sr("x", TS::UIntType, TS::UIntType)))))
             .formula(unwrap_panic(var_get(sr("x", TS::UIntType, TS::UIntType)))),
 
-        Halt::new()
+        Halt::new_test()
             .pred(pi(is_err(var_get(sr("x", TS::UIntType, TS::UIntType)))))
             .formula(var_get(sr("x", TS::UIntType, TS::UIntType)))
             .early_return()
@@ -2424,7 +2426,7 @@ fn test_halt_symop_add() {
         info!("termination state: ==================================\n{}\n", &t.clone().rollup());
     }
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(pt())
             .formula(cu(1 + 2 + 3 + 4 + 5))
     ]);
@@ -2441,7 +2443,7 @@ fn test_halt_symop_if_constant() {
         info!("termination state: ==================================\n{}\n", &t.clone().rollup());
     }
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(pt())
             .formula(cu(2)),
     ]);
@@ -2459,7 +2461,7 @@ fn test_halt_symop_if_sym_constant() {
     }
     // unreachable continuation was eliminated
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(pt())
             .formula(cu(2))
     ]);
@@ -2476,11 +2478,11 @@ fn test_halt_symop_if_sym_var() {
         info!("termination state: ==================================\n{}\n", &t.clone().rollup());
     }
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(pi(var_get(sb("x"))))
             .formula(cu(2)),
 
-        Halt::new()
+        Halt::new_test()
             .pred(pnot(pi(var_get(sb("x")))))
             .formula(cu(3))
     ]);
@@ -2498,15 +2500,15 @@ fn test_halt_symop_var_set_if_sym_var() {
     }
 
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(pi(var_get(sb("x"))))
             .formula(cb(true))
-            .var(contract_id.clone(), "y", lv("y", cu(2))),
+            .var(contract_id.clone(), "y", cu(2)),
 
-        Halt::new()
+        Halt::new_test()
             .pred(pnot(pi(var_get(sb("x")))))
             .formula(cb(true))
-            .var(contract_id.clone(), "y", lv("y", cu(3)))
+            .var(contract_id.clone(), "y", cu(3)),
     ]);
 }
 
@@ -2533,17 +2535,17 @@ fn test_halt_symop_multiple_var_set_if_sym_var() {
     }
 
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(pi(var_get(sb("x"))))
             .formula(cb(true))
-            .var(contract_id.clone(), "y", lv("y", cu(2)))
-            .var(contract_id.clone(), "z", lv("z", cu(20))),
+            .var(contract_id.clone(), "y", cu(2))
+            .var(contract_id.clone(), "z", cu(20)),
 
-        Halt::new()
+        Halt::new_test()
             .pred(pnot(pi(var_get(sb("x")))))
             .formula(cb(true))
-            .var(contract_id.clone(), "y", lv("y", cu(3)))
-            .var(contract_id.clone(), "z", lv("z", cu(30)))
+            .var(contract_id.clone(), "y", cu(3))
+            .var(contract_id.clone(), "z", cu(30))
     ]);
 }
 
@@ -2566,11 +2568,11 @@ fn test_halt_add_from_identical_ifs() {
     }
 
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(pi(var_get(sb("a"))))
             .formula(cu(0 + 1 + 2 + 3)),
 
-        Halt::new()
+        Halt::new_test()
             .pred(pnot(pi(var_get(sb("a")))))
             .formula(cu(10 + 11 + 12 + 13))
     ]);
@@ -2598,67 +2600,40 @@ fn test_halt_add_from_unrelated_ifs() {
     }
 
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(pand(vec![pi(var_get(sb("a"))), pi(var_get(sb("b"))), pi(var_get(sb("c"))), pi(var_get(sb("d")))]))
-            .formula(cu(0 + 1 + 2 + 3)),
+            .formula(cu(6)),
+        
+        Halt::new_test()
+            .pred(por(vec![
+                pand(vec![pi(var_get(sb("a"))), pi(var_get(sb("b"))), pnot(pi(var_get(sb("c")))), pnot(pi(var_get(sb("d"))))]),
+                pand(vec![pi(var_get(sb("a"))), pnot(pi(var_get(sb("b")))), pi(var_get(sb("c"))), pnot(pi(var_get(sb("d"))))]),
+                pand(vec![pi(var_get(sb("a"))), pnot(pi(var_get(sb("b")))), pnot(pi(var_get(sb("c")))), pi(var_get(sb("d")))]),
+                pand(vec![pnot(pi(var_get(sb("a")))), pi(var_get(sb("b"))), pi(var_get(sb("c"))), pnot(pi(var_get(sb("d"))))]),
+                pand(vec![pnot(pi(var_get(sb("a")))), pi(var_get(sb("b"))), pnot(pi(var_get(sb("c")))), pi(var_get(sb("d")))]),
+                pand(vec![pnot(pi(var_get(sb("a")))), pnot(pi(var_get(sb("b")))), pi(var_get(sb("c"))), pi(var_get(sb("d")))]),
+            ]))
+            .formula(cu(26)),
 
-        Halt::new()
-            .pred(pand(vec![pi(var_get(sb("a"))), pi(var_get(sb("b"))), pi(var_get(sb("c"))), pnot(pi(var_get(sb("d"))))]))
-            .formula(cu(0 + 1 + 2 + 13)),
-
-        Halt::new()
-            .pred(pand(vec![pi(var_get(sb("a"))), pi(var_get(sb("b"))), pnot(pi(var_get(sb("c")))), pi(var_get(sb("d")))]))
-            .formula(cu(0 + 1 + 12 + 3)),
+        Halt::new_test()
+            .pred(por(vec![
+                pand(vec![pi(var_get(sb("a"))), pnot(pi(var_get(sb("b")))), pi(var_get(sb("c"))), pi(var_get(sb("d")))]),
+                pand(vec![pnot(pi(var_get(sb("a")))), pi(var_get(sb("b"))), pi(var_get(sb("c"))), pi(var_get(sb("d")))]),
+                pand(vec![pi(var_get(sb("a"))), pi(var_get(sb("b"))), pi(var_get(sb("c"))), pnot(pi(var_get(sb("d"))))]),
+                pand(vec![pi(var_get(sb("a"))), pi(var_get(sb("b"))), pnot(pi(var_get(sb("c")))), pi(var_get(sb("d")))]),
+            ]))
+            .formula(cu(16)),
         
-        Halt::new()
-            .pred(pand(vec![pi(var_get(sb("a"))), pi(var_get(sb("b"))), pnot(pi(var_get(sb("c")))), pnot(pi(var_get(sb("d"))))]))
-            .formula(cu(0 + 1 + 12 + 13)),
-
-        Halt::new()
-            .pred(pand(vec![pi(var_get(sb("a"))), pnot(pi(var_get(sb("b")))), pi(var_get(sb("c"))), pi(var_get(sb("d")))]))
-            .formula(cu(0 + 11 + 2 + 3)),
+        Halt::new_test()
+            .pred(por(vec![
+                pand(vec![pnot(pi(var_get(sb("a")))), pi(var_get(sb("b"))), pnot(pi(var_get(sb("c")))), pnot(pi(var_get(sb("d"))))]),
+                pand(vec![pnot(pi(var_get(sb("a")))), pnot(pi(var_get(sb("b")))), pi(var_get(sb("c"))), pnot(pi(var_get(sb("d"))))]),
+                pand(vec![pi(var_get(sb("a"))), pnot(pi(var_get(sb("b")))), pnot(pi(var_get(sb("c")))), pnot(pi(var_get(sb("d"))))]),
+                pand(vec![pnot(pi(var_get(sb("a")))), pnot(pi(var_get(sb("b")))), pnot(pi(var_get(sb("c")))), pi(var_get(sb("d")))]),
+            ]))
+            .formula(cu(36)),
         
-        Halt::new()
-            .pred(pand(vec![pi(var_get(sb("a"))), pnot(pi(var_get(sb("b")))), pi(var_get(sb("c"))), pnot(pi(var_get(sb("d"))))]))
-            .formula(cu(0 + 11 + 2 + 13)),
-        
-        Halt::new()
-            .pred(pand(vec![pi(var_get(sb("a"))), pnot(pi(var_get(sb("b")))), pnot(pi(var_get(sb("c")))), pi(var_get(sb("d")))]))
-            .formula(cu(0 + 11 + 12 + 3)),
-        
-        Halt::new()
-            .pred(pand(vec![pi(var_get(sb("a"))), pnot(pi(var_get(sb("b")))), pnot(pi(var_get(sb("c")))), pnot(pi(var_get(sb("d"))))]))
-            .formula(cu(0 + 11 + 12 + 13)),
-        
-        Halt::new()
-            .pred(pand(vec![pnot(pi(var_get(sb("a")))), pi(var_get(sb("b"))), pi(var_get(sb("c"))), pi(var_get(sb("d")))]))
-            .formula(cu(10 + 1 + 2 + 3)),
-        
-        Halt::new()
-            .pred(pand(vec![pnot(pi(var_get(sb("a")))), pi(var_get(sb("b"))), pi(var_get(sb("c"))), pnot(pi(var_get(sb("d"))))]))
-            .formula(cu(10 + 1 + 2 + 13)),
-        
-        Halt::new()
-            .pred(pand(vec![pnot(pi(var_get(sb("a")))), pi(var_get(sb("b"))), pnot(pi(var_get(sb("c")))), pi(var_get(sb("d")))]))
-            .formula(cu(10 + 1 + 12 + 3)),
-         
-        Halt::new()
-            .pred(pand(vec![pnot(pi(var_get(sb("a")))), pi(var_get(sb("b"))), pnot(pi(var_get(sb("c")))), pnot(pi(var_get(sb("d"))))]))
-            .formula(cu(10 + 1 + 12 + 13)),
-        
-        Halt::new()
-            .pred(pand(vec![pnot(pi(var_get(sb("a")))), pnot(pi(var_get(sb("b")))), pi(var_get(sb("c"))), pi(var_get(sb("d")))]))
-            .formula(cu(10 + 11 + 2 + 3)),
-        
-        Halt::new()
-            .pred(pand(vec![pnot(pi(var_get(sb("a")))), pnot(pi(var_get(sb("b")))), pi(var_get(sb("c"))), pnot(pi(var_get(sb("d"))))]))
-            .formula(cu(10 + 11 + 2 + 13)),
-        
-        Halt::new()
-            .pred(pand(vec![pnot(pi(var_get(sb("a")))), pnot(pi(var_get(sb("b")))), pnot(pi(var_get(sb("c")))), pi(var_get(sb("d")))]))
-            .formula(cu(10 + 11 + 12 + 3)),
-        
-        Halt::new()
+        Halt::new_test()
             .pred(pand(vec![pnot(pi(var_get(sb("a")))), pnot(pi(var_get(sb("b")))), pnot(pi(var_get(sb("c")))), pnot(pi(var_get(sb("d"))))]))
             .formula(cu(10 + 11 + 12 + 13))
     ])
@@ -2683,11 +2658,11 @@ fn test_halt_list_cons_from_same_if() {
     }
     
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(pi(var_get(sb("a"))))
             .formula(cl(vec![valu(0), valu(1), valu(2), valu(3)])),
         
-        Halt::new()
+        Halt::new_test()
             .pred(pnot(pi(var_get(sb("a")))))
             .formula(cl(vec![valu(10), valu(11), valu(12), valu(13)]))
     ]);
@@ -2715,67 +2690,67 @@ fn test_halt_list_cons_from_unrelated_ifs() {
     }
     
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(pand(vec![pi(var_get(sb("a"))), pi(var_get(sb("b"))), pi(var_get(sb("c"))), pi(var_get(sb("d")))]))
             .formula(cl(vec![valu(0), valu(1), valu(2), valu(3)])),
 
-        Halt::new()
+        Halt::new_test()
             .pred(pand(vec![pi(var_get(sb("a"))), pi(var_get(sb("b"))), pi(var_get(sb("c"))), pnot(pi(var_get(sb("d"))))]))
             .formula(cl(vec![valu(0), valu(1), valu(2), valu(13)])),
 
-        Halt::new()
+        Halt::new_test()
             .pred(pand(vec![pi(var_get(sb("a"))), pi(var_get(sb("b"))), pnot(pi(var_get(sb("c")))), pi(var_get(sb("d")))]))
             .formula(cl(vec![valu(0), valu(1), valu(12), valu(3)])),
         
-        Halt::new()
+        Halt::new_test()
             .pred(pand(vec![pi(var_get(sb("a"))), pi(var_get(sb("b"))), pnot(pi(var_get(sb("c")))), pnot(pi(var_get(sb("d"))))]))
             .formula(cl(vec![valu(0), valu(1), valu(12), valu(13)])),
 
-        Halt::new()
+        Halt::new_test()
             .pred(pand(vec![pi(var_get(sb("a"))), pnot(pi(var_get(sb("b")))), pi(var_get(sb("c"))), pi(var_get(sb("d")))]))
             .formula(cl(vec![valu(0), valu(11), valu(2), valu(3)])),
         
-        Halt::new()
+        Halt::new_test()
             .pred(pand(vec![pi(var_get(sb("a"))), pnot(pi(var_get(sb("b")))), pi(var_get(sb("c"))), pnot(pi(var_get(sb("d"))))]))
             .formula(cl(vec![valu(0), valu(11), valu(2), valu(13)])),
         
-        Halt::new()
+        Halt::new_test()
             .pred(pand(vec![pi(var_get(sb("a"))), pnot(pi(var_get(sb("b")))), pnot(pi(var_get(sb("c")))), pi(var_get(sb("d")))]))
             .formula(cl(vec![valu(0), valu(11), valu(12), valu(3)])),
         
-        Halt::new()
+        Halt::new_test()
             .pred(pand(vec![pi(var_get(sb("a"))), pnot(pi(var_get(sb("b")))), pnot(pi(var_get(sb("c")))), pnot(pi(var_get(sb("d"))))]))
             .formula(cl(vec![valu(0), valu(11), valu(12), valu(13)])),
         
-        Halt::new()
+        Halt::new_test()
             .pred(pand(vec![pnot(pi(var_get(sb("a")))), pi(var_get(sb("b"))), pi(var_get(sb("c"))), pi(var_get(sb("d")))]))
             .formula(cl(vec![valu(10), valu(1), valu(2), valu(3)])),
         
-        Halt::new()
+        Halt::new_test()
             .pred(pand(vec![pnot(pi(var_get(sb("a")))), pi(var_get(sb("b"))), pi(var_get(sb("c"))), pnot(pi(var_get(sb("d"))))]))
             .formula(cl(vec![valu(10), valu(1), valu(2), valu(13)])),
         
-        Halt::new()
+        Halt::new_test()
             .pred(pand(vec![pnot(pi(var_get(sb("a")))), pi(var_get(sb("b"))), pnot(pi(var_get(sb("c")))), pi(var_get(sb("d")))]))
             .formula(cl(vec![valu(10), valu(1), valu(12), valu(3)])),
          
-        Halt::new()
+        Halt::new_test()
             .pred(pand(vec![pnot(pi(var_get(sb("a")))), pi(var_get(sb("b"))), pnot(pi(var_get(sb("c")))), pnot(pi(var_get(sb("d"))))]))
             .formula(cl(vec![valu(10), valu(1), valu(12), valu(13)])),
         
-        Halt::new()
+        Halt::new_test()
             .pred(pand(vec![pnot(pi(var_get(sb("a")))), pnot(pi(var_get(sb("b")))), pi(var_get(sb("c"))), pi(var_get(sb("d")))]))
             .formula(cl(vec![valu(10), valu(11), valu(2), valu(3)])),
         
-        Halt::new()
+        Halt::new_test()
             .pred(pand(vec![pnot(pi(var_get(sb("a")))), pnot(pi(var_get(sb("b")))), pi(var_get(sb("c"))), pnot(pi(var_get(sb("d"))))]))
             .formula(cl(vec![valu(10), valu(11), valu(2), valu(13)])),
         
-        Halt::new()
+        Halt::new_test()
             .pred(pand(vec![pnot(pi(var_get(sb("a")))), pnot(pi(var_get(sb("b")))), pnot(pi(var_get(sb("c")))), pi(var_get(sb("d")))]))
             .formula(cl(vec![valu(10), valu(11), valu(12), valu(3)])),
         
-        Halt::new()
+        Halt::new_test()
             .pred(pand(vec![pnot(pi(var_get(sb("a")))), pnot(pi(var_get(sb("b")))), pnot(pi(var_get(sb("c")))), pnot(pi(var_get(sb("d"))))]))
             .formula(cl(vec![valu(10), valu(11), valu(12), valu(13)]))
     ])
@@ -2800,7 +2775,7 @@ fn test_halt_function_call() {
     }
 
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(pt())
             .formula(cu(1))
     ]);
@@ -2818,7 +2793,7 @@ fn test_halt_mod() {
     }
 
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(pt())
             .formula(cu(2 % 3))
     ]);
@@ -2836,7 +2811,7 @@ fn test_halt_is_eq() {
     }
     
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(pt())
             .formula(cb(false))
     ]);
@@ -2854,7 +2829,7 @@ fn test_halt_if_is_eq() {
     }
 
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(pt())
             .formula(cu(2))
     ]);
@@ -2881,7 +2856,7 @@ fn test_halt_function_call_if_branch() {
     }
 
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(pt())
             .formula(cu(1))
     ]);
@@ -2909,12 +2884,12 @@ fn test_halt_function_call_if_branch_pre_post_vars() {
     }
 
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(peq(rem(var_get(su("v")), cu(2)), cu(0)))
             .formula(cb(true))
             .var(contract_id.clone(), "v", add(vec![cu(1), var_get(su("v"))])),
 
-        Halt::new()
+        Halt::new_test()
             .pred(pnot(peq(rem(var_get(su("v")), cu(2)), cu(0))))
             .formula(cb(true))
             .var(contract_id.clone(), "v", add(vec![cu(3), var_get(su("v"))]))
@@ -2946,7 +2921,7 @@ fn test_halt_var_get_set_tower() {
     }
 
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(pt())
             .formula(add(vec![cu(6), var_get(su("w"))]))
             .var(contract_id.clone(), "w", add(vec![cu(5), var_get(su("w"))]))
@@ -2986,7 +2961,7 @@ fn test_halt_var_get_set_if_tree() {
     }
 
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(peqs(vec![
                 rem(var_get(su("v")), cu(2)),
                 rem(var_get(su("w")), cu(2)),
@@ -2996,19 +2971,19 @@ fn test_halt_var_get_set_if_tree() {
             .var(contract_id.clone(), "v", cu(101))
             .var(contract_id.clone(), "w", cu(101)),
 
-        Halt::new()
+        Halt::new_test()
             .pred(pand(vec![peq(rem(var_get(su("v")), cu(2)), cu(0)), pnot(peq(rem(var_get(su("w")), cu(2)), cu(0)))]))
             .formula(cl(vec![valu(201), valu(200)]))
             .var(contract_id.clone(), "v", cu(201))
             .var(contract_id.clone(), "w", cu(200)),
 
-        Halt::new()
+        Halt::new_test()
             .pred(pand(vec![pnot(peq(rem(var_get(su("v")), cu(2)), cu(0))), peq(rem(var_get(su("w")), cu(2)), cu(0))]))
             .formula(cl(vec![valu(300), valu(301)]))
             .var(contract_id.clone(), "v", cu(300))
             .var(contract_id.clone(), "w", cu(301)),
             
-        Halt::new()
+        Halt::new_test()
             .pred(pand(vec![pnot(peq(rem(var_get(su("v")), cu(2)), cu(0))), pnot(peq(rem(var_get(su("w")), cu(2)), cu(0)))]))
             .formula(cl(vec![valu(400), valu(400)]))
             .var(contract_id.clone(), "v", cu(400))
@@ -3041,7 +3016,7 @@ fn test_halt_var_get_set_tower_if_tree() {
     }
 
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(peqs(vec![
                 rem(var_get(su("v")), cu(2)),
                 rem(var_get(su("w")), cu(2)),
@@ -3051,19 +3026,19 @@ fn test_halt_var_get_set_tower_if_tree() {
             .var(contract_id.clone(), "v", add(vec![cu(6), var_get(su("w"))]))
             .var(contract_id.clone(), "w", add(vec![cu(5), var_get(su("w"))])),
 
-        Halt::new()
+        Halt::new_test()
             .pred(pand(vec![peq(rem(var_get(su("v")), cu(2)), cu(0)), pnot(peq(rem(var_get(su("w")), cu(2)), cu(0)))]))
             .formula(add(vec![cu(24), var_get(su("w"))]))
             .var(contract_id.clone(), "v", add(vec![cu(24), var_get(su("w"))]))
             .var(contract_id.clone(), "w", add(vec![cu(23), var_get(su("w"))])),
 
-        Halt::new()
+        Halt::new_test()
             .pred(pand(vec![pnot(peq(rem(var_get(su("v")), cu(2)), cu(0))), peq(rem(var_get(su("w")), cu(2)), cu(0))]))
             .formula(add(vec![cu(42), var_get(su("w"))]))
             .var(contract_id.clone(), "v", add(vec![cu(42), var_get(su("w"))]))
             .var(contract_id.clone(), "w", add(vec![cu(32), var_get(su("w"))])),
 
-        Halt::new()
+        Halt::new_test()
             .pred(pand(vec![pnot(peq(rem(var_get(su("v")), cu(2)), cu(0))), pnot(peq(rem(var_get(su("w")), cu(2)), cu(0)))]))
             .formula(add(vec![cu(60), var_get(su("w"))]))
             .var(contract_id.clone(), "v", add(vec![cu(60), var_get(su("w"))]))
@@ -3099,7 +3074,7 @@ fn test_halt_var_get_set_if_sequence() {
     }
 
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(peqs(vec![
                 rem(var_get(su("v")), cu(2)),
                 rem(var_get(su("v")), cu(3)),
@@ -3109,7 +3084,7 @@ fn test_halt_var_get_set_if_sequence() {
             .formula(lcons(vec![var_get(su("v")), cu(40)]))
             .var(contract_id.clone(), "w", cu(40)),
 
-        Halt::new()
+        Halt::new_test()
             .pred(pand(vec![
                 peqs(vec![
                     rem(var_get(su("v")), cu(2)),
@@ -3122,17 +3097,14 @@ fn test_halt_var_get_set_if_sequence() {
             .var(contract_id.clone(), "v", cu(6))
             .var(contract_id.clone(), "w", cu(30)),
 
-        Halt::new()
-            .pred(pand(vec![
-                peq(rem(var_get(su("v")), cu(2)), cu(0)),
-                pnot(peq(rem(var_get(su("v")), cu(3)), cu(0))),
+        Halt::new_test()
+            .pred(por(vec![
+                pand(vec![
+                    peq(rem(var_get(su("v")), cu(2)), cu(0)),
+                    pnot(peq(rem(var_get(su("v")), cu(3)), cu(0)))
+                ]),
+                pnot(peq(rem(var_get(su("v")), cu(2)), cu(0)))
             ]))
-            .formula(cl(vec![valu(5), valu(40)]))
-            .var(contract_id.clone(), "v", cu(5))
-            .var(contract_id.clone(), "w", cu(40)),
-
-        Halt::new()
-            .pred(pnot(peq(rem(var_get(su("v")), cu(2)), cu(0))))
             .formula(cl(vec![valu(5), valu(40)]))
             .var(contract_id.clone(), "v", cu(5))
             .var(contract_id.clone(), "w", cu(40)),
@@ -3179,7 +3151,7 @@ fn test_halt_let_bind() {
     }
 
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(pt())
             .formula(cb(true))
             .var(contract_id.clone(), "v", add(vec![cu(3), var_get(su("v"))]))
@@ -3205,12 +3177,12 @@ fn test_halt_if_let_bind() {
     }
 
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(peq(rem(var_get(su("v")), cu(2)), cu(0)))
             .formula(cb(true))
             .var(contract_id.clone(), "v", add(vec![cu(1), var_get(su("v"))])),
         
-        Halt::new()
+        Halt::new_test()
             .pred(pnot(peq(rem(var_get(su("v")), cu(2)), cu(0))))
             .formula(cb(true))
             .var(contract_id.clone(), "v", add(vec![cu(2), var_get(su("v"))]))
@@ -3238,12 +3210,12 @@ fn test_halt_if_let_var_set_bind() {
     }
 
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(peq(rem(var_get(su("v")), cu(2)), cu(0)))
             .formula(cb(true))
             .var(contract_id.clone(), "v", cu(10)),
 
-        Halt::new()
+        Halt::new_test()
             .pred(pnot(peq(rem(var_get(su("v")), cu(2)), cu(0))))
             .formula(cb(true))
             .var(contract_id.clone(), "v", add(vec![cu(2), var_get(su("v"))]))
@@ -3269,7 +3241,7 @@ fn test_halt_map_user_func() {
     }
 
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(pt())
             .formula(lcons(vec![var_get(su("v")), add2(cu(1), var_get(su("v"))), add2(cu(2), var_get(su("v"))), add2(cu(3), var_get(su("v")))]))
     ]);
@@ -3296,10 +3268,10 @@ fn test_halt_map_user_func_branch() {
     }
 
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(peq(rem(var_get(su("v")), cu(2)), cu(0)))
             .formula(lcons(vec![var_get(su("v")), add2(cu(1), var_get(su("v"))), add2(cu(2), var_get(su("v"))), add2(cu(3), var_get(su("v")))])),
-        Halt::new()
+        Halt::new_test()
             .pred(pnot(peq(rem(var_get(su("v")), cu(2)), cu(0))))
             .formula(lcons(vec![var_get(su("v")), sub2(var_get(su("v")), cu(1)), sub2(var_get(su("v")), cu(2)), sub2(var_get(su("v")), cu(3))]))
     ])
@@ -3324,10 +3296,10 @@ fn test_alt_map_sequence_branch() {
     }
 
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(peq(rem(var_get(su("v")), cu(2)), cu(0)))
             .formula(lcons(vec![var_get(su("v")), add2(cu(1), var_get(su("v"))), add2(cu(2), var_get(su("v"))), add2(cu(3), var_get(su("v")))])),
-        Halt::new()
+        Halt::new_test()
             .pred(pnot(peq(rem(var_get(su("v")), cu(2)), cu(0))))
             .formula(lcons(vec![add2(cu(10), var_get(su("v"))), add2(cu(11), var_get(su("v"))), add2(cu(12), var_get(su("v"))), add2(cu(13), var_get(su("v")))]))
     ])
@@ -3353,24 +3325,24 @@ fn test_halt_map_symbolic_list() {
     }
 
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(peq(cu(0), llen(var_get(sl("list-v", TS::UIntType, 4)))))
             .formula(cl(vec![])),
 
-        Halt::new()
+        Halt::new_test()
             .pred(peq(cu(1), llen(var_get(sl("list-v", TS::UIntType, 4)))))
             .formula(lcons(vec![
                 add2(var_get(su("v")), unwrap_panic(elat(var_get(sl("list-v", TS::UIntType, 4)), cu(0))))
             ])),
 
-        Halt::new()
+        Halt::new_test()
             .pred(peq(cu(2), llen(var_get(sl("list-v", TS::UIntType, 4)))))
             .formula(lcons(vec![
                 add2(var_get(su("v")), unwrap_panic(elat(var_get(sl("list-v", TS::UIntType, 4)), cu(0)))),
                 add2(var_get(su("v")), unwrap_panic(elat(var_get(sl("list-v", TS::UIntType, 4)), cu(1))))
             ])),
         
-        Halt::new()
+        Halt::new_test()
             .pred(peq(cu(3), llen(var_get(sl("list-v", TS::UIntType, 4)))))
             .formula(lcons(vec![
                 add2(var_get(su("v")), unwrap_panic(elat(var_get(sl("list-v", TS::UIntType, 4)), cu(0)))),
@@ -3378,7 +3350,7 @@ fn test_halt_map_symbolic_list() {
                 add2(var_get(su("v")), unwrap_panic(elat(var_get(sl("list-v", TS::UIntType, 4)), cu(2))))
             ])),
         
-        Halt::new()
+        Halt::new_test()
             .pred(peq(cu(4), llen(var_get(sl("list-v", TS::UIntType, 4)))))
             .formula(lcons(vec![
                 add2(var_get(su("v")), unwrap_panic(elat(var_get(sl("list-v", TS::UIntType, 4)), cu(0)))),
@@ -3411,7 +3383,7 @@ fn test_halt_map_symbolic_lists() {
     }
     
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(por(vec![
                 peq(cu(0), llen(var_get(sl("list-v1", TS::UIntType, 4)))),
                 peq(cu(0), llen(var_get(sl("list-v2", TS::UIntType, 4)))),
@@ -3419,7 +3391,7 @@ fn test_halt_map_symbolic_lists() {
             ]))
             .formula(cl(vec![])),
 
-        Halt::new()
+        Halt::new_test()
             .pred(por(vec![
                 pand(vec![
                     peq(cu(1), llen(var_get(sl("list-v1", TS::UIntType, 4)))),
@@ -3446,7 +3418,7 @@ fn test_halt_map_symbolic_lists() {
                 ])
             ])),
         
-        Halt::new()
+        Halt::new_test()
             .pred(por(vec![
                 pand(vec![
                     peq(cu(2), llen(var_get(sl("list-v1", TS::UIntType, 4)))),
@@ -3479,7 +3451,7 @@ fn test_halt_map_symbolic_lists() {
                 ])
             ])),
         
-        Halt::new()
+        Halt::new_test()
             .pred(por(vec![
                 pand(vec![
                     peq(cu(3), llen(var_get(sl("list-v1", TS::UIntType, 4)))),
@@ -3518,7 +3490,7 @@ fn test_halt_map_symbolic_lists() {
                 ])
             ])),
         
-        Halt::new()
+        Halt::new_test()
             .pred(por(vec![
                 pand(vec![
                     peq(cu(4), llen(var_get(sl("list-v1", TS::UIntType, 4)))),
@@ -3584,7 +3556,7 @@ fn test_halt_fold_user_func() {
     }
 
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(pt())
             .formula(add(vec![
                 mul2(cu(4), var_get(su("v"))),
@@ -3620,14 +3592,14 @@ fn test_halt_fold_user_func_branch() {
     }
 
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(peq(rem(var_get(su("v")), cu(2)), cu(0)))
             .formula(add(vec![
                 mul2(cu(4), var_get(su("v"))),
                 cu(16)
             ])),
 
-        Halt::new()
+        Halt::new_test()
             .pred(pnot(peq(rem(var_get(su("v")), cu(2)), cu(0))))
             .formula(cu(8))
     ]);
@@ -3652,11 +3624,11 @@ fn test_halt_fold_sequence_branch() {
     }
 
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(peq(rem(var_get(su("v")), cu(2)), cu(0)))
             .formula(add2(mul2(var_get(su("v")), cu(4)), cu(16))),
 
-        Halt::new()
+        Halt::new_test()
             .pred(pnot(peq(rem(var_get(su("v")), cu(2)), cu(0))))
             .formula(add2(mul2(var_get(su("v")), cu(4)), cu(56))),
     ]);
@@ -3682,11 +3654,11 @@ fn test_halt_fold_symbolic_lists() {
     }
    
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(peq(llen(var_get(sl("list-v1", TS::UIntType, 4))), cu(0)))
             .formula(cu(10)),
 
-        Halt::new()
+        Halt::new_test()
             .pred(peq(llen(var_get(sl("list-v1", TS::UIntType, 4))), cu(1)))
             .formula(add(vec![
                 var_get(su("v")),
@@ -3694,7 +3666,7 @@ fn test_halt_fold_symbolic_lists() {
                 cu(10)
             ])),
 
-        Halt::new()
+        Halt::new_test()
             .pred(peq(llen(var_get(sl("list-v1", TS::UIntType, 4))), cu(2)))
             .formula(add(vec![
                 mul2(cu(2), var_get(su("v"))),
@@ -3703,7 +3675,7 @@ fn test_halt_fold_symbolic_lists() {
                 cu(10)
             ])),
 
-        Halt::new()
+        Halt::new_test()
             .pred(peq(llen(var_get(sl("list-v1", TS::UIntType, 4))), cu(3)))
             .formula(add(vec![
                 mul2(cu(3), var_get(su("v"))),
@@ -3713,7 +3685,7 @@ fn test_halt_fold_symbolic_lists() {
                 cu(10)
             ])),
 
-        Halt::new()
+        Halt::new_test()
             .pred(peq(llen(var_get(sl("list-v1", TS::UIntType, 4))), cu(4)))
             .formula(add(vec![
                 mul2(cu(4), var_get(su("v"))),
@@ -3745,15 +3717,15 @@ fn test_halt_filter_list_user_func() {
     }
 
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(peq(var_get(su("v")), cu(0)))
             .formula(cl(vec![valu(0), valu(2)])),
 
-        Halt::new()
+        Halt::new_test()
             .pred(peq(var_get(su("v")), cu(1)))
             .formula(cl(vec![valu(1), valu(3)])),
 
-        Halt::new()
+        Halt::new_test()
             .pred(pand(vec![pnot(peq(var_get(su("v")), cu(0))), pnot(peq(var_get(su("v")), cu(1)))]))
             .formula(cl(vec![]))
     ]);
@@ -3780,11 +3752,11 @@ fn test_halt_filter_user_func_branch() {
     }
 
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(peq(var_get(su("v")), cu(3)))
             .formula(cl(vec![valu(0), valu(2), valu(3)])),
 
-        Halt::new()
+        Halt::new_test()
             .pred(pnot(peq(var_get(su("v")), cu(3))))
             .formula(cl(vec![valu(3)]))
     ]);
@@ -3809,15 +3781,15 @@ fn test_halt_filter_sequence_branch() {
     }
 
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(peq(var_get(su("v")), cu(1)))
             .formula(cl(vec![valu(1), valu(3)])),
 
-        Halt::new()
+        Halt::new_test()
             .pred(peq(var_get(su("v")), cu(0)))
             .formula(cl(vec![valu(10), valu(20)])),
 
-        Halt::new()
+        Halt::new_test()
             .pred(pand(vec![pnot(peq(var_get(su("v")), cu(0))), pnot(peq(var_get(su("v")), cu(1)))]))
             .formula(cl(vec![]))
     ]);
@@ -3843,71 +3815,97 @@ fn test_halt_filter_symbolic_lists() {
     }
 
     assert_halts(termination_states, vec![
-        // length 0 -- 1 possibility
-        Halt::new()
-            .pred(peq(llen(var_get(sl("l", TS::UIntType, 3))), cu(0)))
-            .formula(cl(vec![])),
-
-        // length 1 -- 2 possibilities
-        Halt::new()
-            .pred(pand(vec![
-                peq(llen(var_get(sl("l", TS::UIntType, 3))), cu(1)),
-                peq(var_get(su("v")), rem(unwrap_panic(elat(var_get(sl("l", TS::UIntType, 3)), cu(0))), cu(2)))
+        Halt::new_test()
+            .pred(por(vec![
+                pand(vec![
+                    peq(llen(var_get(sl("l", TS::UIntType, 3))), cu(1)),
+                    peq(var_get(su("v")), rem(unwrap_panic(elat(var_get(sl("l", TS::UIntType, 3)), cu(0))), cu(2)))
+                ]),
+                pand(vec![
+                    peq(llen(var_get(sl("l", TS::UIntType, 3))), cu(2)),
+                    peq(var_get(su("v")), rem(unwrap_panic(elat(var_get(sl("l", TS::UIntType, 3)), cu(0))), cu(2))),
+                    pnot(peq(var_get(su("v")), rem(unwrap_panic(elat(var_get(sl("l", TS::UIntType, 3)), cu(1))), cu(2)))),
+                ]),
+                pand(vec![
+                    peq(llen(var_get(sl("l", TS::UIntType, 3))), cu(3)),
+                    peqs(vec![
+                        var_get(su("v")),
+                        rem(unwrap_panic(elat(var_get(sl("l", TS::UIntType, 3)), cu(0))), cu(2))
+                    ]),
+                    pnot(peq(var_get(su("v")), rem(unwrap_panic(elat(var_get(sl("l", TS::UIntType, 3)), cu(1))), cu(2)))),
+                    pnot(peq(var_get(su("v")), rem(unwrap_panic(elat(var_get(sl("l", TS::UIntType, 3)), cu(2))), cu(2)))),
+                ])
             ]))
             .formula(lcons(vec![unwrap_panic(elat(var_get(sl("l", TS::UIntType, 3)), cu(0)))])),
         
-        Halt::new()
-            .pred(pand(vec![
-                peq(llen(var_get(sl("l", TS::UIntType, 3))), cu(1)),
-                pnot(peq(var_get(su("v")), rem(unwrap_panic(elat(var_get(sl("l", TS::UIntType, 3)), cu(0))), cu(2))))
+        Halt::new_test()
+            .pred(por(vec![
+                peq(llen(var_get(sl("l", TS::UIntType, 3))), cu(0)),
+                pand(vec![
+                    peq(llen(var_get(sl("l", TS::UIntType, 3))), cu(1)),
+                    pnot(peq(var_get(su("v")), rem(unwrap_panic(elat(var_get(sl("l", TS::UIntType, 3)), cu(0))), cu(2))))
+                ]),
+                pand(vec![
+                    peq(llen(var_get(sl("l", TS::UIntType, 3))), cu(2)),
+                    pnot(peq(var_get(su("v")), rem(unwrap_panic(elat(var_get(sl("l", TS::UIntType, 3)), cu(0))), cu(2)))),
+                    pnot(peq(var_get(su("v")), rem(unwrap_panic(elat(var_get(sl("l", TS::UIntType, 3)), cu(1))), cu(2)))),
+                ]),
+                pand(vec![
+                    peq(llen(var_get(sl("l", TS::UIntType, 3))), cu(3)),
+                    pnot(peq(var_get(su("v")), rem(unwrap_panic(elat(var_get(sl("l", TS::UIntType, 3)), cu(0))), cu(2)))),
+                    pnot(peq(var_get(su("v")), rem(unwrap_panic(elat(var_get(sl("l", TS::UIntType, 3)), cu(1))), cu(2)))),
+                    pnot(peq(var_get(su("v")), rem(unwrap_panic(elat(var_get(sl("l", TS::UIntType, 3)), cu(2))), cu(2)))),
+                ])
             ]))
             .formula(cl(vec![])),
            
-        // length 2 -- 4 possibilities
-        Halt::new()
-            .pred(pand(vec![
-                peq(llen(var_get(sl("l", TS::UIntType, 3))), cu(2)),
-                peqs(vec![
-                    var_get(su("v")),
-                    rem(unwrap_panic(elat(var_get(sl("l", TS::UIntType, 3)), cu(0))), cu(2)),
-                    rem(unwrap_panic(elat(var_get(sl("l", TS::UIntType, 3)), cu(1))), cu(2)),
-                ])
+        Halt::new_test()
+            .pred(por(vec![
+                pand(vec![
+                    peq(llen(var_get(sl("l", TS::UIntType, 3))), cu(2)),
+                    peqs(vec![
+                        var_get(su("v")),
+                        rem(unwrap_panic(elat(var_get(sl("l", TS::UIntType, 3)), cu(0))), cu(2)),
+                        rem(unwrap_panic(elat(var_get(sl("l", TS::UIntType, 3)), cu(1))), cu(2)),
+                    ])
+                ]),
+                pand(vec![
+                    peq(llen(var_get(sl("l", TS::UIntType, 3))), cu(3)),
+                    peqs(vec![
+                        var_get(su("v")),
+                        rem(unwrap_panic(elat(var_get(sl("l", TS::UIntType, 3)), cu(0))), cu(2)),
+                        rem(unwrap_panic(elat(var_get(sl("l", TS::UIntType, 3)), cu(1))), cu(2)),
+                    ]),
+                    pnot(peq(var_get(su("v")), rem(unwrap_panic(elat(var_get(sl("l", TS::UIntType, 3)), cu(2))), cu(2)))),
+                ]),
             ]))
             .formula(lcons(vec![
                 unwrap_panic(elat(var_get(sl("l", TS::UIntType, 3)), cu(0))),
                 unwrap_panic(elat(var_get(sl("l", TS::UIntType, 3)), cu(1)))
             ])),
 
-        Halt::new()
-            .pred(pand(vec![
-                peq(llen(var_get(sl("l", TS::UIntType, 3))), cu(2)),
-                peq(var_get(su("v")), rem(unwrap_panic(elat(var_get(sl("l", TS::UIntType, 3)), cu(0))), cu(2))),
-                pnot(peq(var_get(su("v")), rem(unwrap_panic(elat(var_get(sl("l", TS::UIntType, 3)), cu(1))), cu(2)))),
-            ]))
-            .formula(lcons(vec![
-                unwrap_panic(elat(var_get(sl("l", TS::UIntType, 3)), cu(0))),
-            ])),
-
-        Halt::new()
-            .pred(pand(vec![
-                peq(llen(var_get(sl("l", TS::UIntType, 3))), cu(2)),
-                pnot(peq(var_get(su("v")), rem(unwrap_panic(elat(var_get(sl("l", TS::UIntType, 3)), cu(0))), cu(2)))),
-                peq(var_get(su("v")), rem(unwrap_panic(elat(var_get(sl("l", TS::UIntType, 3)), cu(1))), cu(2))),
+        Halt::new_test()
+            .pred(por(vec![
+                pand(vec![
+                    peq(llen(var_get(sl("l", TS::UIntType, 3))), cu(2)),
+                    pnot(peq(var_get(su("v")), rem(unwrap_panic(elat(var_get(sl("l", TS::UIntType, 3)), cu(0))), cu(2)))),
+                    peq(var_get(su("v")), rem(unwrap_panic(elat(var_get(sl("l", TS::UIntType, 3)), cu(1))), cu(2))),
+                ]),
+                pand(vec![
+                    peq(llen(var_get(sl("l", TS::UIntType, 3))), cu(3)),
+                    peqs(vec![
+                        var_get(su("v")),
+                        rem(unwrap_panic(elat(var_get(sl("l", TS::UIntType, 3)), cu(1))), cu(2))
+                    ]),
+                    pnot(peq(var_get(su("v")), rem(unwrap_panic(elat(var_get(sl("l", TS::UIntType, 3)), cu(0))), cu(2)))),
+                    pnot(peq(var_get(su("v")), rem(unwrap_panic(elat(var_get(sl("l", TS::UIntType, 3)), cu(2))), cu(2)))),
+                ]),
             ]))
             .formula(lcons(vec![
                 unwrap_panic(elat(var_get(sl("l", TS::UIntType, 3)), cu(1))),
             ])),
 
-        Halt::new()
-            .pred(pand(vec![
-                peq(llen(var_get(sl("l", TS::UIntType, 3))), cu(2)),
-                pnot(peq(var_get(su("v")), rem(unwrap_panic(elat(var_get(sl("l", TS::UIntType, 3)), cu(0))), cu(2)))),
-                pnot(peq(var_get(su("v")), rem(unwrap_panic(elat(var_get(sl("l", TS::UIntType, 3)), cu(1))), cu(2)))),
-            ]))
-            .formula(cl(vec![])),
-
-        // length 3 -- 8 possibilities
-        Halt::new()
+        Halt::new_test()
             .pred(pand(vec![
                 peq(llen(var_get(sl("l", TS::UIntType, 3))), cu(3)),
                 peqs(vec![
@@ -3923,22 +3921,7 @@ fn test_halt_filter_symbolic_lists() {
                 unwrap_panic(elat(var_get(sl("l", TS::UIntType, 3)), cu(2)))
             ])),
 
-        Halt::new()
-            .pred(pand(vec![
-                peq(llen(var_get(sl("l", TS::UIntType, 3))), cu(3)),
-                peqs(vec![
-                    var_get(su("v")),
-                    rem(unwrap_panic(elat(var_get(sl("l", TS::UIntType, 3)), cu(0))), cu(2)),
-                    rem(unwrap_panic(elat(var_get(sl("l", TS::UIntType, 3)), cu(1))), cu(2)),
-                ]),
-                pnot(peq(var_get(su("v")), rem(unwrap_panic(elat(var_get(sl("l", TS::UIntType, 3)), cu(2))), cu(2)))),
-            ]))
-            .formula(lcons(vec![
-                unwrap_panic(elat(var_get(sl("l", TS::UIntType, 3)), cu(0))),
-                unwrap_panic(elat(var_get(sl("l", TS::UIntType, 3)), cu(1))),
-            ])),
-        
-        Halt::new()
+        Halt::new_test()
             .pred(pand(vec![
                 peq(llen(var_get(sl("l", TS::UIntType, 3))), cu(3)),
                 peqs(vec![
@@ -3953,7 +3936,7 @@ fn test_halt_filter_symbolic_lists() {
                 unwrap_panic(elat(var_get(sl("l", TS::UIntType, 3)), cu(2))),
             ])),
         
-        Halt::new()
+        Halt::new_test()
             .pred(pand(vec![
                 peq(llen(var_get(sl("l", TS::UIntType, 3))), cu(3)),
                 peqs(vec![
@@ -3968,35 +3951,7 @@ fn test_halt_filter_symbolic_lists() {
                 unwrap_panic(elat(var_get(sl("l", TS::UIntType, 3)), cu(2))),
             ])),
         
-        Halt::new()
-            .pred(pand(vec![
-                peq(llen(var_get(sl("l", TS::UIntType, 3))), cu(3)),
-                peqs(vec![
-                    var_get(su("v")),
-                    rem(unwrap_panic(elat(var_get(sl("l", TS::UIntType, 3)), cu(1))), cu(2))
-                ]),
-                pnot(peq(var_get(su("v")), rem(unwrap_panic(elat(var_get(sl("l", TS::UIntType, 3)), cu(0))), cu(2)))),
-                pnot(peq(var_get(su("v")), rem(unwrap_panic(elat(var_get(sl("l", TS::UIntType, 3)), cu(2))), cu(2)))),
-            ]))
-            .formula(lcons(vec![
-                unwrap_panic(elat(var_get(sl("l", TS::UIntType, 3)), cu(1))),
-            ])),
-
-        Halt::new()
-            .pred(pand(vec![
-                peq(llen(var_get(sl("l", TS::UIntType, 3))), cu(3)),
-                peqs(vec![
-                    var_get(su("v")),
-                    rem(unwrap_panic(elat(var_get(sl("l", TS::UIntType, 3)), cu(0))), cu(2))
-                ]),
-                pnot(peq(var_get(su("v")), rem(unwrap_panic(elat(var_get(sl("l", TS::UIntType, 3)), cu(1))), cu(2)))),
-                pnot(peq(var_get(su("v")), rem(unwrap_panic(elat(var_get(sl("l", TS::UIntType, 3)), cu(2))), cu(2)))),
-            ]))
-            .formula(lcons(vec![
-                unwrap_panic(elat(var_get(sl("l", TS::UIntType, 3)), cu(0))),
-            ])),
-
-        Halt::new()
+        Halt::new_test()
             .pred(pand(vec![
                 peq(llen(var_get(sl("l", TS::UIntType, 3))), cu(3)),
                 peqs(vec![
@@ -4009,15 +3964,6 @@ fn test_halt_filter_symbolic_lists() {
             .formula(lcons(vec![
                 unwrap_panic(elat(var_get(sl("l", TS::UIntType, 3)), cu(2))),
             ])),
-
-        Halt::new()
-            .pred(pand(vec![
-                peq(llen(var_get(sl("l", TS::UIntType, 3))), cu(3)),
-                pnot(peq(var_get(su("v")), rem(unwrap_panic(elat(var_get(sl("l", TS::UIntType, 3)), cu(0))), cu(2)))),
-                pnot(peq(var_get(su("v")), rem(unwrap_panic(elat(var_get(sl("l", TS::UIntType, 3)), cu(1))), cu(2)))),
-                pnot(peq(var_get(su("v")), rem(unwrap_panic(elat(var_get(sl("l", TS::UIntType, 3)), cu(2))), cu(2)))),
-            ]))
-            .formula(cl(vec![])),
     ]);
 }
 
@@ -4046,17 +3992,16 @@ fn test_halt_map_get() {
         assert!(t.map_accesses.iter().find(|ma| {
             ma.name.name().as_str() == "squares" 
             && ma.key == *vu("x")
-            && ma.value == None
         }).is_some());
         assert!(t.pre_map_state.get(&FullName(contract_id.clone(), ClarityName::try_from("squares").unwrap())).unwrap().get(&cu(3)).is_some());
     }
 
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(pis_some(map_get("squares", cu(3))))
-            .formula(mul2(unwrap_panic(map_get("squares", cu(3))), unwrap_panic(map_get("squares", cu(3))))),
+            .formula(pow(unwrap_panic(map_get("squares", cu(3))), cu(2))),
         
-        Halt::new()
+        Halt::new_test()
             .pred(pis_none(map_get("squares", cu(3))))
             .formula(cu(6))
     ]);
@@ -4086,12 +4031,12 @@ fn test_halt_map_set() {
     }
 
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(pis_some(map_get("squares", cu(3))))
             .formula(cb(true))
-            .map(contract_id.clone(), "squares", unwrap_panic(map_get("squares", cu(3))), mul2(unwrap_panic(map_get("squares", cu(3))), unwrap_panic(map_get("squares", cu(3))))),
+            .map(contract_id.clone(), "squares", unwrap_panic(map_get("squares", cu(3))), pow(unwrap_panic(map_get("squares", cu(3))), cu(2))),
 
-        Halt::new()
+        Halt::new_test()
             .pred(pis_none(map_get("squares", cu(3))))
             .formula(cb(true))
             .map(contract_id.clone(), "squares", cu(3), cu(6))
@@ -4119,7 +4064,7 @@ fn test_halt_multiple_map_set() {
     }
 
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(pt())
             .formula(co(valu(3)))
             .map(contract_id.clone(), "squares", cu(1), cu(3))
@@ -4147,7 +4092,7 @@ fn test_halt_multiple_sym_map_set() {
         info!("termination state: ==================================\n{}\n", &t.clone().rollup());
     }
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(pt())
             .formula(some(add2(cu(2), var_get(su("x")))))
             .map(contract_id.clone(), "squares", var_get(su("x")), add2(cu(2), var_get(su("x"))))
@@ -4175,7 +4120,7 @@ fn test_halt_multiple_map_get_none() {
     }
     
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(pt())
             .formula(map_get("squares", cu(2)))
             .map(contract_id.clone(), "squares", cu(1), cu(3))
@@ -4204,7 +4149,7 @@ fn test_halt_map_set_delete() {
     }
 
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(pt())
             .formula(none())
             .mapd(contract_id.clone(), "squares", cu(1))
@@ -4238,7 +4183,7 @@ fn test_halt_limit_function_exploration() {
     }
     
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(pt())
             .formula(fcall(&format!("{contract_id}.ignored-function"), vec![cu(3), cu(2)]))
             .reachable_map_write(contract_id.clone(), "squares")
@@ -4298,19 +4243,19 @@ fn test_halt_rollup_early_return() {
     }
 
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(pnot(peq(rem(lv("input", vu("input")), cu(3)), cu(0))))
             .formula(cerr(valu(1)))
             .early_return(),
         
-        Halt::new()
+        Halt::new_test()
             .pred(pand(vec![peq(rem(lv("input", vu("input")), cu(3)), cu(0)), pnot(peq(rem(lv("input", vu("input")), cu(2)), cu(0)))]))
             .formula(cerr(valu(2)))
             .early_return(),
 
-        Halt::new()
+        Halt::new_test()
             .pred(peqs(vec![rem(lv("input", vu("input")), cu(2)), rem(lv("input", vu("input")), cu(3)), cu(0)]))
-            .formula(ok(mul(vec![lv("input", vu("input")), lv("input", vu("input")), lv("input", vu("input"))])))
+            .formula(ok(pow(lv("input", vu("input")), cu(3))))
     ]);
 }
 
@@ -4394,44 +4339,19 @@ fn test_halt_contract_call() {
     }
 
     assert_halts(termination_states, vec![
-        Halt::new()
-            .pred(pand(vec![
-                peq(rem(fq_var_get(&client_contract_id, su("xx")), cu(3)), cu(0)),
-                pis_some(fq_map_get(&library_contract_id, "quads", fq_var_get(&client_contract_id, su("xx")))),
-                pis_some(fq_map_get(&library_contract_id, "squares", fq_var_get(&client_contract_id, su("xx")))),
-            ]))
-            .formula(cok(valb(false)))
-            .reachable_map_write(library_contract_id.clone(), "cubes")
-            .reachable_map_write(library_contract_id.clone(), "quads")
-            .reachable_map_write(client_contract_id.clone(), "quints"),
-        
-        Halt::new()
+        Halt::new_test()
             .pred(pand(vec![
                 peq(rem(fq_var_get(&client_contract_id, su("xx")), cu(3)), cu(0)),
                 pis_none(fq_map_get(&library_contract_id, "quads", fq_var_get(&client_contract_id, su("xx")))),
                 pis_some(fq_map_get(&library_contract_id, "squares", fq_var_get(&client_contract_id, su("xx")))),
             ]))
             .formula(cok(valb(true)))
-            .map(library_contract_id.clone(), "quads", fq_var_get(&client_contract_id, su("xx")), mul(vec![
-                unwrap_panic(fq_map_get(&library_contract_id, "squares", fq_var_get(&client_contract_id, su("xx")))),
-                unwrap_panic(fq_map_get(&library_contract_id, "squares", fq_var_get(&client_contract_id, su("xx"))))
-            ]))
-            .reachable_map_write(library_contract_id.clone(), "cubes")
-            .reachable_map_write(library_contract_id.clone(), "quads")
-            .reachable_map_write(client_contract_id.clone(), "quints"),
-        
-        Halt::new()
-            .pred(pand(vec![
-                peq(rem(fq_var_get(&client_contract_id, su("xx")), cu(3)), cu(0)),
-                pis_some(fq_map_get(&library_contract_id, "quads", fq_var_get(&client_contract_id, su("xx")))),
-                pis_none(fq_map_get(&library_contract_id, "squares", fq_var_get(&client_contract_id, su("xx")))),
-            ]))
-            .formula(cok(valb(false)))
+            .map(library_contract_id.clone(), "quads", fq_var_get(&client_contract_id, su("xx")), pow(unwrap_panic(fq_map_get(&library_contract_id, "squares", fq_var_get(&client_contract_id, su("xx")))), cu(2)))
             .reachable_map_write(library_contract_id.clone(), "cubes")
             .reachable_map_write(library_contract_id.clone(), "quads")
             .reachable_map_write(client_contract_id.clone(), "quints"),
 
-        Halt::new()
+        Halt::new_test()
             .pred(pand(vec![
                 peq(rem(fq_var_get(&client_contract_id, su("xx")), cu(3)), cu(0)),
                 pis_none(fq_map_get(&library_contract_id, "quads", fq_var_get(&client_contract_id, su("xx")))),
@@ -4443,22 +4363,11 @@ fn test_halt_contract_call() {
             .reachable_map_write(library_contract_id.clone(), "quads")
             .reachable_map_write(client_contract_id.clone(), "quints"),
 
-        Halt::new()
-            .pred(pand(vec![
-                pnot(peq(rem(fq_var_get(&client_contract_id, su("xx")), cu(3)), cu(0))),
-                pis_some(fq_map_get(&client_contract_id, "quints", fq_var_get(&client_contract_id, su("xx")))),
-                pis_some(fq_map_get(&library_contract_id, "cubes", fq_var_get(&client_contract_id, su("xx")))),
-                pis_some(fq_map_get(&library_contract_id, "squares", fq_var_get(&client_contract_id, su("xx")))),
-            ]))
-            .formula(cok(valb(false)))
-            .reachable_map_write(library_contract_id.clone(), "cubes")
-            .reachable_map_write(library_contract_id.clone(), "quads")
-            .reachable_map_write(client_contract_id.clone(), "quints"),
-
-        Halt::new()
+        Halt::new_test()
             .pred(pand(vec![
                 pnot(peq(rem(fq_var_get(&client_contract_id, su("xx")), cu(3)), cu(0))),
                 pis_none(fq_map_get(&client_contract_id, "quints", fq_var_get(&client_contract_id, su("xx")))),
+                pis_none(fq_map_get(&client_contract_id, "squares", fq_var_get(&client_contract_id, su("xx")))),
                 pis_some(fq_map_get(&library_contract_id, "cubes", fq_var_get(&client_contract_id, su("xx")))),
                 pis_some(fq_map_get(&library_contract_id, "squares", fq_var_get(&client_contract_id, su("xx")))),
             ]))
@@ -4471,28 +4380,43 @@ fn test_halt_contract_call() {
             .reachable_map_write(library_contract_id.clone(), "quads")
             .reachable_map_write(client_contract_id.clone(), "quints"),
 
-        Halt::new()
-            .pred(pand(vec![
-                pnot(peq(rem(fq_var_get(&client_contract_id, su("xx")), cu(3)), cu(0))),
-                pis_some(fq_map_get(&client_contract_id, "quints", fq_var_get(&client_contract_id, su("xx")))),
-                pis_none(fq_map_get(&library_contract_id, "cubes", fq_var_get(&client_contract_id, su("xx")))),
-                pis_some(fq_map_get(&library_contract_id, "squares", fq_var_get(&client_contract_id, su("xx")))),
-            ]))
-            .formula(cok(valb(false)))
-            .reachable_map_write(library_contract_id.clone(), "cubes")
-            .reachable_map_write(library_contract_id.clone(), "quads")
-            .reachable_map_write(client_contract_id.clone(), "quints"),
-
-        Halt::new()
-            .pred(pand(vec![
-                pnot(peq(rem(fq_var_get(&client_contract_id, su("xx")), cu(3)), cu(0))),
-                pis_none(fq_map_get(&client_contract_id, "quints", fq_var_get(&client_contract_id, su("xx")))),
-                pis_none(fq_map_get(&library_contract_id, "cubes", fq_var_get(&client_contract_id, su("xx")))),
-                pis_some(fq_map_get(&library_contract_id, "squares", fq_var_get(&client_contract_id, su("xx")))),
+        Halt::new_test()
+            .pred(por(vec![
+                pand(vec![
+                    pnot(peq(rem(fq_var_get(&client_contract_id, su("xx")), cu(3)), cu(0))),
+                    pis_none(fq_map_get(&client_contract_id, "quints", fq_var_get(&client_contract_id, su("xx")))),
+                    pis_some(fq_map_get(&client_contract_id, "squares", fq_var_get(&client_contract_id, su("xx")))),
+                    pis_some(fq_map_get(&library_contract_id, "cubes", fq_var_get(&client_contract_id, su("xx")))),
+                    pis_none(fq_map_get(&library_contract_id, "squares", fq_var_get(&client_contract_id, su("xx"))))
+                ]),
+                pand(vec![
+                    pnot(peq(rem(fq_var_get(&client_contract_id, su("xx")), cu(3)), cu(0))),
+                    pis_none(fq_map_get(&client_contract_id, "quints", fq_var_get(&client_contract_id, su("xx")))),
+                    pis_some(fq_map_get(&client_contract_id, "squares", fq_var_get(&client_contract_id, su("xx")))),
+                    pis_some(fq_map_get(&library_contract_id, "cubes", fq_var_get(&client_contract_id, su("xx")))),
+                    pis_some(fq_map_get(&library_contract_id, "squares", fq_var_get(&client_contract_id, su("xx"))))
+                ]),
             ]))
             .formula(cok(valb(true)))
             .map(client_contract_id.clone(), "quints", fq_var_get(&client_contract_id, su("xx")), mul(vec![
-                unwrap_panic(fq_map_get(&library_contract_id, "squares", fq_var_get(&client_contract_id, su("xx")))),
+                unwrap_panic(fq_map_get(&client_contract_id, "squares", fq_var_get(&client_contract_id, su("xx")))),
+                unwrap_panic(fq_map_get(&library_contract_id, "cubes", fq_var_get(&client_contract_id, su("xx")))),
+            ]))
+            .reachable_map_write(library_contract_id.clone(), "cubes")
+            .reachable_map_write(library_contract_id.clone(), "quads")
+            .reachable_map_write(client_contract_id.clone(), "quints"),
+       
+        Halt::new_test()
+            .pred(pand(vec![
+                pnot(peq(rem(fq_var_get(&client_contract_id, su("xx")), cu(3)), cu(0))),
+                pis_none(fq_map_get(&client_contract_id, "quints", fq_var_get(&client_contract_id, su("xx")))),
+                pis_some(fq_map_get(&client_contract_id, "squares", fq_var_get(&client_contract_id, su("xx")))),
+                pis_none(fq_map_get(&library_contract_id, "cubes", fq_var_get(&client_contract_id, su("xx")))),
+                pis_some(fq_map_get(&library_contract_id, "squares", fq_var_get(&client_contract_id, su("xx"))))
+            ]))
+            .formula(cok(valb(true)))
+            .map(client_contract_id.clone(), "quints", fq_var_get(&client_contract_id, su("xx")), mul(vec![
+                unwrap_panic(fq_map_get(&client_contract_id, "squares", fq_var_get(&client_contract_id, su("xx")))),
                 unwrap_panic(fq_map_get(&library_contract_id, "squares", fq_var_get(&client_contract_id, su("xx")))),
                 fq_var_get(&client_contract_id, su("xx"))
             ]))
@@ -4500,24 +4424,46 @@ fn test_halt_contract_call() {
             .reachable_map_write(library_contract_id.clone(), "quads")
             .reachable_map_write(client_contract_id.clone(), "quints"),
 
-        Halt::new()
+        Halt::new_test()
             .pred(pand(vec![
                 pnot(peq(rem(fq_var_get(&client_contract_id, su("xx")), cu(3)), cu(0))),
-                pis_some(fq_map_get(&client_contract_id, "quints", fq_var_get(&client_contract_id, su("xx")))),
-                pis_some(fq_map_get(&library_contract_id, "cubes", fq_var_get(&client_contract_id, su("xx")))),
-                pis_none(fq_map_get(&library_contract_id, "squares", fq_var_get(&client_contract_id, su("xx")))),
+                pis_none(fq_map_get(&client_contract_id, "quints", fq_var_get(&client_contract_id, su("xx")))),
+                pis_none(fq_map_get(&client_contract_id, "squares", fq_var_get(&client_contract_id, su("xx")))),
+                pis_none(fq_map_get(&library_contract_id, "cubes", fq_var_get(&client_contract_id, su("xx")))),
+                pis_some(fq_map_get(&library_contract_id, "squares", fq_var_get(&client_contract_id, su("xx")))),
             ]))
-            .formula(cok(valb(false)))
+            .formula(cok(valb(true)))
+            .map(client_contract_id.clone(), "quints", fq_var_get(&client_contract_id, su("xx")), mul(vec![
+                fq_var_get(&client_contract_id, su("xx")),
+                pow(unwrap_panic(fq_map_get(&library_contract_id, "squares", fq_var_get(&client_contract_id, su("xx")))), cu(2))
+            ]))
             .reachable_map_write(library_contract_id.clone(), "cubes")
             .reachable_map_write(library_contract_id.clone(), "quads")
             .reachable_map_write(client_contract_id.clone(), "quints"),
 
-        Halt::new()
-            .pred(pand(vec![
-                pnot(peq(rem(fq_var_get(&client_contract_id, su("xx")), cu(3)), cu(0))),
-                pis_none(fq_map_get(&client_contract_id, "quints", fq_var_get(&client_contract_id, su("xx")))),
-                pis_some(fq_map_get(&library_contract_id, "cubes", fq_var_get(&client_contract_id, su("xx")))),
-                pis_none(fq_map_get(&library_contract_id, "squares", fq_var_get(&client_contract_id, su("xx")))),
+        Halt::new_test()
+            .pred(por(vec![
+                pand(vec![
+                    pnot(peq(rem(fq_var_get(&client_contract_id, su("xx")), cu(3)), cu(0))),
+                    pis_none(fq_map_get(&client_contract_id, "quints", fq_var_get(&client_contract_id, su("xx")))),
+                    pis_none(fq_map_get(&client_contract_id, "squares", fq_var_get(&client_contract_id, su("xx")))),
+                    pis_none(fq_map_get(&library_contract_id, "cubes", fq_var_get(&client_contract_id, su("xx")))),
+                    pis_none(fq_map_get(&library_contract_id, "squares", fq_var_get(&client_contract_id, su("xx"))))
+                ]),
+                pand(vec![
+                    pnot(peq(rem(fq_var_get(&client_contract_id, su("xx")), cu(3)), cu(0))),
+                    pis_none(fq_map_get(&client_contract_id, "quints", fq_var_get(&client_contract_id, su("xx")))),
+                    pis_none(fq_map_get(&client_contract_id, "squares", fq_var_get(&client_contract_id, su("xx")))),
+                    pis_some(fq_map_get(&library_contract_id, "cubes", fq_var_get(&client_contract_id, su("xx")))),
+                    pis_none(fq_map_get(&library_contract_id, "squares", fq_var_get(&client_contract_id, su("xx"))))
+                ]),
+                pand(vec![
+                    pnot(peq(rem(fq_var_get(&client_contract_id, su("xx")), cu(3)), cu(0))),
+                    pis_none(fq_map_get(&client_contract_id, "quints", fq_var_get(&client_contract_id, su("xx")))),
+                    pis_some(fq_map_get(&client_contract_id, "squares", fq_var_get(&client_contract_id, su("xx")))),
+                    pis_none(fq_map_get(&library_contract_id, "cubes", fq_var_get(&client_contract_id, su("xx")))),
+                    pis_none(fq_map_get(&library_contract_id, "squares", fq_var_get(&client_contract_id, su("xx"))))
+                ]),
             ]))
             .formula(cok(valb(true)))
             .map(client_contract_id.clone(), "quints", fq_var_get(&client_contract_id, su("xx")), cu(0))
@@ -4525,27 +4471,76 @@ fn test_halt_contract_call() {
             .reachable_map_write(library_contract_id.clone(), "quads")
             .reachable_map_write(client_contract_id.clone(), "quints"),
 
-        Halt::new()
-            .pred(pand(vec![
-                pnot(peq(rem(fq_var_get(&client_contract_id, su("xx")), cu(3)), cu(0))),
-                pis_some(fq_map_get(&client_contract_id, "quints", fq_var_get(&client_contract_id, su("xx")))),
-                pis_none(fq_map_get(&library_contract_id, "cubes", fq_var_get(&client_contract_id, su("xx")))),
-                pis_none(fq_map_get(&library_contract_id, "squares", fq_var_get(&client_contract_id, su("xx")))),
+        Halt::new_test()
+            .pred(por(vec![
+                pand(vec![
+                    peq(rem(fq_var_get(&client_contract_id, su("xx")), cu(3)), cu(0)),
+                    pis_some(fq_map_get(&library_contract_id, "quads", fq_var_get(&client_contract_id, su("xx")))),
+                    pis_some(fq_map_get(&library_contract_id, "squares", fq_var_get(&client_contract_id, su("xx")))),
+                ]),
+                pand(vec![
+                    peq(rem(fq_var_get(&client_contract_id, su("xx")), cu(3)), cu(0)),
+                    pis_some(fq_map_get(&library_contract_id, "quads", fq_var_get(&client_contract_id, su("xx")))),
+                    pis_none(fq_map_get(&library_contract_id, "squares", fq_var_get(&client_contract_id, su("xx")))),
+                ]),
+                pand(vec![
+                    pnot(peq(rem(fq_var_get(&client_contract_id, su("xx")), cu(3)), cu(0))),
+                    pis_some(fq_map_get(&client_contract_id, "quints", fq_var_get(&client_contract_id, su("xx")))),
+                    pis_none(fq_map_get(&client_contract_id, "squares", fq_var_get(&client_contract_id, su("xx")))),
+                    pis_none(fq_map_get(&library_contract_id, "cubes", fq_var_get(&client_contract_id, su("xx")))),
+                    pis_none(fq_map_get(&library_contract_id, "squares", fq_var_get(&client_contract_id, su("xx")))),
+                ]),
+                pand(vec![
+                    pnot(peq(rem(fq_var_get(&client_contract_id, su("xx")), cu(3)), cu(0))),
+                    pis_some(fq_map_get(&client_contract_id, "quints", fq_var_get(&client_contract_id, su("xx")))),
+                    pis_none(fq_map_get(&client_contract_id, "squares", fq_var_get(&client_contract_id, su("xx")))),
+                    pis_none(fq_map_get(&library_contract_id, "cubes", fq_var_get(&client_contract_id, su("xx")))),
+                    pis_some(fq_map_get(&library_contract_id, "squares", fq_var_get(&client_contract_id, su("xx")))),
+                ]),
+                pand(vec![
+                    pnot(peq(rem(fq_var_get(&client_contract_id, su("xx")), cu(3)), cu(0))),
+                    pis_some(fq_map_get(&client_contract_id, "quints", fq_var_get(&client_contract_id, su("xx")))),
+                    pis_none(fq_map_get(&client_contract_id, "squares", fq_var_get(&client_contract_id, su("xx")))),
+                    pis_some(fq_map_get(&library_contract_id, "cubes", fq_var_get(&client_contract_id, su("xx")))),
+                    pis_none(fq_map_get(&library_contract_id, "squares", fq_var_get(&client_contract_id, su("xx")))),
+                ]),
+                pand(vec![
+                    pnot(peq(rem(fq_var_get(&client_contract_id, su("xx")), cu(3)), cu(0))),
+                    pis_some(fq_map_get(&client_contract_id, "quints", fq_var_get(&client_contract_id, su("xx")))),
+                    pis_none(fq_map_get(&client_contract_id, "squares", fq_var_get(&client_contract_id, su("xx")))),
+                    pis_some(fq_map_get(&library_contract_id, "cubes", fq_var_get(&client_contract_id, su("xx")))),
+                    pis_some(fq_map_get(&library_contract_id, "squares", fq_var_get(&client_contract_id, su("xx")))),
+                ]),
+                pand(vec![
+                    pnot(peq(rem(fq_var_get(&client_contract_id, su("xx")), cu(3)), cu(0))),
+                    pis_some(fq_map_get(&client_contract_id, "quints", fq_var_get(&client_contract_id, su("xx")))),
+                    pis_some(fq_map_get(&client_contract_id, "squares", fq_var_get(&client_contract_id, su("xx")))),
+                    pis_none(fq_map_get(&library_contract_id, "cubes", fq_var_get(&client_contract_id, su("xx")))),
+                    pis_none(fq_map_get(&library_contract_id, "squares", fq_var_get(&client_contract_id, su("xx")))),
+                ]),
+                pand(vec![
+                    pnot(peq(rem(fq_var_get(&client_contract_id, su("xx")), cu(3)), cu(0))),
+                    pis_some(fq_map_get(&client_contract_id, "quints", fq_var_get(&client_contract_id, su("xx")))),
+                    pis_some(fq_map_get(&client_contract_id, "squares", fq_var_get(&client_contract_id, su("xx")))),
+                    pis_none(fq_map_get(&library_contract_id, "cubes", fq_var_get(&client_contract_id, su("xx")))),
+                    pis_some(fq_map_get(&library_contract_id, "squares", fq_var_get(&client_contract_id, su("xx")))),
+                ]),
+                pand(vec![
+                    pnot(peq(rem(fq_var_get(&client_contract_id, su("xx")), cu(3)), cu(0))),
+                    pis_some(fq_map_get(&client_contract_id, "quints", fq_var_get(&client_contract_id, su("xx")))),
+                    pis_some(fq_map_get(&client_contract_id, "squares", fq_var_get(&client_contract_id, su("xx")))),
+                    pis_some(fq_map_get(&library_contract_id, "cubes", fq_var_get(&client_contract_id, su("xx")))),
+                    pis_none(fq_map_get(&library_contract_id, "squares", fq_var_get(&client_contract_id, su("xx")))),
+                ]),
+                pand(vec![
+                    pnot(peq(rem(fq_var_get(&client_contract_id, su("xx")), cu(3)), cu(0))),
+                    pis_some(fq_map_get(&client_contract_id, "quints", fq_var_get(&client_contract_id, su("xx")))),
+                    pis_some(fq_map_get(&client_contract_id, "squares", fq_var_get(&client_contract_id, su("xx")))),
+                    pis_some(fq_map_get(&library_contract_id, "cubes", fq_var_get(&client_contract_id, su("xx")))),
+                    pis_some(fq_map_get(&library_contract_id, "squares", fq_var_get(&client_contract_id, su("xx")))),
+                ])
             ]))
             .formula(cok(valb(false)))
-            .reachable_map_write(library_contract_id.clone(), "cubes")
-            .reachable_map_write(library_contract_id.clone(), "quads")
-            .reachable_map_write(client_contract_id.clone(), "quints"),
-
-        Halt::new()
-            .pred(pand(vec![
-                pnot(peq(rem(fq_var_get(&client_contract_id, su("xx")), cu(3)), cu(0))),
-                pis_none(fq_map_get(&client_contract_id, "quints", fq_var_get(&client_contract_id, su("xx")))),
-                pis_none(fq_map_get(&library_contract_id, "cubes", fq_var_get(&client_contract_id, su("xx")))),
-                pis_none(fq_map_get(&library_contract_id, "squares", fq_var_get(&client_contract_id, su("xx")))),
-            ]))
-            .formula(cok(valb(true)))
-            .map(client_contract_id.clone(), "quints", fq_var_get(&client_contract_id, su("xx")), cu(0))
             .reachable_map_write(library_contract_id.clone(), "cubes")
             .reachable_map_write(library_contract_id.clone(), "quads")
             .reachable_map_write(client_contract_id.clone(), "quints"),
@@ -4614,11 +4609,11 @@ fn test_halt_trait_contract_call() {
     }
 
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(peq(vu("op"), cu(0)))
             .formula(ok(add2(vu("a"), vu("b")))),
         
-        Halt::new()
+        Halt::new_test()
             .pred(pnot(peq(vu("op"), cu(0))))
             .formula(cerr(valu(2000)))
     ]);
@@ -5362,7 +5357,7 @@ fn test_halt_pox4_get_check_delegation() {
     }
 
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(pand(vec![
                 pgreater(vu("burn-block-height"), 
                    unwrap_panic(tget("until-burn-ht",
@@ -5374,27 +5369,28 @@ fn test_halt_pox4_get_check_delegation() {
                 pi(is_some(map_get("delegation-state", tcons(vec![("stacker", vp("stacker"))]))))]))
             .formula(none()),
 
-        Halt::new()
-            .pred(pand(vec![
-                pleq(vu("burn-block-height"), 
-                   unwrap_panic(tget("until-burn-ht",
+        Halt::new_test()
+            .pred(por(vec![
+                pand(vec![
+                    pi(is_none(tget("until-burn-ht",
                         unwrap_panic(map_get("delegation-state", tcons(vec![("stacker", vp("stacker"))])))))),
 
-                pi(is_some(tget("until-burn-ht",
-                    unwrap_panic(map_get("delegation-state", tcons(vec![("stacker", vp("stacker"))])))))),
+                    pi(is_some(map_get("delegation-state", tcons(vec![("stacker", vp("stacker"))]))))
+                ]),
+                pand(vec![
+                    pleq(vu("burn-block-height"), 
+                       unwrap_panic(tget("until-burn-ht",
+                            unwrap_panic(map_get("delegation-state", tcons(vec![("stacker", vp("stacker"))])))))),
 
-                pi(is_some(map_get("delegation-state", tcons(vec![("stacker", vp("stacker"))]))))]))
+                    pi(is_some(tget("until-burn-ht",
+                        unwrap_panic(map_get("delegation-state", tcons(vec![("stacker", vp("stacker"))])))))),
+
+                    pi(is_some(map_get("delegation-state", tcons(vec![("stacker", vp("stacker"))]))))
+                ])
+            ]))
             .formula(some(unwrap_panic(map_get("delegation-state", tcons(vec![("stacker", vp("stacker"))]))))),
 
-        Halt::new()
-            .pred(pand(vec![
-                pi(is_none(tget("until-burn-ht",
-                    unwrap_panic(map_get("delegation-state", tcons(vec![("stacker", vp("stacker"))])))))),
-
-                pi(is_some(map_get("delegation-state", tcons(vec![("stacker", vp("stacker"))]))))]))
-            .formula(some(unwrap_panic(map_get("delegation-state", tcons(vec![("stacker", vp("stacker"))]))))),
-
-        Halt::new()
+        Halt::new_test()
             .pred(pi(is_none(map_get("delegation-state", tcons(vec![("stacker", vp("stacker"))])))))
             .formula(none())
             .early_return()
@@ -5551,12 +5547,12 @@ fn test_halt_pox4_verify_signer_key_sig() {
     );
 
     assert_halts(termination_states, vec![
-        Halt::new()
+        Halt::new_test()
             .pred(plesser(vu("max-amount"), vu("amount")))
             .formula(cerr(vali(38)))
             .early_return(),
 
-        Halt::new()
+        Halt::new_test()
             .pred(pand(vec![
                 pgeq(vu("max-amount"), vu("amount")),
                 pis_some(used_auth.clone())
@@ -5564,7 +5560,7 @@ fn test_halt_pox4_verify_signer_key_sig() {
             .formula(cerr(vali(39)))
             .early_return(),
 
-        Halt::new()
+        Halt::new_test()
             .pred(pand(vec![
                 pgeq(vu("max-amount"), vu("amount")),
                 pis_none(used_auth.clone()),
@@ -5575,7 +5571,7 @@ fn test_halt_pox4_verify_signer_key_sig() {
             .formula(cerr(vali(35)))
             .early_return(),
 
-        Halt::new()
+        Halt::new_test()
             .pred(pand(vec![
                 pgeq(vu("max-amount"), vu("amount")),
                 pis_some(vo("signer-sig-opt", TS::SequenceType(SequenceSubtype::BufferType(65u32.try_into().unwrap())))),
@@ -5585,46 +5581,592 @@ fn test_halt_pox4_verify_signer_key_sig() {
             .formula(cerr(vali(36)))
             .early_return(),
        
-        Halt::new()
-            .pred(pand(vec![
-                pgeq(vu("max-amount"), vu("amount")),
-                pis_none(used_auth.clone()),
-                pis_none(vo("signer-sig-opt", TS::SequenceType(SequenceSubtype::BufferType(65u32.try_into().unwrap())))),
-                pis_some(signer_key_auth.clone()),
-                pnot(pi(unwrap_panic(signer_key_auth.clone())))
+        Halt::new_test()
+            .pred(por(vec![
+                pand(vec![
+                    pgeq(vu("max-amount"), vu("amount")),
+                    pis_none(used_auth.clone()),
+                    pis_none(vo("signer-sig-opt", TS::SequenceType(SequenceSubtype::BufferType(65u32.try_into().unwrap())))),
+                    pis_some(signer_key_auth.clone()),
+                    pnot(pi(unwrap_panic(signer_key_auth.clone())))
+                ]),
+                pand(vec![
+                    pgeq(vu("max-amount"), vu("amount")),
+                    pis_none(used_auth.clone()),
+                    pis_none(signer_key_auth.clone()),
+                    pis_none(vo("signer-sig-opt", TS::SequenceType(SequenceSubtype::BufferType(65u32.try_into().unwrap()))))
+                ])
             ]))
             .formula(cerr(vali(19)))
             .early_return(),
 
-        Halt::new()
-            .pred(pand(vec![
-                pgeq(vu("max-amount"), vu("amount")),
-                pis_none(used_auth.clone()),
-                pis_none(signer_key_auth.clone()),
-                pis_none(vo("signer-sig-opt", TS::SequenceType(SequenceSubtype::BufferType(65u32.try_into().unwrap()))))
-            ]))
-            .formula(cerr(vali(19)))
-            .early_return(),
-
-        Halt::new()
-            .pred(pand(vec![
-                pgeq(vu("max-amount"), vu("amount")),
-                pis_none(used_auth.clone()),
-                pis_ok(signer_key_recover.clone()),
-                pis_some(vo("signer-sig-opt", TS::SequenceType(SequenceSubtype::BufferType(65u32.try_into().unwrap())))),
-                peq(vsb("signer-key", 33), unwrap_panic(signer_key_recover.clone()))
+        Halt::new_test()
+            .pred(por(vec![
+                pand(vec![
+                    pgeq(vu("max-amount"), vu("amount")),
+                    pis_none(used_auth.clone()),
+                    pis_ok(signer_key_recover.clone()),
+                    pis_some(vo("signer-sig-opt", TS::SequenceType(SequenceSubtype::BufferType(65u32.try_into().unwrap())))),
+                    peq(vsb("signer-key", 33), unwrap_panic(signer_key_recover.clone()))
+                ]),
+                pand(vec![
+                    pgeq(vu("max-amount"), vu("amount")),
+                    pis_none(used_auth.clone()),
+                    pis_some(signer_key_auth.clone()),
+                    pi(unwrap_panic(signer_key_auth.clone())),
+                    pis_none(vo("signer-sig-opt", TS::SequenceType(SequenceSubtype::BufferType(65u32.try_into().unwrap()))))
+                ])
             ]))
             .formula(cok(valb(true))),
-
-        Halt::new()
-            .pred(pand(vec![
-                pgeq(vu("max-amount"), vu("amount")),
-                pis_none(used_auth.clone()),
-                pis_some(signer_key_auth.clone()),
-                pi(unwrap_panic(signer_key_auth.clone())),
-                pis_none(vo("signer-sig-opt", TS::SequenceType(SequenceSubtype::BufferType(65u32.try_into().unwrap()))))
-            ]))
-            .formula(cok(valb(true)))
     ]);
 }
 
+#[test]
+fn test_continuation_combination() {
+    let contract_id = default_contract_id();
+    let mut symbex = Symbex::from_contract(contract_id.clone(), r#"
+        (define-map m uint uint)
+        (define-data-var m-add uint u5)
+
+        (define-private (inner-fold (idx uint) (acc (response uint uint)))
+            (let (
+                ;; short-circuit
+                (mo (+ (try! acc) (var-get m-add)))
+            )
+            (asserts! (not (is-eq (mod idx mo) u0))
+                (err u0))
+
+            (asserts! (not (is-eq (mod idx mo) u1))
+                (err u0))
+
+            (asserts! (not (is-eq (mod idx mo) u2))
+                (err u0))
+
+            (if (map-insert m idx idx)
+                (ok mo)
+                (err u0))))
+
+        (define-public (populate (modulus uint) (items (list 5 uint)))
+            (begin
+                (var-set m-add modulus)
+                (try! (fold inner-fold items (ok modulus)))
+                (ok (map-get? m modulus))))
+
+        "#,
+    )
+    .unwrap()
+    .init()
+    .unwrap();
+
+    let termination_states = symbex.eval_user_function("populate").unwrap();
+    for t in termination_states.iter() {
+        info!("{}", t.trace());
+        info!("termination state: ==================================\n{}\n", &t.clone().rollup());
+    }
+
+    let map_is_none = |item| { pis_none(map_get("m", unwrap_panic(elat(vl("items", TS::UIntType, 5), cu(item))))) };
+    let map_is_some = |item| { pis_some(map_get("m", unwrap_panic(elat(vl("items", TS::UIntType, 5), cu(item))))) };
+    let item_at = |idx| { unwrap_panic(elat(vl("items", TS::UIntType, 5), cu(idx))) };
+
+    let item_divisor = |idx| {
+        if idx >= 1 {
+            add2(mul2(cu(idx + 1), lv("m-add", vu("m-add"))), vu("modulus"))
+        }
+        else {
+            add2(lv("m-add", vu("m-add")), vu("modulus"))
+        }
+    };
+
+    let is_eq_mod = |idx, md| {
+        if idx >= 1 {
+            peq(rem(item_at(idx), item_divisor(idx)), cu(md))
+        }
+        else {
+            peq(rem(item_at(idx), item_divisor(idx)), cu(md))
+        }
+    };
+
+    assert_halts(termination_states, vec![
+        Halt::new_test()
+            .pred(por(vec![
+                pand(vec![
+                    peqs(vec![llen(vl("items", TS::UIntType, 5)), rem(item_at(1), item_divisor(1)), cu(2)]),
+                    map_is_none(0),
+                    pnot(is_eq_mod(0, 0)),
+                    pnot(is_eq_mod(0, 1)),
+                    pnot(is_eq_mod(0, 2)),
+                ]),
+                pand(vec![
+                    peq(llen(vl("items", TS::UIntType, 5)), cu(1)),
+                    is_eq_mod(0, 0)
+                ]),
+                pand(vec![
+                    peq(llen(vl("items", TS::UIntType, 5)), cu(1)),
+                    is_eq_mod(0, 2)
+                ]),
+                pand(vec![
+                    peq(llen(vl("items", TS::UIntType, 5)), cu(1)),
+                    map_is_some(0),
+                    pnot(is_eq_mod(0, 0)),
+                    pnot(is_eq_mod(0, 1)),
+                    pnot(is_eq_mod(0, 2)),
+                ]),
+                pand(vec![
+                    peq(llen(vl("items", TS::UIntType, 5)), cu(2)),
+                    is_eq_mod(1, 0),
+                    map_is_none(0),
+                    pnot(is_eq_mod(0, 0)),
+                    pnot(is_eq_mod(0, 1)),
+                    pnot(is_eq_mod(0, 2)),
+                ]),
+                pand(vec![
+                    peq(llen(vl("items", TS::UIntType, 5)), cu(2)),
+                    is_eq_mod(1, 1),
+                    map_is_none(0),
+                    pnot(is_eq_mod(0, 0)),
+                    pnot(is_eq_mod(0, 1)),
+                    pnot(is_eq_mod(0, 2)),
+                ]),
+                pand(vec![
+                    peq(llen(vl("items", TS::UIntType, 5)), cu(2)),
+                    map_is_none(0),
+                    map_is_some(1),
+                    pnot(is_eq_mod(0, 0)),
+                    pnot(is_eq_mod(0, 1)),
+                    pnot(is_eq_mod(0, 2)),
+                    pnot(is_eq_mod(1, 0)),
+                    pnot(is_eq_mod(1, 1)),
+                    pnot(is_eq_mod(1, 2)),
+                ]),
+                pand(vec![
+                    peq(llen(vl("items", TS::UIntType, 5)), cu(2)),
+                    map_is_some(0),
+                    pnot(is_eq_mod(0, 0)),
+                    pnot(is_eq_mod(0, 1)),
+                    pnot(is_eq_mod(0, 2)),
+                ]),
+                pand(vec![
+                    peq(llen(vl("items", TS::UIntType, 5)), cu(3)),
+                    is_eq_mod(2, 0),
+                    map_is_none(0),
+                    map_is_none(1),
+                    pnot(is_eq_mod(0, 0)),
+                    pnot(is_eq_mod(0, 1)),
+                    pnot(is_eq_mod(0, 2)),
+                    pnot(is_eq_mod(1, 0)),
+                    pnot(is_eq_mod(1, 1)),
+                    pnot(is_eq_mod(1, 2)),
+                ]),
+                pand(vec![
+                    peq(llen(vl("items", TS::UIntType, 5)), cu(3)),
+                    is_eq_mod(2, 1),
+                    map_is_none(0),
+                    map_is_none(1),
+                    pnot(is_eq_mod(0, 0)),
+                    pnot(is_eq_mod(0, 1)),
+                    pnot(is_eq_mod(0, 2)),
+                    pnot(is_eq_mod(1, 0)),
+                    pnot(is_eq_mod(1, 1)),
+                    pnot(is_eq_mod(1, 2)),
+                ]),
+                pand(vec![
+                    peq(llen(vl("items", TS::UIntType, 5)), cu(3)),
+                    is_eq_mod(2, 2),
+                    map_is_none(0),
+                    map_is_none(1),
+                    pnot(is_eq_mod(0, 0)),
+                    pnot(is_eq_mod(0, 1)),
+                    pnot(is_eq_mod(0, 2)),
+                    pnot(is_eq_mod(1, 0)),
+                    pnot(is_eq_mod(1, 1)),
+                    pnot(is_eq_mod(1, 2)),
+                ]),
+                pand(vec![
+                    peq(llen(vl("items", TS::UIntType, 5)), cu(3)),
+                    map_is_none(0),
+                    map_is_none(1),
+                    map_is_some(2),
+                    pnot(is_eq_mod(0, 0)),
+                    pnot(is_eq_mod(0, 1)),
+                    pnot(is_eq_mod(0, 2)),
+                    pnot(is_eq_mod(1, 0)),
+                    pnot(is_eq_mod(1, 1)),
+                    pnot(is_eq_mod(1, 2)),
+                    pnot(is_eq_mod(2, 0)),
+                    pnot(is_eq_mod(2, 1)),
+                    pnot(is_eq_mod(2, 2)),
+                ]),
+                pand(vec![
+                    peq(llen(vl("items", TS::UIntType, 5)), cu(3)),
+                    map_is_none(0),
+                    map_is_some(1),
+                    pnot(is_eq_mod(0, 0)),
+                    pnot(is_eq_mod(0, 1)),
+                    pnot(is_eq_mod(0, 2)),
+                    pnot(is_eq_mod(1, 0)),
+                    pnot(is_eq_mod(1, 1)),
+                    pnot(is_eq_mod(1, 2)),
+                ]),
+                pand(vec![
+                    peq(llen(vl("items", TS::UIntType, 5)), cu(4)),
+                    is_eq_mod(3, 0),
+                    map_is_none(0),
+                    map_is_none(1),
+                    map_is_none(2),
+                    pnot(is_eq_mod(0, 0)),
+                    pnot(is_eq_mod(0, 1)),
+                    pnot(is_eq_mod(0, 2)),
+                    pnot(is_eq_mod(1, 0)),
+                    pnot(is_eq_mod(1, 1)),
+                    pnot(is_eq_mod(1, 2)),
+                    pnot(is_eq_mod(2, 0)),
+                    pnot(is_eq_mod(2, 1)),
+                    pnot(is_eq_mod(2, 2)),
+                ]),
+                pand(vec![
+                    peq(llen(vl("items", TS::UIntType, 5)), cu(4)),
+                    is_eq_mod(3, 1),
+                    map_is_none(0),
+                    map_is_none(1),
+                    map_is_none(2),
+                    pnot(is_eq_mod(0, 0)),
+                    pnot(is_eq_mod(0, 1)),
+                    pnot(is_eq_mod(0, 2)),
+                    pnot(is_eq_mod(1, 0)),
+                    pnot(is_eq_mod(1, 1)),
+                    pnot(is_eq_mod(1, 2)),
+                    pnot(is_eq_mod(2, 0)),
+                    pnot(is_eq_mod(2, 1)),
+                    pnot(is_eq_mod(2, 2)),
+                ]),
+                pand(vec![
+                    peq(llen(vl("items", TS::UIntType, 5)), cu(4)),
+                    is_eq_mod(3, 2),
+                    map_is_none(0),
+                    map_is_none(1),
+                    map_is_none(2),
+                    pnot(is_eq_mod(0, 0)),
+                    pnot(is_eq_mod(0, 1)),
+                    pnot(is_eq_mod(0, 2)),
+                    pnot(is_eq_mod(1, 0)),
+                    pnot(is_eq_mod(1, 1)),
+                    pnot(is_eq_mod(1, 2)),
+                    pnot(is_eq_mod(2, 0)),
+                    pnot(is_eq_mod(2, 1)),
+                    pnot(is_eq_mod(2, 2)),
+                ]),
+                pand(vec![
+                    peq(llen(vl("items", TS::UIntType, 5)), cu(4)),
+                    map_is_none(0),
+                    map_is_none(1),
+                    map_is_none(2),
+                    map_is_some(3),
+                    pnot(is_eq_mod(0, 0)),
+                    pnot(is_eq_mod(0, 1)),
+                    pnot(is_eq_mod(0, 2)),
+                    pnot(is_eq_mod(1, 0)),
+                    pnot(is_eq_mod(1, 1)),
+                    pnot(is_eq_mod(1, 2)),
+                    pnot(is_eq_mod(2, 0)),
+                    pnot(is_eq_mod(2, 1)),
+                    pnot(is_eq_mod(2, 2)),
+                    pnot(is_eq_mod(3, 0)),
+                    pnot(is_eq_mod(3, 1)),
+                    pnot(is_eq_mod(3, 2)),
+                ]),
+                pand(vec![
+                    peq(llen(vl("items", TS::UIntType, 5)), cu(4)),
+                    map_is_none(0),
+                    map_is_none(1),
+                    map_is_some(2),
+                    pnot(is_eq_mod(0, 0)),
+                    pnot(is_eq_mod(0, 1)),
+                    pnot(is_eq_mod(0, 2)),
+                    pnot(is_eq_mod(1, 0)),
+                    pnot(is_eq_mod(1, 1)),
+                    pnot(is_eq_mod(1, 2)),
+                    pnot(is_eq_mod(2, 0)),
+                    pnot(is_eq_mod(2, 1)),
+                    pnot(is_eq_mod(2, 2)),
+                ]),
+                pand(vec![
+                    peq(llen(vl("items", TS::UIntType, 5)), cu(5)),
+                    is_eq_mod(4, 0),
+                    map_is_none(0),
+                    map_is_none(1),
+                    map_is_none(2),
+                    map_is_none(3),
+                    pnot(is_eq_mod(0, 0)),
+                    pnot(is_eq_mod(0, 1)),
+                    pnot(is_eq_mod(0, 2)),
+                    pnot(is_eq_mod(1, 0)),
+                    pnot(is_eq_mod(1, 1)),
+                    pnot(is_eq_mod(1, 2)),
+                    pnot(is_eq_mod(2, 0)),
+                    pnot(is_eq_mod(2, 1)),
+                    pnot(is_eq_mod(2, 2)),
+                    pnot(is_eq_mod(3, 0)),
+                    pnot(is_eq_mod(3, 1)),
+                    pnot(is_eq_mod(3, 2)),
+                ]),
+                pand(vec![
+                    peq(llen(vl("items", TS::UIntType, 5)), cu(5)),
+                    is_eq_mod(4, 1),
+                    map_is_none(0),
+                    map_is_none(1),
+                    map_is_none(2),
+                    map_is_none(3),
+                    pnot(is_eq_mod(0, 0)),
+                    pnot(is_eq_mod(0, 1)),
+                    pnot(is_eq_mod(0, 2)),
+                    pnot(is_eq_mod(1, 0)),
+                    pnot(is_eq_mod(1, 1)),
+                    pnot(is_eq_mod(1, 2)),
+                    pnot(is_eq_mod(2, 0)),
+                    pnot(is_eq_mod(2, 1)),
+                    pnot(is_eq_mod(2, 2)),
+                    pnot(is_eq_mod(3, 0)),
+                    pnot(is_eq_mod(3, 1)),
+                    pnot(is_eq_mod(3, 2)),
+                ]),
+                pand(vec![
+                    peq(llen(vl("items", TS::UIntType, 5)), cu(5)),
+                    is_eq_mod(4, 2),
+                    map_is_none(0),
+                    map_is_none(1),
+                    map_is_none(2),
+                    map_is_none(3),
+                    pnot(is_eq_mod(0, 0)),
+                    pnot(is_eq_mod(0, 1)),
+                    pnot(is_eq_mod(0, 2)),
+                    pnot(is_eq_mod(1, 0)),
+                    pnot(is_eq_mod(1, 1)),
+                    pnot(is_eq_mod(1, 2)),
+                    pnot(is_eq_mod(2, 0)),
+                    pnot(is_eq_mod(2, 1)),
+                    pnot(is_eq_mod(2, 2)),
+                    pnot(is_eq_mod(3, 0)),
+                    pnot(is_eq_mod(3, 1)),
+                    pnot(is_eq_mod(3, 2)),
+                ]),
+                pand(vec![
+                    peq(llen(vl("items", TS::UIntType, 5)), cu(5)),
+                    map_is_none(0),
+                    map_is_none(1),
+                    map_is_none(2),
+                    map_is_none(3),
+                    map_is_some(4),
+                    pnot(is_eq_mod(0, 0)),
+                    pnot(is_eq_mod(0, 1)),
+                    pnot(is_eq_mod(0, 2)),
+                    pnot(is_eq_mod(1, 0)),
+                    pnot(is_eq_mod(1, 1)),
+                    pnot(is_eq_mod(1, 2)),
+                    pnot(is_eq_mod(2, 0)),
+                    pnot(is_eq_mod(2, 1)),
+                    pnot(is_eq_mod(2, 2)),
+                    pnot(is_eq_mod(3, 0)),
+                    pnot(is_eq_mod(3, 1)),
+                    pnot(is_eq_mod(3, 2)),
+                    pnot(is_eq_mod(4, 0)),
+                    pnot(is_eq_mod(4, 1)),
+                    pnot(is_eq_mod(4, 2)),
+                ]),
+                pand(vec![
+                    peq(llen(vl("items", TS::UIntType, 5)), cu(5)),
+                    map_is_none(0),
+                    map_is_none(1),
+                    map_is_none(2),
+                    map_is_some(3),
+                    pnot(is_eq_mod(0, 0)),
+                    pnot(is_eq_mod(0, 1)),
+                    pnot(is_eq_mod(0, 2)),
+                    pnot(is_eq_mod(1, 0)),
+                    pnot(is_eq_mod(1, 1)),
+                    pnot(is_eq_mod(1, 2)),
+                    pnot(is_eq_mod(2, 0)),
+                    pnot(is_eq_mod(2, 1)),
+                    pnot(is_eq_mod(2, 2)),
+                    pnot(is_eq_mod(3, 0)),
+                    pnot(is_eq_mod(3, 1)),
+                    pnot(is_eq_mod(3, 2)),
+                ]),
+                peqs(vec![llen(vl("items", TS::UIntType, 5)), rem(unwrap_panic(elat(vl("items", TS::UIntType, 5), cu(0))), add2(lv("m-add", vu("m-add")), vu("modulus"))), cu(1)]),
+            ]))
+            .formula(cerr(valu(0)))
+            .early_return()
+            .reachable_map_write(contract_id.clone(), "m"),
+
+        Halt::new_test()
+            .pred(peq(llen(vl("items", TS::UIntType, 5)), cu(0)))
+            .formula(ok(map_get("m", vu("modulus"))))
+            .var(contract_id.clone(), "m-add", vu("modulus"))
+            .reachable_map_write(contract_id.clone(), "m"),
+
+        Halt::new_test()
+            .pred(pand(vec![
+                peq(llen(vl("items", TS::UIntType, 5)), cu(1)),
+                map_is_none(0),
+                pnot(is_eq_mod(0, 0)),
+                pnot(is_eq_mod(0, 1)),
+                pnot(is_eq_mod(0, 2)),
+            ]))
+            .formula(ok(map_get("m", vu("modulus"))))
+            .var(contract_id.clone(), "m-add", vu("modulus"))
+            .map(contract_id.clone(), "m", item_at(0), item_at(0))
+            .reachable_map_write(contract_id.clone(), "m"),
+
+        Halt::new_test()
+            .pred(pand(vec![
+                peq(llen(vl("items", TS::UIntType, 5)), cu(2)),
+                map_is_none(0),
+                map_is_none(1),
+                pnot(is_eq_mod(0, 0)),
+                pnot(is_eq_mod(0, 1)),
+                pnot(is_eq_mod(0, 2)),
+                pnot(is_eq_mod(1, 0)),
+                pnot(is_eq_mod(1, 1)),
+                pnot(is_eq_mod(1, 2)),
+            ]))
+            .formula(ok(map_get("m", vu("modulus"))))
+            .var(contract_id.clone(), "m-add", vu("modulus"))
+            .map(contract_id.clone(), "m", item_at(0), item_at(0))
+            .map(contract_id.clone(), "m", item_at(1), item_at(1))
+            .reachable_map_write(contract_id.clone(), "m"),
+
+        Halt::new_test()
+            .pred(pand(vec![
+                peq(llen(vl("items", TS::UIntType, 5)), cu(3)),
+                map_is_none(0),
+                map_is_none(1),
+                map_is_none(2),
+                pnot(is_eq_mod(0, 0)),
+                pnot(is_eq_mod(0, 1)),
+                pnot(is_eq_mod(0, 2)),
+                pnot(is_eq_mod(1, 0)),
+                pnot(is_eq_mod(1, 1)),
+                pnot(is_eq_mod(1, 2)),
+                pnot(is_eq_mod(2, 0)),
+                pnot(is_eq_mod(2, 1)),
+                pnot(is_eq_mod(2, 2)),
+            ]))
+            .formula(ok(map_get("m", vu("modulus"))))
+            .var(contract_id.clone(), "m-add", vu("modulus"))
+            .map(contract_id.clone(), "m", item_at(0), item_at(0))
+            .map(contract_id.clone(), "m", item_at(1), item_at(1))
+            .map(contract_id.clone(), "m", item_at(2), item_at(2))
+            .reachable_map_write(contract_id.clone(), "m"),
+
+        Halt::new_test()
+            .pred(pand(vec![
+                peq(llen(vl("items", TS::UIntType, 5)), cu(4)),
+                map_is_none(0),
+                map_is_none(1),
+                map_is_none(2),
+                map_is_none(3),
+                pnot(is_eq_mod(0, 0)),
+                pnot(is_eq_mod(0, 1)),
+                pnot(is_eq_mod(0, 2)),
+                pnot(is_eq_mod(1, 0)),
+                pnot(is_eq_mod(1, 1)),
+                pnot(is_eq_mod(1, 2)),
+                pnot(is_eq_mod(2, 0)),
+                pnot(is_eq_mod(2, 1)),
+                pnot(is_eq_mod(2, 2)),
+                pnot(is_eq_mod(3, 0)),
+                pnot(is_eq_mod(3, 1)),
+                pnot(is_eq_mod(3, 2)),
+            ]))
+            .formula(ok(map_get("m", vu("modulus"))))
+            .var(contract_id.clone(), "m-add", vu("modulus"))
+            .map(contract_id.clone(), "m", item_at(0), item_at(0))
+            .map(contract_id.clone(), "m", item_at(1), item_at(1))
+            .map(contract_id.clone(), "m", item_at(2), item_at(2))
+            .map(contract_id.clone(), "m", item_at(3), item_at(3))
+            .reachable_map_write(contract_id.clone(), "m"),
+
+        Halt::new_test()
+            .pred(pand(vec![
+                peq(llen(vl("items", TS::UIntType, 5)), cu(5)),
+                map_is_none(0),
+                map_is_none(1),
+                map_is_none(2),
+                map_is_none(3),
+                map_is_none(4),
+                pnot(is_eq_mod(0, 0)),
+                pnot(is_eq_mod(0, 1)),
+                pnot(is_eq_mod(0, 2)),
+                pnot(is_eq_mod(1, 0)),
+                pnot(is_eq_mod(1, 1)),
+                pnot(is_eq_mod(1, 2)),
+                pnot(is_eq_mod(2, 0)),
+                pnot(is_eq_mod(2, 1)),
+                pnot(is_eq_mod(2, 2)),
+                pnot(is_eq_mod(3, 0)),
+                pnot(is_eq_mod(3, 1)),
+                pnot(is_eq_mod(3, 2)),
+                pnot(is_eq_mod(4, 0)),
+                pnot(is_eq_mod(4, 1)),
+                pnot(is_eq_mod(4, 2)),
+            ]))
+            .formula(ok(map_get("m", vu("modulus"))))
+            .var(contract_id.clone(), "m-add", vu("modulus"))
+            .map(contract_id.clone(), "m", item_at(0), item_at(0))
+            .map(contract_id.clone(), "m", item_at(1), item_at(1))
+            .map(contract_id.clone(), "m", item_at(2), item_at(2))
+            .map(contract_id.clone(), "m", item_at(3), item_at(3))
+            .map(contract_id.clone(), "m", item_at(4), item_at(4))
+            .reachable_map_write(contract_id.clone(), "m"),
+    ]);
+}
+
+#[test]
+fn test_continuation_comments() {
+    let contract_id = default_contract_id();
+    let mut symbex = Symbex::from_contract(contract_id.clone(), r#"
+        (define-map m uint uint)
+
+        ;; is this a comment on m-add?
+        (define-data-var m-add uint u5)
+
+        ;; is this a top-level comment?
+
+        ;; this is a comment on inner-fold
+        (define-private (inner-fold (idx uint) (acc (response uint uint)))
+            ;; what is this a comment on?
+            (let (
+                ;; short-circuit
+                (mo (+ (try! acc) (var-get m-add)))
+            )
+            (asserts! (not (is-eq (mod idx mo) u0))
+                (err u0))
+
+            (asserts! (not (is-eq (mod idx mo) u1))
+                (err u0))
+
+            (asserts! (not (is-eq (mod idx mo) u2))
+                (err u0))
+
+            (if (map-insert m idx idx)
+                (ok mo)
+                (err u0))))
+
+        ;; this is a comment on populate
+        (define-public (populate (modulus uint) (items (list 5 uint)))
+            (begin
+                (var-set m-add modulus)
+                (try! (fold inner-fold items (ok modulus)))
+                (ok (map-get? m modulus))))
+
+        "#,
+    )
+    .unwrap()
+    .init()
+    .unwrap();
+
+    let termination_states = symbex.eval_all().unwrap();
+    for t in termination_states.iter() {
+        info!("{}", t.trace());
+        info!("termination state: ==================================\n{}\n", &t.clone().rollup());
+    }
+}
