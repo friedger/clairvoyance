@@ -42,10 +42,44 @@ pub mod tests;
 use std::env;
 use std::process;
 
+/// Set the engine's log verbosity from `-v`/`-vv`/`--quiet`, defaulting to
+/// quiet so a plain run prints only its result. The engine logs through
+/// stacks-common, which reads these environment variables the first time it
+/// logs -- which is after this runs -- so setting them here is what takes
+/// effect. A verbosity flag is consumed from `argv` if present; an explicit
+/// STACKS_LOG_*/BLOCKSTACK_DEBUG in the environment always wins.
+fn configure_logging(argv: &mut Vec<String>) {
+    let already_set = ["STACKS_LOG_TRACE", "STACKS_LOG_DEBUG", "STACKS_LOG_CRITONLY", "BLOCKSTACK_DEBUG"]
+        .iter()
+        .any(|k| std::env::var(k).is_ok());
+
+    let mut verbosity: Option<&str> = None;
+    argv.retain(|a| match a.as_str() {
+        "-q" | "--quiet" => { verbosity = Some("quiet"); false }
+        "-v" | "--verbose" => { verbosity = Some("info"); false }
+        "-vv" | "--debug" => { verbosity = Some("debug"); false }
+        _ => true,
+    });
+
+    if already_set {
+        return;
+    }
+    // SAFETY: single-threaded startup, before any logging or other thread has
+    // read the environment. The engine reads these variables lazily on its
+    // first log call, which happens after this returns.
+    match verbosity {
+        Some("debug") => unsafe { std::env::set_var("STACKS_LOG_DEBUG", "1") },
+        Some("info") => { /* leave the engine default (Info) */ }
+        // Default and explicit --quiet: only critical output from the engine.
+        _ => unsafe { std::env::set_var("STACKS_LOG_CRITONLY", "1") },
+    }
+}
+
 fn main() {
     let mut argv : Vec<_> = std::env::args().collect();
 
     let _prog_name = argv.remove(0);
+    configure_logging(&mut argv);
     let (exit_code, message) = cli::run_subcommand(&mut argv);
     if exit_code != 0 {
         eprintln!("{}", &message);

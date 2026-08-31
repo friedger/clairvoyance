@@ -97,9 +97,32 @@ pub fn usage(msg: &str, code: i32) {
     process::exit(code);
 }
 
+pub fn top_level_help() -> String {
+    "clairvoyance -- a symbolic execution engine for Clarity\n\
+     \n\
+     USAGE:\n\
+     \x20 clairvoyance <command> [subcommand] [args...]\n\
+     \n\
+     COMMANDS:\n\
+     \x20 sym check     CONTRACT_ID CODE [FUNCTION]   Verify a function against its\n\
+     \x20                                             (@clairvoyance ...) spec (PASS/VIOLATED).\n\
+     \x20 sym exec-func CONTRACT_ID CODE FUNCTION     Print every terminating state of a function.\n\
+     \x20 sym reachable CONTRACT_ID CODE FUNCTION     Print the reachable call graph.\n\
+     \x20 contract ast|context|analyze CONTRACT_ID CODE   Inspect the parsed/analyzed contract.\n\
+     \n\
+     GLOBAL OPTIONS:\n\
+     \x20 -v, --verbose   Show the engine's INFO log (default: quiet)\n\
+     \x20 -vv, --debug    Show the engine's DEBUG log\n\
+     \x20 -q, --quiet     Suppress all but critical engine output (the default)\n\
+     \n\
+     Run `clairvoyance sym help` or `clairvoyance contract help` for the options\n\
+     each command takes. CODE may be a file path or `-` for stdin.\n\
+     ".to_string()
+}
+
 pub fn run_subcommand(argv: &mut Vec<String>) -> (i32, String) {
     if argv.len() == 0 {
-        return (1, format!("Missing subcommand"));
+        return (1, top_level_help());
     }
 
     let subcommand = argv.remove(0);
@@ -110,8 +133,11 @@ pub fn run_subcommand(argv: &mut Vec<String>) -> (i32, String) {
         "sym" => {
             sym::run_cli_sym(argv)
         }
+        "help" | "-h" | "--help" => {
+            (0, top_level_help())
+        }
         _ => {
-            return (1, format!("Unrecognized subcommand '{subcommand}'"))
+            (1, format!("Unrecognized subcommand '{subcommand}'. Try `clairvoyance help`."))
         }
     }
 }
