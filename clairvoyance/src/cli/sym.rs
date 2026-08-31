@@ -547,6 +547,91 @@ fn summary_line(pass: usize, nospec: usize, fail: usize, specerr: usize, err: us
     format!("Summary: {pass} passed, {fail} violated, {specerr} spec-error, {err} error, {nospec} no-spec")
 }
 
+/// The parameter list of `fname`, each parameter rendered back to Clarity
+/// source as `(name type)`. `None` if the function is not defined in `src`.
+/// Parse-only, so no dependency contracts are needed.
+fn function_params(
+    contract_id: &QualifiedContractIdentifier,
+    src: &str,
+    fname: &str,
+) -> Result<Option<Vec<String>>, Error> {
+    let ast = crate::core::ast::parse_ast(contract_id, src)?;
+    for expr in ast.expressions.iter() {
+        let Some(list) = expr.match_list() else { continue; };
+        let Some(head) = list.get(0).and_then(|e| e.match_atom()) else { continue; };
+        if head.as_str() != "define-public" && head.as_str() != "define-read-only"
+            && head.as_str() != "define-private"
+        {
+            continue;
+        }
+        let Some(sig) = list.get(1).and_then(|e| e.match_list()) else { continue; };
+        let Some(name) = sig.get(0).and_then(|e| e.match_atom()) else { continue; };
+        if name.as_str() != fname {
+            continue;
+        }
+        let mut params = vec![];
+        for p in sig.iter().skip(1) {
+            // Each parameter is `(pname ptype...)`; render its type back to
+            // source verbatim so exotic types (tuples, buffers) survive.
+            if let Some(parts) = p.match_list() {
+                let ty: Vec<String> = parts.iter().skip(1).map(|e| format!("{e}")).collect();
+                params.push((format!("{}", parts.get(0).map(|e| format!("{e}")).unwrap_or_default()), ty.join(" ")));
+            }
+        }
+        // Re-key parameters to fresh names to avoid collisions between the
+        // mutator's and the invariant's parameters in the harness.
+        let rendered: Vec<String> = params.into_iter().map(|(_n, ty)| ty).collect();
+        return Ok(Some(rendered));
+    }
+    Ok(None)
+}
+
+// Sentinels the induction harness returns. Chosen large and specific so a
+// mutator returning them by chance is vanishingly unlikely.
+const INDUCT_PRE_SENTINEL: &str = "u340282366920938463463374607431768211454";
+const INDUCT_POST_SENTINEL: &str = "u340282366920938463463374607431768211455";
+
+/// Build a harness function, appended to the contract, that assumes the
+/// invariant on entry, runs the mutator with fresh symbolic arguments, and
+/// asserts the invariant still holds. If the invariant can fail afterwards,
+/// the harness returns the post-sentinel error on that path.
+///
+///   (define-public (HARNESS <mut-params> <inv-params>)
+///       (begin
+///           (asserts! (INV <inv-args>) (err PRE))     ;; assume it held on entry
+///           (unwrap-panic (MUT <mut-args>))           ;; run the mutator
+///           (asserts! (INV <inv-args>) (err POST))    ;; it must still hold
+///           (ok true)))
+fn build_induction_harness(
+    harness_name: &str,
+    mutator: &str,
+    mut_param_types: &[String],
+    invariant: &str,
+    inv_param_types: &[String],
+) -> String {
+    let mut sig = String::new();
+    let mut mut_args = String::new();
+    let mut inv_args = String::new();
+    for (i, ty) in mut_param_types.iter().enumerate() {
+        sig.push_str(&format!(" (m{i} {ty})"));
+        mut_args.push_str(&format!(" m{i}"));
+    }
+    for (i, ty) in inv_param_types.iter().enumerate() {
+        sig.push_str(&format!(" (i{i} {ty})"));
+        inv_args.push_str(&format!(" i{i}"));
+    }
+    format!(
+        "\n(define-public ({harness_name}{sig})\n  \
+           (begin\n    \
+             (asserts! ({invariant}{inv_args}) (err {pre}))\n    \
+             (unwrap-panic ({mutator}{mut_args}))\n    \
+             (asserts! ({invariant}{inv_args}) (err {post}))\n    \
+             (ok true)))\n",
+        pre = INDUCT_PRE_SENTINEL,
+        post = INDUCT_POST_SENTINEL,
+    )
+}
+
 /// `sym check` -- verify a function (or every function) against the
 /// (@clairvoyance ...) specification in its doc comment, and report a
 /// developer-facing PASS / VIOLATED / SPEC ERROR verdict with a meaningful
@@ -694,6 +779,155 @@ fn cli_check(argv: &[String]) -> (i32, String) {
     (code, report)
 }
 
+/// Public and read-only function names of a contract, in source order.
+fn functions_by_kind(
+    contract_id: &QualifiedContractIdentifier,
+    src: &str,
+) -> Result<(Vec<String>, Vec<String>), Error> {
+    let ast = crate::core::ast::parse_ast(contract_id, src)?;
+    let (mut publics, mut readonlys) = (vec![], vec![]);
+    for expr in ast.expressions.iter() {
+        let Some(list) = expr.match_list() else { continue; };
+        let Some(head) = list.get(0).and_then(|e| e.match_atom()) else { continue; };
+        let Some(sig) = list.get(1).and_then(|e| e.match_list()) else { continue; };
+        let Some(name) = sig.get(0).and_then(|e| e.match_atom()) else { continue; };
+        match head.as_str() {
+            "define-public" => publics.push(name.to_string()),
+            "define-read-only" => readonlys.push(name.to_string()),
+            _ => {}
+        }
+    }
+    Ok((publics, readonlys))
+}
+
+/// `sym induct` -- inductive invariant checking.
+///
+/// For each (invariant I, mutator M) pair, synthesize a harness that assumes I
+/// on entry, runs M over fresh symbolic arguments, and asserts I still holds;
+/// symbolically execute it, and report whether I is preserved:
+///
+///   HOLDS       the engine proved I holds after M on every path
+///   VIOLATED    I fails after M unconditionally (a definite counterexample)
+///   NOT PROVEN  the engine could not rule out a path where I fails after M;
+///               the residual condition is shown. This is either a real
+///               conditional violation or a limit of the simplifier (there is
+///               no SMT backend), and the condition tells you which to suspect.
+///
+/// With no `--invariant`, every read-only named `invariant-*` is used; with no
+/// `--mutator`, every public function is used.
+fn cli_induct(argv: &[String]) -> (i32, String) {
+    let mut remaining_args = argv.to_vec();
+
+    let tx_sender = match load_tx_sender(&mut remaining_args) { Ok(p) => p, Err(x) => return x };
+    let tx_sponsor = match load_tx_sponsor(&mut remaining_args) { Ok(p) => p, Err(x) => return x };
+    let contract_caller = match load_contract_caller(&mut remaining_args) { Ok(p) => p, Err(x) => return x };
+    let contract_tx_sponsor = match load_contract_tx_sponsor(&mut remaining_args) { Ok(p) => p, Err(x) => return x };
+
+    let mut invariants = vec![];
+    while let Ok(Some(name)) = cli::consume_arg(&mut remaining_args, &["--invariant"], true) {
+        invariants.push(name);
+    }
+    let mut mutators = vec![];
+    while let Ok(Some(name)) = cli::consume_arg(&mut remaining_args, &["--mutator"], true) {
+        mutators.push(name);
+    }
+
+    let deps = match load_deps(&mut remaining_args) { Ok(deps) => deps, Err(x) => return x };
+    let concretized_traits = match load_concretized_traits(&mut remaining_args) { Ok(t) => t, Err(x) => return x };
+    let default_concretized_traits = match load_default_concretized_traits(&mut remaining_args) { Ok(t) => t, Err(x) => return x };
+
+    let Some(contract_id_str) = argv.get(0) else { return (1, "Missing contract ID".into()); };
+    let Some(code_path_or_stdin) = argv.get(1) else { return (1, "Missing code".into()); };
+    let Ok(contract_id) = QualifiedContractIdentifier::parse(contract_id_str) else {
+        return (1, format!("Failed to parse contract ID {contract_id_str}"));
+    };
+    let src = match cli::load_from_file_or_stdin(code_path_or_stdin) {
+        Ok(s) => match String::from_utf8(s) { Ok(src) => src, Err(_) => return (1, "Code is not UTF-8".into()) },
+        Err(e) => return (1, format!("Failed to load source code from {code_path_or_stdin}: {e:?}")),
+    };
+
+    let (publics, readonlys) = match functions_by_kind(&contract_id, &src) {
+        Ok(x) => x,
+        Err(e) => return (2, format!("Could not parse contract: {e}")),
+    };
+    if invariants.is_empty() {
+        invariants = readonlys.iter().filter(|n| n.starts_with("invariant-")).cloned().collect();
+    }
+    if mutators.is_empty() {
+        mutators = publics.clone();
+    }
+    if invariants.is_empty() {
+        return (1, "No invariants to check. Name one with --invariant, or define read-only invariant-* functions.".into());
+    }
+    if mutators.is_empty() {
+        return (1, "No mutators to check. Name one with --mutator.".into());
+    }
+
+    let post_err = format!("(err {})", INDUCT_POST_SENTINEL);
+    let mut report = String::new();
+    let (mut n_holds, mut n_violated, mut n_unproven, mut n_skipped) = (0, 0, 0, 0);
+
+    for inv in invariants.iter() {
+        let inv_params = match function_params(&contract_id, &src, inv) {
+            Ok(Some(p)) => p,
+            _ => { report.push_str(&format!("\n{inv}\n  (invariant not found; skipping)\n")); continue; }
+        };
+        report.push_str(&format!("\n{inv}\n"));
+        for mutator in mutators.iter() {
+            let mut_params = match function_params(&contract_id, &src, mutator) {
+                Ok(Some(p)) => p,
+                _ => { report.push_str(&format!("  SKIP       {mutator}  (not found)\n")); n_skipped += 1; continue; }
+            };
+            let harness_name = format!("clv-induct-{mutator}-{inv}");
+            let harness = build_induction_harness(&harness_name, mutator, &mut_params, inv, &inv_params);
+            let src2 = format!("{src}{harness}");
+
+            let res = exec_user_function(
+                contract_id.clone(), &src2, &harness_name, &deps,
+                concretized_traits.clone(), default_concretized_traits.clone(),
+                std::collections::HashSet::new(),
+                tx_sender.clone(), contract_caller.clone(), tx_sponsor.clone(), contract_tx_sponsor.clone(),
+                false, vec![],
+                true, // explore fully: the mutator and invariant must be inlined for their state to compose
+            );
+            match res {
+                Ok(conts) => {
+                    let violations: Vec<_> = conts.iter()
+                        .filter(|c| format!("{}", c.final_formula) == post_err)
+                        .collect();
+                    if violations.is_empty() {
+                        n_holds += 1;
+                        report.push_str(&format!("  HOLDS      {mutator}\n"));
+                    } else if violations.iter().any(|c| format!("{}", c.predicate).trim() == "true") {
+                        n_violated += 1;
+                        report.push_str(&format!("  VIOLATED   {mutator}  (unconditionally)\n"));
+                    } else {
+                        n_unproven += 1;
+                        let cond = format!("{}", violations[0].predicate);
+                        let cond = cond.split_whitespace().collect::<Vec<_>>().join(" ");
+                        let cond = if cond.len() > 160 { format!("{}...", &cond[..160]) } else { cond };
+                        report.push_str(&format!("  NOT PROVEN {mutator}  (fails when: {cond})\n"));
+                    }
+                }
+                Err(e) => {
+                    n_skipped += 1;
+                    report.push_str(&format!("  SKIP       {mutator}  (could not compose: {e})\n"));
+                }
+            }
+        }
+    }
+
+    let header = format!(
+        "Inductive invariant check for {contract_id}\n\
+         (does each mutator preserve each invariant?)\n"
+    );
+    let footer = format!(
+        "\nSummary: {n_holds} holds, {n_violated} violated, {n_unproven} not-proven, {n_skipped} skipped\n"
+    );
+    let code = if n_violated > 0 { 3 } else if n_unproven > 0 { 5 } else { 0 };
+    (code, format!("{header}{report}{footer}"))
+}
+
 fn cli_reachability_graph(argv: &[String]) -> (i32, String) {
     let Some(contract_id_str) = argv.get(0) else {
         return (1, "Missing contract ID".into());
@@ -771,6 +1005,9 @@ pub fn run_cli_sym(argv: &mut Vec<String>) -> (i32, String) {
         "check" => {
             cli_check(&argv)
         }
+        "induct" => {
+            cli_induct(&argv)
+        }
         "reachable" => {
             cli_reachability_graph(&argv)
         }
@@ -789,6 +1026,7 @@ fn sym_help() -> String {
      \n\
      USAGE:\n\
      \x20 clairvoyance sym check     CONTRACT_ID CODE [FUNCTION] [options]\n\
+     \x20 clairvoyance sym induct    CONTRACT_ID CODE [options]\n\
      \x20 clairvoyance sym exec-func CONTRACT_ID CODE FUNCTION  [options]\n\
      \x20 clairvoyance sym reachable CONTRACT_ID CODE FUNCTION  [options]\n\
      \x20 clairvoyance sym help\n\
@@ -799,6 +1037,11 @@ fn sym_help() -> String {
      \x20            Omit FUNCTION (or pass --all) to check every public and read-only\n\
      \x20            function in the contract and print a summary. Exit code is 0 only\n\
      \x20            when everything checked passes.\n\
+     \x20 induct     Inductive invariant checking. For each (invariant, mutator) pair,\n\
+     \x20            assume the invariant, run the mutator, and check it still holds.\n\
+     \x20            Reports HOLDS / VIOLATED / NOT PROVEN. With no --invariant, every\n\
+     \x20            read-only named invariant-* is used; with no --mutator, every public\n\
+     \x20            function. Options: --invariant NAME, --mutator NAME (both repeatable).\n\
      \x20 exec-func  Symbolically execute FUNCTION and print every terminating state\n\
      \x20            (path predicate, return value, and state writes). Also enforces any\n\
      \x20            (@clairvoyance ...) spec, like `check`, but prints the raw states.\n\

@@ -1443,7 +1443,7 @@ impl SymOp {
     /// string representation to the number of times the term occurs, compute the _difference_
     /// between the two.  For each term in both tables, subtract the count in `diff` from that in
     /// `term_table`.  This is used to reduce a formula like (a + b) - (a + c) to (b - c)
-    fn remove_terms(term_table: &mut HashMap<String, (Box<SymOp>, u128)>, diff: HashMap<String, u128>) -> Result<(), Error> {
+    fn remove_terms(term_table: &mut BTreeMap<String, (Box<SymOp>, u128)>, diff: HashMap<String, u128>) -> Result<(), Error> {
         for (term, diff) in diff.into_iter() {
             let del = if let Some((_, add_count)) = term_table.get_mut(&term) {
                 if diff == *add_count {
@@ -1543,8 +1543,13 @@ impl SymOp {
         let sub_signed_table = Self::make_term_count_table(subs)?;
 
         // consolidate by sign
-        let mut add_table = HashMap::new();
-        let mut sub_table = HashMap::new();
+        // BTreeMap, not HashMap: `add_table`/`sub_table` are iterated below to
+        // build the simplified term lists, so their order is the order of terms
+        // in the result. A HashMap makes that order vary run to run, which is a
+        // primary source of nondeterministic (flaky) simplification output.
+        // Keyed by the term's string form (Ord), so iteration is stable.
+        let mut add_table = BTreeMap::new();
+        let mut sub_table = BTreeMap::new();
         for (term_s, (term, sign, count)) in add_signed_table.into_iter() {
             if sign > 0 {
                 add_table.insert(term_s, (term, count));
@@ -5537,6 +5542,180 @@ impl SymOp {
         };
         Box::new(op)
     }
+
+    fn bind_loaded_vars_in_list(ops: Vec<Box<SymOp>>, subs: &HashMap<FullName, SymOp>) -> Vec<Box<SymOp>> {
+        ops.into_iter().map(|op| op.bind_loaded_vars(subs)).collect()
+    }
+
+    /// Simultaneously replace every read of each data var in `subs` -- a
+    /// `LoadedDataVariable(name, _)` node -- with its mapped formula, in one
+    /// pass (the replacements are not themselves rewritten, so vars that refer
+    /// to one another compose correctly). This is what lets a caller's current
+    /// value of a data var flow into a callee that reads it, and what composes
+    /// an invariant's reads onto a mutator's pre- or post-state. Mirrors
+    /// `bind_symbol`, but keys on the variable's fully-qualified name and
+    /// replaces the whole node rather than a leaf symbol.
+    pub fn bind_loaded_vars(self, subs: &HashMap<FullName, SymOp>) -> Box<SymOp> {
+        
+        let op = match self {
+            Self::Constant(v) => Self::Constant(v),
+            Self::Variable(v) => Self::Variable(v),
+            Self::LoadedDataVariable(name, op) => {
+                if let Some(replacement) = subs.get(&name) {
+                    replacement.clone()
+                }
+                else {
+                    Self::LoadedDataVariable(name, op.bind_loaded_vars(subs))
+                }
+            }
+            Self::Add(ops) => Self::Add(Self::bind_loaded_vars_in_list(ops, subs)),
+            Self::Subtract(ops) => Self::Subtract(Self::bind_loaded_vars_in_list(ops, subs)),
+            Self::Multiply(ops) => Self::Multiply(Self::bind_loaded_vars_in_list(ops, subs)),
+            Self::Divide(ops) => Self::Divide(Self::bind_loaded_vars_in_list(ops, subs)),
+            Self::ToInt(op) => Self::ToInt(op.bind_loaded_vars(subs)),
+            Self::ToUInt(op) => Self::ToUInt(op.bind_loaded_vars(subs)),
+            Self::Modulo(op1, op2) => Self::Modulo(op1.bind_loaded_vars(subs), op2.bind_loaded_vars(subs)),
+            Self::Power(base_op, exp_op) => Self::Power(base_op.bind_loaded_vars(subs), exp_op.bind_loaded_vars(subs)),
+            Self::Sqrti(op) => Self::Sqrti(op.bind_loaded_vars(subs)),
+            Self::Log2(op) => Self::Log2(op.bind_loaded_vars(subs)),
+            Self::And(ops) => Self::And(Self::bind_loaded_vars_in_list(ops, subs)),
+            Self::Or(ops) => Self::Or(Self::bind_loaded_vars_in_list(ops, subs)),
+            Self::Not(op) => Self::Not(op.bind_loaded_vars(subs)),
+            Self::Greater(x, y) => Self::Greater(x.bind_loaded_vars(subs), y.bind_loaded_vars(subs)),
+            Self::Geq(x, y) => Self::Geq(x.bind_loaded_vars(subs), y.bind_loaded_vars(subs)),
+            Self::Equals(ops) => Self::Equals(Self::bind_loaded_vars_in_list(ops, subs)),
+            Self::Leq(x, y) => Self::Leq(x.bind_loaded_vars(subs), y.bind_loaded_vars(subs)),
+            Self::Less(x, y) => Self::Less(x.bind_loaded_vars(subs), y.bind_loaded_vars(subs)),
+            Self::Append(list_op, val_op) => Self::Append(list_op.bind_loaded_vars(subs), val_op.bind_loaded_vars(subs)),
+            Self::Concat(ops) => Self::Concat(Self::bind_loaded_vars_in_list(ops, subs)),
+            Self::AsMaxLen(op1, op2) => Self::AsMaxLen(op1.bind_loaded_vars(subs), op2.bind_loaded_vars(subs)),
+            Self::Len(op) => Self::Len(op.bind_loaded_vars(subs)),
+            Self::ElementAt(op1, op2) => Self::ElementAt(op1.bind_loaded_vars(subs), op2.bind_loaded_vars(subs)),
+            Self::IndexOf(op1, op2) => Self::IndexOf(op1.bind_loaded_vars(subs), op2.bind_loaded_vars(subs)),
+            Self::BuffToIntLe(op) => Self::BuffToIntLe(op.bind_loaded_vars(subs)),
+            Self::BuffToUIntLe(op) => Self::BuffToUIntLe(op.bind_loaded_vars(subs)),
+            Self::BuffToIntBe(op) => Self::BuffToIntBe(op.bind_loaded_vars(subs)),
+            Self::BuffToUIntBe(op) => Self::BuffToUIntBe(op.bind_loaded_vars(subs)),
+            Self::IsStandard(op) => Self::IsStandard(op.bind_loaded_vars(subs)),
+            Self::PrincipalDestruct(op) => Self::PrincipalDestruct(op.bind_loaded_vars(subs)),
+            Self::PrincipalConstruct(op1, op2, op3_opt) => {
+                let new_op3_opt = if let Some(op3) = op3_opt {
+                    Some(op3.bind_loaded_vars(subs))
+                }
+                else {
+                    None
+                };
+                Self::PrincipalConstruct(op1.bind_loaded_vars(subs), op2.bind_loaded_vars(subs), new_op3_opt)
+            },
+            Self::StringToInt(op) => Self::StringToInt(op.bind_loaded_vars(subs)),
+            Self::StringToUInt(op) => Self::StringToUInt(op.bind_loaded_vars(subs)),
+            Self::IntToAscii(op) => Self::IntToAscii(op.bind_loaded_vars(subs)),
+            Self::IntToUtf8(op) => Self::IntToUtf8(op.bind_loaded_vars(subs)),
+            Self::ListCons(ops) => Self::ListCons(Self::bind_loaded_vars_in_list(ops, subs)),
+            Self::FetchVar(name) => Self::FetchVar(name),
+            Self::SetVar(name, op) => Self::SetVar(name, op.bind_loaded_vars(subs)),
+            Self::FetchEntry(name, op) => Self::FetchEntry(name, op.bind_loaded_vars(subs)),
+            Self::LoadedMapEntry(name, key_op, value_op_opt) => {
+                let new_value_op_opt = if let Some(op) = value_op_opt {
+                    Some(op.bind_loaded_vars(subs))
+                }
+                else {
+                    None
+                };
+                Self::LoadedMapEntry(name, key_op.bind_loaded_vars(subs), new_value_op_opt)
+            }
+            Self::SetEntry(name, op1, op2) => Self::SetEntry(name, op1.bind_loaded_vars(subs), op2.bind_loaded_vars(subs)),
+            Self::InsertEntry(name, op1, op2) => Self::InsertEntry(name, op1.bind_loaded_vars(subs), op2.bind_loaded_vars(subs)),
+            Self::DeleteEntry(name, op) => Self::DeleteEntry(name, op.bind_loaded_vars(subs)),
+            Self::TupleCons(fields) => {
+                let mut new_fields = vec![];
+                for (key, value) in fields.into_iter() {
+                    let new_value = value.bind_loaded_vars(subs);
+                    new_fields.push((key, new_value));
+                }
+                Self::TupleCons(new_fields)
+            }
+            Self::TupleGet(name, op) => Self::TupleGet(name, op.bind_loaded_vars(subs)),
+            Self::TupleMerge(op1, op2) => Self::TupleMerge(op1.bind_loaded_vars(subs), op2.bind_loaded_vars(subs)),
+            Self::Hash160(op) => Self::Hash160(op.bind_loaded_vars(subs)),
+            Self::Sha256(op) => Self::Sha256(op.bind_loaded_vars(subs)),
+            Self::Sha512(op) => Self::Sha512(op.bind_loaded_vars(subs)),
+            Self::Sha512Trunc256(op) => Self::Sha512Trunc256(op.bind_loaded_vars(subs)),
+            Self::Keccak256(op) => Self::Keccak256(op.bind_loaded_vars(subs)),
+            Self::Secp256k1Recover(op1, op2) => Self::Secp256k1Recover(op1.bind_loaded_vars(subs), op2.bind_loaded_vars(subs)),
+            Self::Secp256k1Verify(op1, op2, op3) => Self::Secp256k1Verify(op1.bind_loaded_vars(subs), op2.bind_loaded_vars(subs), op3.bind_loaded_vars(subs)),
+            Self::ContractOf(op1) => Self::ContractOf(op1.bind_loaded_vars(subs)),
+            Self::PrincipalOf(op1) => Self::PrincipalOf(op1.bind_loaded_vars(subs)),
+            Self::GetBurnBlockInfo(prop, op) => Self::GetBurnBlockInfo(prop, op.bind_loaded_vars(subs)),
+            Self::IsOkay(op) => Self::IsOkay(op.bind_loaded_vars(subs)),
+            Self::IsErr(op) => Self::IsErr(op.bind_loaded_vars(subs)),
+            Self::IsSome(op) => Self::IsSome(op.bind_loaded_vars(subs)),
+            Self::IsNone(op) => Self::IsNone(op.bind_loaded_vars(subs)),
+            Self::UnwrapPanic(op) => Self::UnwrapPanic(op.bind_loaded_vars(subs)),
+            Self::UnwrapErrPanic(op) => Self::UnwrapErrPanic(op.bind_loaded_vars(subs)),
+            Self::ConsError(op) => Self::ConsError(op.bind_loaded_vars(subs)),
+            Self::ConsOkay(op) => Self::ConsOkay(op.bind_loaded_vars(subs)),
+            Self::ConsSome(op) => Self::ConsSome(op.bind_loaded_vars(subs)),
+            Self::GetTokenBalance(name, op) => Self::GetTokenBalance(name, op.bind_loaded_vars(subs)),
+            Self::GetNftOwner(name, op) => Self::GetNftOwner(name, op.bind_loaded_vars(subs)),
+            Self::TransferToken(name, op1, op2, op3) => Self::TransferToken(name, op1.bind_loaded_vars(subs), op2.bind_loaded_vars(subs), op3.bind_loaded_vars(subs)),
+            Self::TransferNft(name, op1, op2, op3) => Self::TransferNft(name, op1.bind_loaded_vars(subs), op2.bind_loaded_vars(subs), op3.bind_loaded_vars(subs)),
+            Self::MintToken(name, op1, op2) => Self::MintToken(name, op1.bind_loaded_vars(subs), op2.bind_loaded_vars(subs)),
+            Self::MintNft(name, op1, op2) => Self::MintNft(name, op1.bind_loaded_vars(subs), op2.bind_loaded_vars(subs)),
+            Self::GetTokenSupply(name) => Self::GetTokenSupply(name),
+            Self::BurnToken(name, op) => Self::BurnToken(name, op.bind_loaded_vars(subs)),
+            Self::BurnNft(name, op1, op2) => Self::BurnNft(name, op1.bind_loaded_vars(subs), op2.bind_loaded_vars(subs)),
+            Self::GetStxBalance(op) => Self::GetStxBalance(op.bind_loaded_vars(subs)),
+            Self::StxTransfer(op1, op2, op3) => Self::StxTransfer(op1.bind_loaded_vars(subs), op2.bind_loaded_vars(subs), op3.bind_loaded_vars(subs)),
+            Self::StxTransferMemo(op1, op2, op3, op4) => Self::StxTransferMemo(op1.bind_loaded_vars(subs), op2.bind_loaded_vars(subs), op3.bind_loaded_vars(subs), op4.bind_loaded_vars(subs)),
+            Self::StxBurn(op1) => Self::StxBurn(op1.bind_loaded_vars(subs)),
+            Self::StxGetAccount(op1) => Self::StxGetAccount(op1.bind_loaded_vars(subs)),
+            Self::BitwiseAnd(ops) => Self::BitwiseAnd(Self::bind_loaded_vars_in_list(ops, subs)),
+            Self::BitwiseOr(ops) => Self::BitwiseOr(Self::bind_loaded_vars_in_list(ops, subs)),
+            Self::BitwiseXor(ops) => Self::BitwiseXor(Self::bind_loaded_vars_in_list(ops, subs)),
+            Self::BitwiseNot(op) => Self::BitwiseNot(op.bind_loaded_vars(subs)),
+            Self::BitwiseLShift(op1, op2) => Self::BitwiseLShift(op1.bind_loaded_vars(subs), op2.bind_loaded_vars(subs)),
+            Self::BitwiseRShift(op1, op2) => Self::BitwiseRShift(op1.bind_loaded_vars(subs), op2.bind_loaded_vars(subs)),
+            Self::Slice(op1, op2, op3) => Self::Slice(op1.bind_loaded_vars(subs), op2.bind_loaded_vars(subs), op3.bind_loaded_vars(subs)),
+            Self::ToConsensusBuff(op) => Self::ToConsensusBuff(op.bind_loaded_vars(subs)),
+            Self::FromConsensusBuff(ts, op) => Self::FromConsensusBuff(ts, op.bind_loaded_vars(subs)),
+            Self::ReplaceAt(op1, op2, op3) => Self::ReplaceAt(op1.bind_loaded_vars(subs), op2.bind_loaded_vars(subs), op3.bind_loaded_vars(subs)),
+            Self::GetStacksBlockInfo(name, op) => Self::GetStacksBlockInfo(name, op.bind_loaded_vars(subs)),
+            Self::GetTenureInfo(name, op) => Self::GetTenureInfo(name, op.bind_loaded_vars(subs)),
+            Self::ContractHash(op) => Self::ContractHash(op.bind_loaded_vars(subs)),
+            Self::ToAscii(op) => Self::ToAscii(op.bind_loaded_vars(subs)),
+            Self::RestrictAssets(op1, op2, op3) => Self::RestrictAssets(op1.bind_loaded_vars(subs), op2.bind_loaded_vars(subs), op3.bind_loaded_vars(subs)),
+            Self::AsContractSafe(op1, op2) => Self::AsContractSafe(op1.bind_loaded_vars(subs), op2.bind_loaded_vars(subs)),
+            Self::AllowanceWithStx(op) => Self::AllowanceWithStx(op.bind_loaded_vars(subs)),
+            Self::AllowanceWithFt(op1, name, op2) => Self::AllowanceWithFt(op1.bind_loaded_vars(subs), name, op2.bind_loaded_vars(subs)),
+            Self::AllowanceWithNft(op1, name, op2) => Self::AllowanceWithNft(op1.bind_loaded_vars(subs), name, op2.bind_loaded_vars(subs)),
+            Self::AllowanceWithStacking(op) => Self::AllowanceWithStacking(op.bind_loaded_vars(subs)),
+            Self::AllowanceAll => Self::AllowanceAll,
+            Self::Secp256r1Verify(op1, op2, op3) => Self::Secp256r1Verify(op1.bind_loaded_vars(subs), op2.bind_loaded_vars(subs), op3.bind_loaded_vars(subs)),
+            Self::VerifyMerkleProof(op1, op2, op3, op4, op5) => Self::VerifyMerkleProof(
+                op1.bind_loaded_vars(subs),
+                op2.bind_loaded_vars(subs),
+                op3.bind_loaded_vars(subs),
+                op4.bind_loaded_vars(subs),
+                op5.bind_loaded_vars(subs),
+            ),
+            Self::GetBitcoinTxOutput(op1, op2) => Self::GetBitcoinTxOutput(
+                op1.bind_loaded_vars(subs),
+                op2.bind_loaded_vars(subs),
+            ),
+            Self::Panic => Self::Panic,
+            Self::FunctionCall(name, args) => {
+                let mut new_args = vec![];
+                for arg in args.into_iter() {
+                    let new_arg = arg.bind_loaded_vars(subs);
+                    new_args.push(new_arg);
+                }
+                Self::FunctionCall(name, new_args)
+            }
+        };
+        Box::new(op)
+    }
+
 }
 
 /// Predicates over operations over symbols.
@@ -6298,12 +6477,24 @@ impl Continuation {
         let mut bound_formulae = free.bound_formulae.clone();
         bound_formulae.extend(parent.bound_formulae.clone().into_iter());
 
+        // The callee read each data var at its entry, which is the caller's
+        // *current* value of that var at the call site: whatever the caller has
+        // written (var_state), else the var's entry value (pre_var_state). Bind
+        // the callee's data-var reads to those, so a var the caller set before
+        // the call flows into the callee that reads it -- and, once composed
+        // back, the caller sees the callee's writes over its own reads.
+        let mut caller_vars: HashMap<FullName, SymOp> = parent.pre_var_state.clone();
+        for (name, val) in parent.var_state.iter() {
+            caller_vars.insert(name.clone(), val.clone());
+        }
+
         let mut free_predicate = free.predicate.clone().as_symop();
         for (sym_id, symop) in bound_formulae.iter() {
             debug!("Bind predicate symbol {sym_id} = {symop}");
             free_predicate = *free_predicate.bind_symbol(sym_id.clone(), symop.clone());
         }
         free_predicate = parent.bind_globals(free_predicate);
+        free_predicate = *free_predicate.bind_loaded_vars(&caller_vars);
         let predicate = free_predicate.and(parent.predicate.clone().as_symop()).try_as_predicate()?.simplify()?;
 
         let mut final_formula = free.final_formula.clone();
@@ -6312,6 +6503,7 @@ impl Continuation {
             final_formula = *final_formula.bind_symbol(sym_id.clone(), symop.clone());
         }
         final_formula = parent.bind_globals(final_formula);
+        final_formula = *final_formula.bind_loaded_vars(&caller_vars);
        
         let mut pre_var_state = parent.pre_var_state.clone();
         for (name, val) in free.pre_var_state.iter() {
@@ -6340,6 +6532,10 @@ impl Continuation {
                 debug!("Bind var (var-set {name}) symbol {sym_id} = {symop}");
                 new_val = new_val.bind_symbol(sym_id.clone(), symop).simplify()?;
             }
+            // The callee's write is expressed over the vars it read at entry;
+            // resolve those to the caller's current values so the composed
+            // post-value is in the caller's terms.
+            new_val = new_val.bind_loaded_vars(&caller_vars).simplify()?;
             var_state.insert(name.clone(), new_val);
         }
         

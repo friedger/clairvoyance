@@ -82,6 +82,7 @@ for the full option list.
 | command | what it does |
 | --- | --- |
 | `sym check CONTRACT_ID CODE [FUNCTION]` | Verify a function against its specification and report **PASS / VIOLATED / SPEC ERROR / NO SPEC**, with a meaningful exit code. Omit `FUNCTION`, or pass `--all`, to check every public and read-only function and print a summary. |
+| `sym induct CONTRACT_ID CODE` | Inductive invariant checking: for each `(invariant, mutator)` pair, assume the invariant, run the mutator, and check it still holds. Reports **HOLDS / NOT PROVEN / VIOLATED**. |
 | `sym exec-func CONTRACT_ID CODE FUNCTION` | Symbolically execute a function and print every terminating state — its path predicate, return value, and state writes. Also enforces any specification. |
 | `sym reachable CONTRACT_ID CODE FUNCTION` | Print the call graph reachable from a function: which data vars and maps it may read and write, transitively. |
 | `contract ast\|context\|analyze CONTRACT_ID CODE` | Inspect the parsed AST, the contract context, or the analysis of a contract. |
@@ -140,6 +141,41 @@ wrong:
 | halting condition failed | a matched state whose predicate does not imply the conclusion |
 | incorrect / missing / unchecked var or map write | a state write that differs from, is absent from, or is not covered by the spec |
 
+## Inductive invariant checking
+
+`sym induct` checks that a contract's own invariants are *preserved* by its
+mutators, which is the inductive step of a safety proof. It follows the
+convention that an invariant is a read-only function named `invariant-*`
+returning `bool` (the same convention the property-based fuzzers use).
+
+For each `(invariant I, mutator M)` pair it synthesizes a harness that assumes
+`I` on entry, runs `M` over fresh symbolic arguments, and asserts `I` still
+holds, then symbolically executes it:
+
+```sh
+$ clairvoyance sym induct SP000000000000000000002Q6VF78.ledger examples/inductive.clar
+invariant-a-eq-b
+  NOT PROVEN bump-both  (fails when: (and (is-eq a b) (not (is-eq (+ a u1) (+ b u1)))))
+  NOT PROVEN bump-a     (fails when: (and (is-eq a b) (not (is-eq (+ a u1) b))))
+  HOLDS      bump-c
+```
+
+- **HOLDS** — the engine proved `I` holds after `M` on every path (the path
+  where it could fail was shown to be unreachable).
+- **NOT PROVEN** — the engine could not rule out a path where `I` fails after
+  `M`; the residual condition is printed. This is *either* a real conditional
+  violation (a condition you can satisfy — `bump-a` above breaks `a == b`
+  whenever it held) *or* a limit of the simplifier (a condition that is
+  actually contradictory but that the algebraic simplifier cannot reduce —
+  `bump-both` above preserves `a == b`, but proving it needs to cancel the
+  `+ u1` on both sides of an equality, which needs an SMT solver). The printed
+  condition tells you which to suspect.
+- **VIOLATED** — `I` fails after `M` unconditionally.
+
+This works by composing the mutator's state effects into the invariant's reads
+— a called function's data-var reads now resolve against the caller's current
+state, so a value the mutator writes flows into the invariant that reads it.
+
 ## Limitations
 
 Clairvoyance is young, and it is honest about what it cannot yet do:
@@ -157,6 +193,13 @@ Clairvoyance is young, and it is honest about what it cannot yet do:
   unresolved formula, not a crash.
 - **Some builtins are unmodelled**, including the Bitcoin transaction reader
   (`get-bitcoin-tx-output?`) and the signature-verification builtins.
+- **Cross-function composition is partial.** A callee's data-var reads and
+  writes now compose into the caller correctly; map reads a callee makes of a
+  map the caller wrote are not yet composed. `sym induct` therefore reasons
+  best about invariants over data vars.
+- **The test suite is not yet deterministic.** Parts of the engine iterate
+  hash maps in a nondeterministic order, so some tests pass or fail run to run.
+  The arithmetic simplifier has been made deterministic; other sites remain.
 
 If the engine cannot evaluate a function it says so and exits non-zero, rather
 than reporting a false pass.
