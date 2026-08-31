@@ -1443,7 +1443,7 @@ impl SymOp {
     /// string representation to the number of times the term occurs, compute the _difference_
     /// between the two.  For each term in both tables, subtract the count in `diff` from that in
     /// `term_table`.  This is used to reduce a formula like (a + b) - (a + c) to (b - c)
-    fn remove_terms(term_table: &mut HashMap<String, (Box<SymOp>, u128)>, diff: HashMap<String, u128>) {
+    fn remove_terms(term_table: &mut HashMap<String, (Box<SymOp>, u128)>, diff: HashMap<String, u128>) -> Result<(), Error> {
         for (term, diff) in diff.into_iter() {
             let del = if let Some((_, add_count)) = term_table.get_mut(&term) {
                 if diff == *add_count {
@@ -1451,7 +1451,7 @@ impl SymOp {
                 }
                 else {
                     if diff > *add_count {
-                        panic!("for term {term}, diff = {diff}, add_count = {}", add_count);
+                        return Err(Error::Failed(format!("Cannot simplify: term `{term}` cancels more times ({diff}) than it appears ({add_count})")));
                     }
                     *add_count -= diff;
                     false
@@ -1464,6 +1464,7 @@ impl SymOp {
                 term_table.remove(&term);
             }
         }
+        Ok(())
     }
 
     /// Combine terms in the form of (a + b + c + ...) - (x + y + z + ...)
@@ -1517,7 +1518,7 @@ impl SymOp {
                 }
             }
             else {
-                panic!("Got zero add terms");
+                return Err(Error::Failed("Cannot simplify: additive combination has no terms and no known signedness".into()));
             }
         }
         else if adds.len() == 0 && subs.len() > 0 {
@@ -1531,7 +1532,7 @@ impl SymOp {
                 }
             }
             else {
-                panic!("Got zero terms");
+                return Err(Error::Failed("Cannot simplify: subtractive combination has no terms and no known signedness".into()));
             }
         }
 
@@ -1578,8 +1579,8 @@ impl SymOp {
             }
         }
 
-        Self::remove_terms(&mut add_table, add_diff);
-        Self::remove_terms(&mut sub_table, sub_diff);
+        Self::remove_terms(&mut add_table, add_diff)?;
+        Self::remove_terms(&mut sub_table, sub_diff)?;
 
         let mut new_adds = vec![];
         let mut new_subs = vec![];
@@ -1675,9 +1676,9 @@ impl SymOp {
         if new_adds.len() == 0 && new_subs.len() == 0 {
             let adds_str = old_adds.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(" ");
             let subs_str = old_subs.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(" ");
-            error!("adds = (+ {adds_str})");
-            error!("subs = (- {subs_str})");
-            panic!("new_adds.len() == 0 and new_subs.len() == 0");
+            debug!("adds = (+ {adds_str})");
+            debug!("subs = (- {subs_str})");
+            return Err(Error::Failed("Cannot simplify: additive/subtractive terms fully cancelled with no residual".into()));
         }
 
         if new_subs.len() == 0 {
@@ -3746,13 +3747,16 @@ impl SymOp {
 
         debug!("consensus_or: consensus_terms = {consensus_terms:?}");
 
-        let final_terms : Vec<_> = ops
+        let mut final_terms : Vec<_> = ops
             .into_iter()
             .filter(|op| !consensus_terms.contains(&op.to_string()))
             .collect();
 
-        assert!(final_terms.len() > 1);
-        Ok(Self::Or(final_terms))
+        match final_terms.len() {
+            0 => Err(Error::Failed("Cannot simplify: disjunction reduced to no terms".into())),
+            1 => Ok(*final_terms.pop().expect("infallible: len checked")),
+            _ => Ok(Self::Or(final_terms)),
+        }
     }
 
     /// apply and-absorption
@@ -4891,8 +4895,11 @@ impl SymOp {
                     folded_ops.push(Box::new(Self::Constant(cur_constant)));
                 }
 
-                assert!(folded_ops.len() > 1, "Too few folded ops");
-                Ok(Self::Concat(folded_ops))
+                match folded_ops.len() {
+                    0 => Err(Error::Failed("Cannot simplify: concatenation reduced to no operands".into())),
+                    1 => Ok(*folded_ops.pop().expect("infallible: len checked")),
+                    _ => Ok(Self::Concat(folded_ops)),
+                }
             },
             Self::AsMaxLen(op1, op2) => {
                 Self::simplify_native_2args("as-max-len?", op1, op2, |x, y| Self::AsMaxLen(x, y))
@@ -8024,7 +8031,12 @@ impl Symbex {
                        c.predicate = p.clone();
                    }
                    Err(e) => {
-                       panic!("failed to simplify predicate: {e:?}");
+                       // The simplifier could not reduce this predicate (e.g. a
+                       // nonlinear term it has no rule for). Keep the predicate
+                       // as-is and carry on rather than aborting the whole run:
+                       // a term we cannot normalize is an `undecided` result,
+                       // not an engine crash.
+                       warn!("Continuation {}: could not simplify predicate, keeping it unsimplified: {e:?}", c.id);
                    }
                }
                let f = c.final_formula.clone();
@@ -8034,7 +8046,7 @@ impl Symbex {
                        c.final_formula = f.clone();
                    }
                    Err(e) => {
-                       panic!("failed to simplify final formula: {e:?}");
+                       warn!("Continuation {}: could not simplify final formula, keeping it unsimplified: {e:?}", c.id);
                    }
                }
                c
