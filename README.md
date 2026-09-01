@@ -239,6 +239,14 @@ Clairvoyance is young, and it is honest about what it cannot yet do:
   so a hard term shows up as an unresolved formula, not a crash.
 - **Some builtins are unmodelled**, including the Bitcoin transaction reader
   (`get-bitcoin-tx-output?`) and the signature-verification builtins.
+- **Assets are state, allowances are not.** Fungible-token and STX balances are
+  tracked for real: a transfer, mint or burn moves a balance and a later read
+  sees it, across a `contract-call?`. A balance nothing has written reads as a
+  free symbol, so no starting balance is assumed. What is *not* modelled is the
+  allowance list on `as-contract?`: its body runs, and the path where the chain
+  would have refused the call is not explored. That direction is safe — it
+  admits movements the chain would reject, so an invariant gets harder to prove,
+  never easier.
 - **Cross-function composition covers data vars and concrete map keys.** A
   callee's data-var reads/writes and its `map-get?` of a key the caller wrote
   compose into the caller. What is not resolved is a read of an *uninitialized*

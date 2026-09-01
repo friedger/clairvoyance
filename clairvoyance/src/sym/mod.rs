@@ -5806,7 +5806,20 @@ impl SymOp {
             Self::ConsError(op) => Self::ConsError(op.bind_map_reads(map_subs)),
             Self::ConsOkay(op) => Self::ConsOkay(op.bind_map_reads(map_subs)),
             Self::ConsSome(op) => Self::ConsSome(op.bind_map_reads(map_subs)),
-            Self::GetTokenBalance(name, op) => Self::GetTokenBalance(name, op.bind_map_reads(map_subs)),
+            Self::GetTokenBalance(name, op) => {
+                // Token balances are kept in the same store as maps, under the
+                // token's name, so a caller's transfer resolves a callee's
+                // balance read the same way a map write resolves a map read.
+                // The one difference is that a balance is not optional: it
+                // substitutes to the value itself, not to `(some value)`.
+                let key = op.bind_map_reads(map_subs);
+                if let Some(value) = map_subs.get(&name).and_then(|m| m.get(&key.to_string())) {
+                    value.clone()
+                }
+                else {
+                    Self::GetTokenBalance(name, key)
+                }
+            }
             Self::GetNftOwner(name, op) => Self::GetNftOwner(name, op.bind_map_reads(map_subs)),
             Self::TransferToken(name, op1, op2, op3) => Self::TransferToken(name, op1.bind_map_reads(map_subs), op2.bind_map_reads(map_subs), op3.bind_map_reads(map_subs)),
             Self::TransferNft(name, op1, op2, op3) => Self::TransferNft(name, op1.bind_map_reads(map_subs), op2.bind_map_reads(map_subs), op3.bind_map_reads(map_subs)),
@@ -7120,6 +7133,28 @@ impl Continuation {
             "unlocked".try_into()?,
             Box::new(SymOp::StxGetAccount(Box::new(who.clone()))),
         ))
+    }
+
+    /// The balance a fungible token holds for `who`: what a transfer, mint or
+    /// burn in this continuation left there, or -- if nothing has touched it --
+    /// a free symbol, since the chain's starting balance is not ours to assume.
+    ///
+    /// Token balances are VM state rather than a map, but they behave exactly
+    /// like one keyed by principal, so they are kept in the same store under
+    /// the token's own name. A contract cannot declare a map and a token with
+    /// the same name, so nothing collides.
+    pub fn ft_balance(&mut self, token: &FullName, who: &SymOp, line: u32) -> SymOp {
+        let existing = self.lookup_global_entry(token, who).cloned();
+        if let Some(value) = existing {
+            return value;
+        }
+        self.read_global_entry(token, who.clone(), line);
+        SymOp::GetTokenBalance(token.clone(), Box::new(who.clone()))
+    }
+
+    /// Set a fungible token balance.
+    pub fn set_ft_balance(&mut self, token: &FullName, who: SymOp, balance: SymOp) {
+        self.set_global_entry(token, who, balance);
     }
 
     /// Move unlocked STX.
@@ -10449,28 +10484,185 @@ impl Symbex {
                                     )?
                                 }
                                 "ft-get-balance" => {
-                                    todo!();
+                                    let Some(token_sym) = lv.get(1) else {
+                                        return Err(Error::Bug(format!("Missing token name for {function_name}")));
+                                    };
+                                    let Some(token_name) = token_sym.match_atom() else {
+                                        return Err(Error::Bug(format!("Token name is not an atom in {function_name}")));
+                                    };
+                                    let Some(addr_sym) = lv.get(2) else {
+                                        return Err(Error::Bug(format!("Missing principal for {function_name}")));
+                                    };
+                                    let addr_cont = Continuation::from_parent(Rc::new(continuation), format!("{function_name}.address-eval"), addr_sym.span.start_line);
+                                    let mut conts = self.eval(addr_cont, addr_sym)?;
+                                    let line = body.span.start_line;
+                                    for cont in conts.iter_mut() {
+                                        if cont.halted() {
+                                            continue;
+                                        }
+                                        let token = FullName(cont.get_current_contract_id(), token_name.clone());
+                                        let who = cont.final_formula.clone().simplify()?;
+                                        cont.final_formula = cont.ft_balance(&token, &who, line);
+                                    }
+                                    conts
                                 }
                                 "nft-get-owner?" => {
                                     todo!();
                                 }
                                 "ft-transfer?" => {
-                                    todo!();
+                                    // (ft-transfer? token amount sender recipient)
+                                    let Some(token_name) = lv.get(1).and_then(|e| e.match_atom()).cloned() else {
+                                        return Err(Error::Bug(format!("Missing token name for {function_name}")));
+                                    };
+                                    let args = lv.get(2..5).ok_or_else(|| Error::Bug(format!("Missing arguments to {function_name}")))?;
+                                    let conts = self.eval_native_n_args(
+                                        continuation,
+                                        function_name.as_str(),
+                                        args,
+                                        |mut a| {
+                                            let recipient = a.pop().unwrap_or(SymOp::none());
+                                            let sender = a.pop().unwrap_or(SymOp::none());
+                                            let amount = a.pop().unwrap_or(SymOp::none());
+                                            SymOp::StxTransfer(Box::new(amount), Box::new(sender), Box::new(recipient))
+                                        }
+                                    )?;
+
+                                    let line = body.span.start_line;
+                                    let mut ret = vec![];
+                                    for mut cont in conts.into_iter() {
+                                        if cont.halted() {
+                                            ret.push(cont);
+                                            continue;
+                                        }
+                                        let SymOp::StxTransfer(amount, sender, recipient) = cont.final_formula.clone() else {
+                                            return Err(Error::Bug(format!("{function_name} lost its arguments")));
+                                        };
+                                        let token = FullName(cont.get_current_contract_id(), token_name.clone());
+                                        let from = cont.ft_balance(&token, &sender, line);
+                                        let to = cont.ft_balance(&token, &recipient, line);
+                                        let pred = cont.predicate.clone();
+
+                                        // The same three conditions the VM
+                                        // checks, and the same split: the
+                                        // transfer that goes through and the
+                                        // one that is refused differ in state,
+                                        // not just in what they return.
+                                        let permitted = Predicate::And(vec![
+                                            Box::new(Predicate::Geq(from.clone(), *amount.clone())),
+                                            Box::new(Predicate::Greater(*amount.clone(), SymOp::Constant(Value::UInt(0)))),
+                                            Box::new(Predicate::Not(Box::new(Predicate::Equals(vec![*sender.clone(), *recipient.clone()])))),
+                                        ]);
+
+                                        let cont_rc = Rc::new(cont);
+
+                                        let mut success = Continuation::from_parent(cont_rc.clone(), format!("{function_name}.transferred"), line);
+                                        success.predicate = pred.clone().and(permitted.clone());
+                                        let debited = SymOp::Subtract(vec![Box::new(from.clone()), amount.clone()]).simplify()?;
+                                        let credited = SymOp::Add(vec![Box::new(to.clone()), amount.clone()]).simplify()?;
+                                        success.set_ft_balance(&token, *sender.clone(), debited);
+                                        success.set_ft_balance(&token, *recipient.clone(), credited);
+                                        success.final_formula = SymOp::ConsOkay(Box::new(SymOp::True()));
+
+                                        let mut failure = Continuation::from_parent(cont_rc.clone(), format!("{function_name}.refused"), line);
+                                        failure.predicate = pred.and(Predicate::Not(Box::new(permitted)));
+                                        failure.final_formula = SymOp::ConsError(Box::new(SymOp::Constant(Value::UInt(1))));
+
+                                        ret.push(success);
+                                        ret.push(failure);
+                                    }
+                                    ret
                                 }
                                 "nft-transfer?" => {
                                     todo!();
                                 }
-                                "ft-mint?" => {
-                                    todo!();
+                                "ft-mint?" | "ft-burn?" => {
+                                    // (ft-mint? token amount recipient) and
+                                    // (ft-burn? token amount sender): one adds
+                                    // to a balance, the other takes away, and
+                                    // a burn can fail for want of balance.
+                                    let minting = function_base_name.as_str() == "ft-mint?";
+                                    let Some(token_name) = lv.get(1).and_then(|e| e.match_atom()).cloned() else {
+                                        return Err(Error::Bug(format!("Missing token name for {function_name}")));
+                                    };
+                                    let args = lv.get(2..4).ok_or_else(|| Error::Bug(format!("Missing arguments to {function_name}")))?;
+                                    let conts = self.eval_native_n_args(
+                                        continuation,
+                                        function_name.as_str(),
+                                        args,
+                                        |mut a| {
+                                            let who = a.pop().unwrap_or(SymOp::none());
+                                            let amount = a.pop().unwrap_or(SymOp::none());
+                                            SymOp::MintToken(FullName::root(QualifiedContractIdentifier::transient()), Box::new(amount), Box::new(who))
+                                        }
+                                    )?;
+
+                                    let line = body.span.start_line;
+                                    let mut ret = vec![];
+                                    for mut cont in conts.into_iter() {
+                                        if cont.halted() {
+                                            ret.push(cont);
+                                            continue;
+                                        }
+                                        let SymOp::MintToken(_, amount, who) = cont.final_formula.clone() else {
+                                            return Err(Error::Bug(format!("{function_name} lost its arguments")));
+                                        };
+                                        let token = FullName(cont.get_current_contract_id(), token_name.clone());
+                                        let held = cont.ft_balance(&token, &who, line);
+                                        let pred = cont.predicate.clone();
+
+                                        let mut permitted: Vec<Box<Predicate>> = vec![Box::new(Predicate::Greater(
+                                            *amount.clone(),
+                                            SymOp::Constant(Value::UInt(0))
+                                        ))];
+                                        if !minting {
+                                            permitted.push(Box::new(Predicate::Geq(held.clone(), *amount.clone())));
+                                        }
+                                        // An `And` of one is not a thing the
+                                        // simplifier accepts, and a mint has
+                                        // only the one condition.
+                                        let permitted = if permitted.len() == 1 {
+                                            *permitted.remove(0)
+                                        }
+                                        else {
+                                            Predicate::And(permitted)
+                                        };
+
+                                        let cont_rc = Rc::new(cont);
+
+                                        let mut success = Continuation::from_parent(cont_rc.clone(), format!("{function_name}.done"), line);
+                                        success.predicate = pred.clone().and(permitted.clone());
+                                        let updated = if minting {
+                                            SymOp::Add(vec![Box::new(held.clone()), amount.clone()]).simplify()?
+                                        }
+                                        else {
+                                            SymOp::Subtract(vec![Box::new(held.clone()), amount.clone()]).simplify()?
+                                        };
+                                        success.set_ft_balance(&token, *who.clone(), updated);
+                                        success.final_formula = SymOp::ConsOkay(Box::new(SymOp::True()));
+
+                                        let mut failure = Continuation::from_parent(cont_rc.clone(), format!("{function_name}.refused"), line);
+                                        failure.predicate = pred.and(Predicate::Not(Box::new(permitted)));
+                                        failure.final_formula = SymOp::ConsError(Box::new(SymOp::Constant(Value::UInt(1))));
+
+                                        ret.push(success);
+                                        ret.push(failure);
+                                    }
+                                    ret
                                 }
                                 "nft-mint?" => {
                                     todo!();
                                 }
                                 "ft-get-supply" => {
-                                    todo!();
-                                }
-                                "ft-burn?" => {
-                                    todo!();
+                                    // Unconstrained: nothing here tracks a
+                                    // running total, and claiming one would be
+                                    // an assumption rather than a fact.
+                                    let Some(token_name) = lv.get(1).and_then(|e| e.match_atom()).cloned() else {
+                                        return Err(Error::Bug(format!("Missing token name for {function_name}")));
+                                    };
+                                    let mut cont = Continuation::from_parent(Rc::new(continuation), function_name.clone(), body.span.start_line);
+                                    let token = FullName(cont.get_current_contract_id(), token_name);
+                                    cont.final_formula = SymOp::GetTokenSupply(token);
+                                    vec![cont]
                                 }
                                 "nft-burn?" => {
                                     todo!();
