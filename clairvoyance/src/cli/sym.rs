@@ -522,6 +522,24 @@ fn explain_engine_error(user_function: &str, e: &Error) -> (i32, String) {
     }
 }
 
+/// Condense an engine error into a single actionable line. The Clarity
+/// analyzer's errors carry the whole offending AST, which is unreadable in a
+/// per-function report -- and when a whole contract is missing, the same error
+/// repeats once per function. The overwhelmingly common case, an unresolved
+/// contract, becomes the thing to do about it.
+fn brief_error(e: &Error) -> String {
+    let text = format!("{e}");
+    if let Some(rest) = text.split("NoSuchContract(\"").nth(1) {
+        if let Some(name) = rest.split('"').next() {
+            return format!("needs `{name}`; pass --dep {name}:PATH (a signature stub is enough)");
+        }
+    }
+    // Otherwise keep the first line, and only as much of it as is readable.
+    let line = text.lines().next().unwrap_or("").trim();
+    let line = line.split(" { ").next().unwrap_or(line);
+    if line.len() > 120 { format!("{}...", &line[..120]) } else { line.to_string() }
+}
+
 /// Enumerate the public and read-only function names defined in `src`, in
 /// source order. Parse-only, so it needs no dependency contracts loaded --
 /// which is what lets `check --all` list the functions of a contract that
@@ -899,6 +917,9 @@ fn cli_induct(argv: &[String]) -> (i32, String) {
     let mut report = String::new();
     let (mut n_holds, mut n_violated, mut n_unproven, mut n_skipped) = (0, 0, 0, 0);
     let mut n_holds_smt = 0;
+    // Skip reasons already spelled out in full, so a missing dependency does
+    // not print its explanation once per (invariant, mutator) pair.
+    let mut skip_reasons = std::collections::HashSet::new();
 
     for inv in invariants.iter() {
         let inv_params = match function_params(&contract_id, &src, inv) {
@@ -957,7 +978,14 @@ fn cli_induct(argv: &[String]) -> (i32, String) {
                 }
                 Err(e) => {
                     n_skipped += 1;
-                    report.push_str(&format!("  SKIP       {mutator}  (could not compose: {e})\n"));
+                    let why = brief_error(&e);
+                    // The same missing dependency skips every pair, so say it
+                    // once and just name the rest.
+                    if skip_reasons.insert(why.clone()) {
+                        report.push_str(&format!("  SKIP       {mutator}  ({why})\n"));
+                    } else {
+                        report.push_str(&format!("  SKIP       {mutator}\n"));
+                    }
                 }
             }
         }
