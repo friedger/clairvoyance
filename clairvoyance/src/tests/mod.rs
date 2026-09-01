@@ -5670,10 +5670,10 @@ fn test_continuation_combination() {
 
     let item_divisor = |idx| {
         if idx >= 1 {
-            add2(mul2(cu(idx + 1), lv("m-add", vu("m-add"))), vu("modulus"))
+            add2(mul2(cu(idx + 1), vu("modulus")), vu("modulus"))
         }
         else {
-            add2(lv("m-add", vu("m-add")), vu("modulus"))
+            add2(vu("modulus"), vu("modulus"))
         }
     };
 
@@ -5991,7 +5991,7 @@ fn test_continuation_combination() {
                     pnot(is_eq_mod(3, 1)),
                     pnot(is_eq_mod(3, 2)),
                 ]),
-                peqs(vec![llen(vl("items", TS::UIntType, 5)), rem(unwrap_panic(elat(vl("items", TS::UIntType, 5), cu(0))), add2(lv("m-add", vu("m-add")), vu("modulus"))), cu(1)]),
+                peqs(vec![llen(vl("items", TS::UIntType, 5)), rem(unwrap_panic(elat(vl("items", TS::UIntType, 5), cu(0))), add2(vu("modulus"), vu("modulus"))), cu(1)]),
             ]))
             .formula(cerr(valu(0)))
             .early_return()
