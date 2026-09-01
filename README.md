@@ -180,11 +180,15 @@ state, so a value the mutator writes flows into the invariant that reads it.
 
 Clairvoyance is young, and it is honest about what it cannot yet do:
 
-- **Cross-contract calls and traits are in progress.** A contract that calls
-  into another contract (including protocol contracts such as `pox-5` or the
-  sBTC contracts) cannot yet be fully reasoned about. Provide callees with
-  `--dep` where they are self-contained; concretize traits with
-  `--concretized-trait`.
+- **Cross-contract calls compose against provided contracts.** A
+  `(contract-call? .other f ...)` to a contract loaded with `--dep` is evaluated
+  into and its state effects compose back, so `sym induct` can check invariants
+  that span contracts (see `examples/ledger.clar`, whose invariant reads a
+  token's supply across the boundary). Traits are dispatched with
+  `--concretized-trait`. The limit is a callee that is *not* provided: the
+  Clarity analyzer needs it present to type-check the call, so a contract that
+  calls `pox-5` or the sBTC contracts must be given those as deps (a signature
+  stub is enough) — they cannot be treated as opaque.
 - **No SMT solver.** Path feasibility and term equality are decided by a
   built-in algebraic simplifier, not a complete decision procedure. Nonlinear
   arithmetic (multiplying or dividing two symbolic values) is where it gives
@@ -198,9 +202,12 @@ Clairvoyance is young, and it is honest about what it cannot yet do:
   compose into the caller. What is not resolved is a read of an *uninitialized*
   slot the caller did not write, and symbolic-key aliasing, so `sym induct`
   reasons best about invariants over data vars and fixed map keys.
-- **Precision is bounded by the simplifier, not an SMT solver.** Equalities
-  cancel common terms (`(is-eq (+ a k) (+ b k))` reduces to `(is-eq a b)`), but
-  inequalities and nonlinear relations may still read as NOT PROVEN.
+- **Precision is bounded by the simplifier, not an SMT solver.** Equalities and
+  inequalities cancel common terms (`(is-eq (+ a k) (+ b k))` reduces to
+  `(is-eq a b)`, `(<= (+ a k) (+ b k))` to `(<= a b)`), and a comparison with its
+  complement is a contradiction — so an invariant preserved by equal increments
+  now proves. Nonlinear relations (a product or quotient of two symbolic values)
+  may still read as NOT PROVEN.
 
 If the engine cannot evaluate a function it says so and exits non-zero, rather
 than reporting a false pass.
