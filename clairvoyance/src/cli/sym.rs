@@ -672,6 +672,13 @@ const INDUCT_POST_SENTINEL: &str = "u340282366920938463463374607431768211455";
 ///           (unwrap-panic (MUT <mut-args>))           ;; run the mutator
 ///           (asserts! (INV <inv-args>) (err POST))    ;; it must still hold
 ///           (ok true)))
+/// Print a line of the report as soon as it is known, rather than collecting
+/// the whole report and showing it at the end.
+fn print_now(line: &str) {
+    print!("{line}");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+}
+
 fn build_induction_harness(
     harness_name: &str,
     mutator: &str,
@@ -1005,23 +1012,38 @@ fn cli_induct(argv: &[String]) -> (i32, String) {
     }
 
     let post_err = format!("(err {})", INDUCT_POST_SENTINEL);
-    let mut report = String::new();
     let (mut n_holds, mut n_violated, mut n_unproven, mut n_skipped) = (0, 0, 0, 0);
     let mut n_holds_smt = 0;
     // Skip reasons already spelled out in full, so a missing dependency does
     // not print its explanation once per (invariant, mutator) pair.
     let mut skip_reasons = std::collections::HashSet::new();
 
+    // A run over a large contract takes minutes, and a report that appears only
+    // at the end is indistinguishable from a hang. Each verdict is printed as
+    // it lands; the returned string is just the summary.
+    let engine = match solver.as_ref() {
+        Some(s) => format!("simplifier + {}", s.program),
+        None if no_smt.is_some() => "simplifier only (--no-smt)".to_string(),
+        None => "simplifier only (no SMT solver found; install z3, or pass --solver PATH)"
+            .to_string(),
+    };
+    println!(
+        "Inductive invariant check for {contract_id}\n\
+         (does each mutator preserve each invariant?)\n\
+         decided by: {engine}"
+    );
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+
     for inv in invariants.iter() {
         let inv_params = match function_params(&contract_id, &src, inv) {
             Ok(Some(p)) => p,
-            _ => { report.push_str(&format!("\n{inv}\n  (invariant not found; skipping)\n")); continue; }
+            _ => { print_now(&format!("\n{inv}\n  (invariant not found; skipping)\n")); continue; }
         };
-        report.push_str(&format!("\n{inv}\n"));
+        print_now(&format!("\n{inv}\n"));
         for mutator in mutators.iter() {
             let mut_params = match function_params(&contract_id, &src, mutator) {
                 Ok(Some(p)) => p,
-                _ => { report.push_str(&format!("  SKIP       {mutator}  (not found)\n")); n_skipped += 1; continue; }
+                _ => { print_now(&format!("  SKIP       {mutator}  (not found)\n")); n_skipped += 1; continue; }
             };
             let harness_name = format!("clv-induct-{mutator}-{inv}");
             let harness = build_induction_harness(&harness_name, mutator, &mut_params, inv, &inv_params);
@@ -1049,10 +1071,10 @@ fn cli_induct(argv: &[String]) -> (i32, String) {
                         .collect();
                     if violations.is_empty() {
                         n_holds += 1;
-                        report.push_str(&format!("  HOLDS      {mutator}\n"));
+                        print_now(&format!("  HOLDS      {mutator}\n"));
                     } else if violations.iter().any(|c| format!("{}", c.predicate).trim() == "true") {
                         n_violated += 1;
-                        report.push_str(&format!("  VIOLATED   {mutator}  (unconditionally)\n"));
+                        print_now(&format!("  VIOLATED   {mutator}  (unconditionally)\n"));
                     } else if solver.as_ref().is_some_and(|s| {
                         // The simplifier could not rule these paths out. Ask a
                         // solver. Only `Unsat` counts: the translation is an
@@ -1065,18 +1087,18 @@ fn cli_induct(argv: &[String]) -> (i32, String) {
                     }) {
                         n_holds += 1;
                         n_holds_smt += 1;
-                        report.push_str(&format!("  HOLDS      {mutator}  (by solver)\n"));
+                        print_now(&format!("  HOLDS      {mutator}  (by solver)\n"));
                     } else {
                         n_unproven += 1;
                         let cond = format!("{}", violations[0].predicate);
                         let cond = cond.split_whitespace().collect::<Vec<_>>().join(" ");
                         let cond = if cond.len() > 160 { format!("{}...", &cond[..160]) } else { cond };
-                        report.push_str(&format!("  NOT PROVEN {mutator}  (fails when: {cond})\n"));
+                        print_now(&format!("  NOT PROVEN {mutator}  (fails when: {cond})\n"));
                     }
                 }
                 Err(Error::TimedOut(secs)) => {
                     n_unproven += 1;
-                    report.push_str(&format!(
+                    print_now(&format!(
                         "  UNFINISHED {mutator}  (gave up after {secs}s; raise --time-budget)\n"
                     ));
                 }
@@ -1084,7 +1106,7 @@ fn cli_induct(argv: &[String]) -> (i32, String) {
                     // Tried and did not finish, which is a different thing
                     // from not having tried: it counts against the proof.
                     n_unproven += 1;
-                    report.push_str(&format!(
+                    print_now(&format!(
                         "  UNFINISHED {mutator}  (gave up after {steps} steps; raise --max-steps)\n"
                     ));
                 }
@@ -1094,32 +1116,21 @@ fn cli_induct(argv: &[String]) -> (i32, String) {
                     // The same missing dependency skips every pair, so say it
                     // once and just name the rest.
                     if skip_reasons.insert(why.clone()) {
-                        report.push_str(&format!("  SKIP       {mutator}  ({why})\n"));
+                        print_now(&format!("  SKIP       {mutator}  ({why})\n"));
                     } else {
-                        report.push_str(&format!("  SKIP       {mutator}\n"));
+                        print_now(&format!("  SKIP       {mutator}\n"));
                     }
                 }
             }
         }
     }
 
-    let engine = match solver.as_ref() {
-        Some(s) => format!("simplifier + {}", s.program),
-        None if no_smt.is_some() => "simplifier only (--no-smt)".to_string(),
-        None => "simplifier only (no SMT solver found; install z3, or pass --solver PATH)"
-            .to_string(),
-    };
-    let header = format!(
-        "Inductive invariant check for {contract_id}\n\
-         (does each mutator preserve each invariant?)\n\
-         decided by: {engine}\n"
-    );
     let footer = format!(
         "\nSummary: {n_holds} holds ({n_holds_smt} by solver), {n_violated} violated, \
          {n_unproven} not-proven, {n_skipped} skipped\n"
     );
     let code = if n_violated > 0 { 3 } else if n_unproven > 0 { 5 } else { 0 };
-    (code, format!("{header}{report}{footer}"))
+    (code, footer)
 }
 
 fn cli_reachability_graph(argv: &[String]) -> (i32, String) {
