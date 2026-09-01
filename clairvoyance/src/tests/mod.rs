@@ -6373,3 +6373,16 @@ fn test_induct_discriminates_across_contracts() {
     );
     assert_verdicts("ledger.clar", &["--dep", dep], 1, 0, 1);
 }
+
+
+/// The `or`-invariant gap, pinned so a fix is noticed rather than silently
+/// changing behaviour. `invariant-as-if` decides all three mutators; the `or`
+/// spelling of the same property decides none of them. Totals across both:
+/// 2 holds (the `if` form on the two preserving mutators), 4 not-proven.
+///
+/// If this starts failing because the counts went up, the gap is fixed: update
+/// the example's header and these numbers.
+#[test]
+fn test_induct_known_gap_or_invariant() {
+    assert_verdicts("known-gap-or-invariant.clar", &[], 2, 0, 4);
+}

@@ -934,6 +934,12 @@ fn cli_induct(argv: &[String]) -> (i32, String) {
         Ok(None) => DEFAULT_TIME_BUDGET,
         Err(e) => return (1, e),
     };
+    // A residual is a counterexample, and a counterexample cut off after 160
+    // characters is not one.
+    let full_conditions = match cli::consume_arg(&mut remaining_args, &["--full-conditions"], false) {
+        Ok(v) => v.is_some(),
+        Err(e) => return (1, e),
+    };
     let step_budget = match cli::consume_arg(&mut remaining_args, &["--max-steps"], true) {
         Ok(Some(v)) => match v.parse::<u64>() {
             Ok(n) => Some(n),
@@ -1105,7 +1111,12 @@ fn cli_induct(argv: &[String]) -> (i32, String) {
                         n_unproven += 1;
                         let cond = format!("{}", violations[0].predicate);
                         let cond = cond.split_whitespace().collect::<Vec<_>>().join(" ");
-                        let cond = if cond.len() > 160 { format!("{}...", &cond[..160]) } else { cond };
+                        let cond = if !full_conditions && cond.len() > 160 {
+                            format!("{}... (--full-conditions for the rest)", &cond[..160])
+                        }
+                        else {
+                            cond
+                        };
                         print_now(&format!("  NOT PROVEN {mutator}  (fails when: {cond})\n"));
                     }
                 }
@@ -1261,7 +1272,8 @@ fn sym_help() -> String {
      \x20            read-only named invariant-* is used; with no --mutator, every public\n\
      \x20            function. Reports UNFINISHED for a pair that ran past --max-steps.\n\
      \x20            Options: --invariant NAME, --mutator NAME (both repeatable),\n\
-     \x20            --solver PATH, --no-smt, --time-budget SECONDS, --max-steps N.\n\
+     \x20            --solver PATH, --no-smt, --time-budget SECONDS, --max-steps N,\n\
+     \x20            --full-conditions.\n\
      \x20 exec-func  Symbolically execute FUNCTION and print every terminating state\n\
      \x20            (path predicate, return value, and state writes). Also enforces any\n\
      \x20            (@clairvoyance ...) spec, like `check`, but prints the raw states.\n\
