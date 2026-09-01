@@ -136,7 +136,9 @@ impl Halt {
                     let symop = ctx.parse_symop(&lv[1])?;
                     formula = Some(Box::new(symop));
                 }
-                "condition" => {
+                // `invariant` is the condition a matching halting state must
+                // satisfy -- an alias for `condition` when used inside a halt.
+                "condition" | "invariant" => {
                     if condition.is_some() {
                         return Err(Error::new_program_error(format!("List expression #{i} is a duplicate directive `{directive}`: {expr}")));
                     }

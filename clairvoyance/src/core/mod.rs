@@ -472,7 +472,12 @@ impl ProofFailures {
             }
         }
 
-        // each continuation must have reached exactly one halt
+        // Every continuation must be accounted for by some halt, and every
+        // halt must hold. Invariants are universal assertions -- more than one
+        // may target the same continuation (one may hold there while another
+        // fails) -- so a satisfied continuation is *marked covered* rather than
+        // consumed, and coverage is checked at the end.
+        let mut covered = vec![false; conts.len()];
         for h in halts.iter() {
             let mut found_cont = None;
             // A continuation whose result matches this halt but whose predicate
@@ -601,12 +606,12 @@ impl ProofFailures {
                 }
                 continue;
             };
-            conts.remove(i);
+            covered[i] = true;
         }
 
-        if conts.len() > 0 {
-            for c in conts {
-                // this is an unaccounted continuation 
+        for (i, c) in conts.into_iter().enumerate() {
+            if !covered[i] {
+                // this is an unaccounted continuation
                 failures.unaccounted_continuation(c);
             }
         }
