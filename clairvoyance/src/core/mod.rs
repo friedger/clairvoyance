@@ -847,7 +847,9 @@ pub enum Error {
     /// Clairvoyance program failed to run
     ProofFailure(ProofFailures),
     /// The exploration ran past its step budget without finishing
-    Budget(u64)
+    Budget(u64),
+    /// The exploration ran past its time budget without finishing
+    TimedOut(u64)
 }
 
 impl Error {
@@ -890,6 +892,9 @@ impl fmt::Display for Error {
             },
             Self::Budget(steps) => {
                 write!(f, "gave up after {steps} steps (raise or remove --max-steps to keep going)")
+            },
+            Self::TimedOut(seconds) => {
+                write!(f, "gave up after {seconds}s (raise or remove --time-budget to keep going)")
             },
             x => {
                 write!(f, "{x:?}")

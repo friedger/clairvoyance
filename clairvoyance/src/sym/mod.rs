@@ -8547,6 +8547,13 @@ pub struct Symbex {
     pub step_budget: Option<u64>,
     /// steps taken so far
     steps: u64,
+    /// when to stop, if a caller set a wall-clock limit. Steps vary in cost by
+    /// orders of magnitude -- one that clones a large continuation is not one
+    /// that reads a constant -- so a time limit is the one a caller can
+    /// actually predict.
+    pub deadline: Option<std::time::Instant>,
+    /// how long that limit was, for the report
+    pub time_budget_secs: u64,
     /// in-RAM contract store
     datastore: BackingStore,
     /// contracts loaded, and their typemaps, symbols, and contexts
@@ -9375,6 +9382,10 @@ impl Symbex {
         self.steps = self.steps.saturating_add(1);
         if let Some(budget) = self.step_budget && self.steps > budget {
             return Err(Error::Budget(self.steps));
+        }
+        // Checking the clock on every step is far cheaper than the step is.
+        if let Some(deadline) = self.deadline && std::time::Instant::now() > deadline {
+            return Err(Error::TimedOut(self.time_budget_secs));
         }
 
         debug!("Simplify continuation {} predicate {}", continuation.id, &continuation.predicate);
@@ -12373,6 +12384,8 @@ impl Symbex {
         let symbex = Symbex {
             step_budget: None,
             steps: 0,
+            deadline: None,
+            time_budget_secs: 0,
             datastore,
             callgraph: None,
             contracts: contract_state,

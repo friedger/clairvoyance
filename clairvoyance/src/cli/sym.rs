@@ -31,6 +31,11 @@ use crate::cli;
 /// sees it, small enough that a blow-up stops in seconds rather than never.
 const DEFAULT_STEP_BUDGET: Option<u64> = Some(2_000_000);
 
+/// How long a single run may take before the engine reports that it did not
+/// finish. Steps vary in cost by orders of magnitude, so this is the limit a
+/// caller can actually predict; the step budget is the backstop.
+const DEFAULT_TIME_BUDGET: Option<u64> = Some(60);
+
 fn exec_user_function(
     contract_id: QualifiedContractIdentifier,
     src: &str,
@@ -53,7 +58,8 @@ fn exec_user_function(
     // current path. This one *can* hide a write, so anything reasoning about
     // state across a call has to leave it off.
     skip_causally_independent: bool,
-    step_budget: Option<u64>
+    step_budget: Option<u64>,
+    time_budget_secs: Option<u64>
 ) -> Result<Vec<Continuation>, Error> {
     let mut contracts : Vec<_> = deps 
         .iter()
@@ -77,6 +83,10 @@ fn exec_user_function(
         .skip_pure(skip_pure)
         .skip_causally_independent(skip_causally_independent);
     symbex.step_budget = step_budget;
+    if let Some(secs) = time_budget_secs {
+        symbex.time_budget_secs = secs;
+        symbex.deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(secs));
+    }
 
     for (func_name, traits) in concretized_traits.iter() {
         for (var_name, contract_id) in traits.iter() {
@@ -379,6 +389,14 @@ fn cli_eval_user_function(argv: &[String]) -> (i32, String) {
 
     // A path blow-up looks exactly like a hang from outside. A budget turns it
     // into a result: the run is reported as unfinished, never as holding.
+    let time_budget = match cli::consume_arg(&mut remaining_args, &["--time-budget"], true) {
+        Ok(Some(v)) => match v.parse::<u64>() {
+            Ok(n) => Some(n),
+            Err(_) => return (1, format!("--time-budget expects seconds, got '{v}'")),
+        },
+        Ok(None) => DEFAULT_TIME_BUDGET,
+        Err(e) => return (1, e),
+    };
     let step_budget = match cli::consume_arg(&mut remaining_args, &["--max-steps"], true) {
         Ok(Some(v)) => match v.parse::<u64>() {
             Ok(n) => Some(n),
@@ -503,7 +521,8 @@ fn cli_eval_user_function(argv: &[String]) -> (i32, String) {
         skip_functions,
         !full_explore_opt.is_some(),
         !full_explore_opt.is_some(),
-        step_budget
+        step_budget,
+        time_budget
     ) {
         Ok(c) => c,
         Err(e) => {
@@ -693,6 +712,14 @@ fn cli_check(argv: &[String]) -> (i32, String) {
 
     // A path blow-up looks exactly like a hang from outside. A budget turns it
     // into a result: the run is reported as unfinished, never as holding.
+    let time_budget = match cli::consume_arg(&mut remaining_args, &["--time-budget"], true) {
+        Ok(Some(v)) => match v.parse::<u64>() {
+            Ok(n) => Some(n),
+            Err(_) => return (1, format!("--time-budget expects seconds, got '{v}'")),
+        },
+        Ok(None) => DEFAULT_TIME_BUDGET,
+        Err(e) => return (1, e),
+    };
     let step_budget = match cli::consume_arg(&mut remaining_args, &["--max-steps"], true) {
         Ok(Some(v)) => match v.parse::<u64>() {
             Ok(n) => Some(n),
@@ -782,6 +809,7 @@ fn cli_check(argv: &[String]) -> (i32, String) {
             !full_explore_opt.is_some(),
             !full_explore_opt.is_some(),
             step_budget,
+            time_budget,
         );
         match res {
             Ok(conts) => {
@@ -883,6 +911,14 @@ fn cli_induct(argv: &[String]) -> (i32, String) {
 
     // A path blow-up looks exactly like a hang from outside. A budget turns it
     // into a result: the run is reported as unfinished, never as holding.
+    let time_budget = match cli::consume_arg(&mut remaining_args, &["--time-budget"], true) {
+        Ok(Some(v)) => match v.parse::<u64>() {
+            Ok(n) => Some(n),
+            Err(_) => return (1, format!("--time-budget expects seconds, got '{v}'")),
+        },
+        Ok(None) => DEFAULT_TIME_BUDGET,
+        Err(e) => return (1, e),
+    };
     let step_budget = match cli::consume_arg(&mut remaining_args, &["--max-steps"], true) {
         Ok(Some(v)) => match v.parse::<u64>() {
             Ok(n) => Some(n),
@@ -1004,6 +1040,7 @@ fn cli_induct(argv: &[String]) -> (i32, String) {
                 true,
                 false,
                 step_budget,
+                time_budget,
             );
             match res {
                 Ok(conts) => {
@@ -1036,6 +1073,12 @@ fn cli_induct(argv: &[String]) -> (i32, String) {
                         let cond = if cond.len() > 160 { format!("{}...", &cond[..160]) } else { cond };
                         report.push_str(&format!("  NOT PROVEN {mutator}  (fails when: {cond})\n"));
                     }
+                }
+                Err(Error::TimedOut(secs)) => {
+                    n_unproven += 1;
+                    report.push_str(&format!(
+                        "  UNFINISHED {mutator}  (gave up after {secs}s; raise --time-budget)\n"
+                    ));
                 }
                 Err(Error::Budget(steps)) => {
                     // Tried and did not finish, which is a different thing
@@ -1192,8 +1235,9 @@ fn sym_help() -> String {
      \x20            assume the invariant, run the mutator, and check it still holds.\n\
      \x20            Reports HOLDS / VIOLATED / NOT PROVEN. With no --invariant, every\n\
      \x20            read-only named invariant-* is used; with no --mutator, every public\n\
-     \x20            function. Options: --invariant NAME, --mutator NAME (both repeatable),\n\
-     \x20            --solver PATH, --no-smt.\n\
+     \x20            function. Reports UNFINISHED for a pair that ran past --max-steps.\n\
+     \x20            Options: --invariant NAME, --mutator NAME (both repeatable),\n\
+     \x20            --solver PATH, --no-smt, --time-budget SECONDS, --max-steps N.\n\
      \x20 exec-func  Symbolically execute FUNCTION and print every terminating state\n\
      \x20            (path predicate, return value, and state writes). Also enforces any\n\
      \x20            (@clairvoyance ...) spec, like `check`, but prints the raw states.\n\
@@ -1224,6 +1268,14 @@ fn sym_help() -> String {
      \x20                              else z3 or cvc5 if one is on PATH.\n\
      \x20 --no-smt                     (induct only) do not use a solver, even if one is\n\
      \x20                              installed.\n\
+     \x20 --time-budget SECONDS        Give up after this long and report the run as\n\
+     \x20                              unfinished, rather than exploring forever.\n\
+     \x20                              Defaults to 60s, per (invariant, mutator) pair for\n\
+     \x20                              `induct`. An unfinished run counts against a proof,\n\
+     \x20                              never for it.\n\
+     \x20 --max-steps N                The same, counted in evaluation steps instead\n\
+     \x20                              (default 2000000). Steps vary wildly in cost, so\n\
+     \x20                              --time-budget is usually the one you want.\n\
      \n\
      SPECIFICATIONS:\n\
      \x20 A specification is a Clarity comment directly above a function, inside a\n\

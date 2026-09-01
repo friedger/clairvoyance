@@ -169,6 +169,10 @@ invariant-a-eq-b
   reduce. The printed condition tells you which to suspect: if you can read a
   counterexample out of it, it is the first kind.
 - **VIOLATED** — `I` fails after `M` unconditionally.
+- **UNFINISHED** — the pair ran past its time budget (`--time-budget`,
+  60s by default) or step budget (`--max-steps`) before the engine was done.
+  It is counted with the not-proven, because it is: the tool stopped looking,
+  which is never evidence that an invariant holds.
 
 This works by composing the mutator's state effects into the invariant's reads
 — a called function's data-var reads now resolve against the caller's current
