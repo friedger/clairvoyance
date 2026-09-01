@@ -1055,10 +1055,15 @@ fn cli_induct(argv: &[String]) -> (i32, String) {
                 std::collections::HashSet::new(),
                 tx_sender.clone(), contract_caller.clone(), tx_sponsor.clone(), contract_tx_sponsor.clone(),
                 false, vec![],
-                // Pure calls stay abstracted -- they cannot carry state
-                // between the mutator and the invariant -- but everything that
-                // touches state is inlined, which is what lets a value the
-                // mutator writes reach the invariant that reads it.
+                // Pure calls stay abstracted: they have no state to carry
+                // between the mutator and the invariant. Causally independent
+                // ones must NOT be -- the analysis looks at what a path has
+                // written so far, and the invariant is called after the
+                // mutator wrote, but the abstraction is decided (and cached)
+                // per function, so the invariant's reads get replaced by fresh
+                // symbols and it holds for no reason. Every example that ought
+                // to fail passes with this turned on, which is how it was
+                // caught; examples/inductive.clar is the cheapest check.
                 true,
                 false,
                 step_budget,

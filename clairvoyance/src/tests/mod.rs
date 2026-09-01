@@ -6299,3 +6299,77 @@ fn test_smt_unmodelled_op_is_shared() {
         "sqrti(x) = 1 and sqrti(x) = 2",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Inductive checking: the discriminating cases
+//
+// These pin the thing that actually matters about `sym induct`: that a mutator
+// which breaks its invariant does NOT come back as HOLDS. Every one of them
+// passed while the engine was abstracting away the invariant's own reads, so a
+// wall of HOLDS is exactly what this failure mode looks like. Assert both
+// halves -- what holds and what does not -- or the test cannot tell the
+// difference.
+// ---------------------------------------------------------------------------
+
+/// Run `sym induct` over an example and return its summary line.
+fn induct_summary(example: &str, extra: &[&str]) -> String {
+    let mut argv: Vec<String> = vec![
+        "induct".to_string(),
+        "SP000000000000000000002Q6VF78.x".to_string(),
+        format!(concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/{}"), example),
+    ];
+    argv.extend(extra.iter().map(|s| s.to_string()));
+    let (_code, summary) = crate::cli::sym::run_cli_sym(&mut argv);
+    summary
+}
+
+/// `n holds, v violated, u not-proven` -- the counts, without the wording.
+fn assert_verdicts(example: &str, extra: &[&str], holds: usize, violated: usize, unproven: usize) {
+    let summary = induct_summary(example, extra);
+    let expected = format!(
+        "{holds} holds",
+    );
+    assert!(
+        summary.contains(&expected),
+        "{example}: expected {holds} holds, got:\n{summary}"
+    );
+    assert!(
+        summary.contains(&format!("{violated} violated")),
+        "{example}: expected {violated} violated, got:\n{summary}"
+    );
+    assert!(
+        summary.contains(&format!("{unproven} not-proven")),
+        "{example}: expected {unproven} not-proven, got:\n{summary}"
+    );
+}
+
+#[test]
+fn test_induct_discriminates_equal_increments() {
+    // bump-both preserves a == b; bump-a breaks it; bump-c does not touch it.
+    assert_verdicts("inductive.clar", &[], 2, 0, 1);
+}
+
+#[test]
+fn test_induct_discriminates_modular_and_nonlinear() {
+    // add-two and inc-n preserve their invariants and need a solver to show it;
+    // add-one really does break evenness.
+    assert_verdicts("inductive-smt.clar", &[], 5, 0, 1);
+}
+
+#[test]
+fn test_induct_discriminates_token_balance() {
+    // owe-funded mints what it promises; owe-unfunded does not.
+    assert_verdicts("inductive-token.clar", &[], 1, 0, 1);
+}
+
+#[test]
+fn test_induct_discriminates_across_contracts() {
+    // The invariant spans two contracts: record-only updates this contract's
+    // book without moving the token, and must not prove.
+    let dep = concat!(
+        "SP000000000000000000002Q6VF78.token:",
+        env!("CARGO_MANIFEST_DIR"),
+        "/../examples/token.clar"
+    );
+    assert_verdicts("ledger.clar", &["--dep", dep], 1, 0, 1);
+}

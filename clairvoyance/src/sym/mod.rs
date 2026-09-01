@@ -6419,6 +6419,14 @@ pub struct ContinuationAccessSnapshot {
 /// A symbolic continuation
 #[derive(Clone, Debug, PartialEq)]
 pub struct Continuation {
+    /// whether this path has moved an asset (a token or STX balance).
+    ///
+    /// The causal-independence analysis works off the callgraph's map and var
+    /// accesses, which say nothing about assets. Until it does, a path that
+    /// has moved one stops abstracting calls away: otherwise a function that
+    /// reads a balance this path just changed could be replaced by a fresh
+    /// symbol, and an invariant over that balance would hold for no reason.
+    asset_written: bool,
     /// internal identifier to ensure uniqueness
     pub id: u64,
     /// Path to the item in the contract being evaluated
@@ -6675,6 +6683,7 @@ impl GetContractSymOps for Continuation {
 impl Continuation {
     pub fn root(symbex: &Symbex, current_contract: PrincipalData) -> Self {
         let mut cont = Self {
+            asset_written: false,
             id: next_cont_id(),
             function_path: None,
             current_line: None,
@@ -6747,6 +6756,7 @@ impl Continuation {
             reachable_var_writes: parent.reachable_var_writes.clone(),
             panicking: false,
             early_return: false,
+            asset_written: parent.asset_written,
         };
         debug!("Created continuation {} ({}) from parent {}: pred={}", cont.id, cont.function_path.as_ref().map(|s| s.as_str()).unwrap_or("unreachable"), parent_id, &cont.predicate);
         cont
@@ -6984,6 +6994,7 @@ impl Continuation {
         var_accesses.extend(free.var_accesses.clone().into_iter());
 
         let cont = Self {
+            asset_written: parent.asset_written || free.asset_written,
             id: next_cont_id(),
             function_path: Some(function_path),
             current_line: free.current_line.clone(),
@@ -7112,6 +7123,7 @@ impl Continuation {
 
     /// Write chain-level state.
     pub fn set_global_entry(&mut self, name: &FullName, key_symop: SymOp, val_symop: SymOp) {
+        self.asset_written = true;
         if let Some(idx) = self.map_tombstones.get_mut(name) {
             idx.remove(&key_symop);
         }
@@ -7635,6 +7647,12 @@ impl Continuation {
     /// written in this continuation (i.e. if not, then perhaps we don't need to evaluate this
     /// function).
     pub fn is_causally_independent(&self, func_name: &FullName, callgraph: &Callgraph) -> Result<bool, Error> {
+        if self.asset_written {
+            // The callgraph does not track asset accesses, so once a balance
+            // has moved there is no way to tell whether this function reads
+            // it. Assume it might.
+            return Ok(false);
+        }
         let reachable_map_accesses : HashSet<_> = callgraph.reachable_map_accesses_from(func_name)?
             .into_iter()
             .collect();
