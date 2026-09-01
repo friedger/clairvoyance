@@ -5493,6 +5493,7 @@ impl SymOp {
         if is_simplified(&cur) {
             return Ok(cur);
         }
+        check_deadline()?;
 
         let old = cur.clone();
         loop {
@@ -6294,6 +6295,7 @@ impl Predicate {
     pub fn simplify(self) -> Result<Self, Error> {
         let mut cur = self;
         loop {
+            check_deadline()?;
             let ret = Self::try_evaluate(cur.clone())?;
             if ret == cur {
                 return Ok(ret);
@@ -6363,6 +6365,43 @@ impl fmt::Display for Trace {
 thread_local! {
     static CONT_ID_CTR: std::cell::Cell<u64> = std::cell::Cell::new(1);
     static LAST_CONT_ID_CTR: std::cell::Cell<u64> = std::cell::Cell::new(0);
+}
+
+// The run's deadline, per thread.
+//
+// The simplifier is reached from far more places than `eval`, and a single
+// call on a large term can run for minutes on its own -- long enough that a
+// budget checked only between evaluation steps never gets a turn. Keeping the
+// deadline here lets the one place that actually spends the time honour it,
+// without threading a reference through every simplification rule.
+thread_local! {
+    static DEADLINE: std::cell::Cell<Option<std::time::Instant>> = std::cell::Cell::new(None);
+}
+
+/// Set (or clear) the deadline for work on this thread.
+pub fn set_deadline(deadline: Option<std::time::Instant>) {
+    DEADLINE.with(|d| d.set(deadline));
+}
+
+/// How long the budget was, for the message. Set alongside the deadline.
+thread_local! {
+    static DEADLINE_SECS: std::cell::Cell<u64> = std::cell::Cell::new(0);
+}
+
+pub fn set_deadline_secs(secs: u64) {
+    DEADLINE_SECS.with(|d| d.set(secs));
+}
+
+/// `Err(TimedOut)` once the deadline has passed, so a long-running
+/// simplification stops instead of running to completion.
+fn check_deadline() -> Result<(), Error> {
+    let expired = DEADLINE.with(|d| d.get())
+        .map(|deadline| std::time::Instant::now() > deadline)
+        .unwrap_or(false);
+    if expired {
+        return Err(Error::TimedOut(DEADLINE_SECS.with(|d| d.get())));
+    }
+    Ok(())
 }
 fn next_cont_id() -> u64 {
     CONT_ID_CTR.with(|c| {
@@ -8591,6 +8630,10 @@ impl SymContract {
 }
 
 /// Symbolic execution engine
+/// Above this many continuations, the pairwise merge scan costs more than the
+/// merging saves.
+const MAX_COMBINABLE_CONTINUATIONS: usize = 256;
+
 #[derive(Debug)]
 pub struct Symbex {
     /// how many evaluation steps remain before the engine gives up, if a
@@ -8822,7 +8865,19 @@ impl Symbex {
             }
         }
 
-        if self.combine_continuations {
+        // Combining is O(n^2) in the number of continuations, and it runs
+        // without ever calling `eval`, so a large set can spend minutes here
+        // where neither the step nor the time budget is ever consulted. Past
+        // the deadline, or past a size where the pairwise scan costs more than
+        // the merge saves, hand the continuations back unmerged: merging is an
+        // optimisation, and skipping it changes nothing but speed.
+        let past_deadline = self.deadline
+            .map(|d| std::time::Instant::now() > d)
+            .unwrap_or(false);
+        if self.combine_continuations
+            && !past_deadline
+            && filtered_conts.len() <= MAX_COMBINABLE_CONTINUATIONS
+        {
             // try to combine continuations
             let cmp_final_formulae = |f1: &SymOp, f2: &SymOp| {
                 f1 == f2

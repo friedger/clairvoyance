@@ -85,7 +85,15 @@ fn exec_user_function(
     symbex.step_budget = step_budget;
     if let Some(secs) = time_budget_secs {
         symbex.time_budget_secs = secs;
-        symbex.deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(secs));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+        symbex.deadline = Some(deadline);
+        // The simplifier is reached from far more places than `eval`, so it
+        // needs the deadline too, or a single long simplification runs past it.
+        crate::sym::set_deadline(Some(deadline));
+        crate::sym::set_deadline_secs(secs);
+    }
+    else {
+        crate::sym::set_deadline(None);
     }
 
     for (func_name, traits) in concretized_traits.iter() {
