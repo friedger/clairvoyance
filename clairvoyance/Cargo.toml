@@ -11,6 +11,10 @@ serde = "1"
 serde_derive = "1"
 num = "0.4"
 slog = { version = "2.5.2", features = [ "max_level_trace" ] }
+# SMT backend: talks SMT-LIB 2 to a solver subprocess (z3 by default).
+# Subprocess rather than native bindings so the build stays light and any
+# SMT-LIB solver works; the tool degrades gracefully when none is installed.
+easy-smt = "0.3"
 
 [dependencies.serde_json]
 version = "1.0"

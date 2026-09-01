@@ -832,6 +832,38 @@ fn cli_induct(argv: &[String]) -> (i32, String) {
         mutators.push(name);
     }
 
+    // An SMT solver decides the paths the simplifier cannot. It may only ever
+    // turn NOT PROVEN into HOLDS -- see the `smt` module on why `Unsat` is the
+    // only trustworthy answer -- so running without one is always safe.
+    let Ok(no_smt) = cli::consume_arg(&mut remaining_args, &["--no-smt"], false) else {
+        return (1, "Could not parse --no-smt".into());
+    };
+    let solver_override = match cli::consume_arg(&mut remaining_args, &["--solver"], true) {
+        Ok(v) => v,
+        Err(e) => return (1, e),
+    };
+    let solver = if no_smt.is_some() {
+        None
+    } else if let Some(program) = solver_override {
+        // An explicit --solver that does not run is an error, not a fallback:
+        // silently reporting the weaker simplifier-only answers under a header
+        // that names the solver would be the wrong kind of quiet.
+        match crate::smt::solver_at(&program) {
+            Some(s) => Some(s),
+            None => {
+                return (
+                    1,
+                    format!(
+                        "Could not run the SMT solver `{program}`. Pass a path to an \
+                         SMT-LIB 2 solver, or --no-smt to check without one."
+                    ),
+                );
+            }
+        }
+    } else {
+        crate::smt::find_solver()
+    };
+
     let deps = match load_deps(&mut remaining_args) { Ok(deps) => deps, Err(x) => return x };
     let concretized_traits = match load_concretized_traits(&mut remaining_args) { Ok(t) => t, Err(x) => return x };
     let default_concretized_traits = match load_default_concretized_traits(&mut remaining_args) { Ok(t) => t, Err(x) => return x };
@@ -866,6 +898,7 @@ fn cli_induct(argv: &[String]) -> (i32, String) {
     let post_err = format!("(err {})", INDUCT_POST_SENTINEL);
     let mut report = String::new();
     let (mut n_holds, mut n_violated, mut n_unproven, mut n_skipped) = (0, 0, 0, 0);
+    let mut n_holds_smt = 0;
 
     for inv in invariants.iter() {
         let inv_params = match function_params(&contract_id, &src, inv) {
@@ -901,6 +934,19 @@ fn cli_induct(argv: &[String]) -> (i32, String) {
                     } else if violations.iter().any(|c| format!("{}", c.predicate).trim() == "true") {
                         n_violated += 1;
                         report.push_str(&format!("  VIOLATED   {mutator}  (unconditionally)\n"));
+                    } else if solver.as_ref().is_some_and(|s| {
+                        // The simplifier could not rule these paths out. Ask a
+                        // solver. Only `Unsat` counts: the translation is an
+                        // over-approximation, so `Sat` proves nothing (see the
+                        // `smt` module). Every violating path must be
+                        // infeasible for the invariant to be preserved.
+                        violations.iter().all(|c| {
+                            crate::smt::predicate_is_unsat(&c.predicate, s) == crate::smt::Answer::Unsat
+                        })
+                    }) {
+                        n_holds += 1;
+                        n_holds_smt += 1;
+                        report.push_str(&format!("  HOLDS      {mutator}  (by solver)\n"));
                     } else {
                         n_unproven += 1;
                         let cond = format!("{}", violations[0].predicate);
@@ -917,12 +963,20 @@ fn cli_induct(argv: &[String]) -> (i32, String) {
         }
     }
 
+    let engine = match solver.as_ref() {
+        Some(s) => format!("simplifier + {}", s.program),
+        None if no_smt.is_some() => "simplifier only (--no-smt)".to_string(),
+        None => "simplifier only (no SMT solver found; install z3, or pass --solver PATH)"
+            .to_string(),
+    };
     let header = format!(
         "Inductive invariant check for {contract_id}\n\
-         (does each mutator preserve each invariant?)\n"
+         (does each mutator preserve each invariant?)\n\
+         decided by: {engine}\n"
     );
     let footer = format!(
-        "\nSummary: {n_holds} holds, {n_violated} violated, {n_unproven} not-proven, {n_skipped} skipped\n"
+        "\nSummary: {n_holds} holds ({n_holds_smt} by solver), {n_violated} violated, \
+         {n_unproven} not-proven, {n_skipped} skipped\n"
     );
     let code = if n_violated > 0 { 3 } else if n_unproven > 0 { 5 } else { 0 };
     (code, format!("{header}{report}{footer}"))
@@ -1041,7 +1095,8 @@ fn sym_help() -> String {
      \x20            assume the invariant, run the mutator, and check it still holds.\n\
      \x20            Reports HOLDS / VIOLATED / NOT PROVEN. With no --invariant, every\n\
      \x20            read-only named invariant-* is used; with no --mutator, every public\n\
-     \x20            function. Options: --invariant NAME, --mutator NAME (both repeatable).\n\
+     \x20            function. Options: --invariant NAME, --mutator NAME (both repeatable),\n\
+     \x20            --solver PATH, --no-smt.\n\
      \x20 exec-func  Symbolically execute FUNCTION and print every terminating state\n\
      \x20            (path predicate, return value, and state writes). Also enforces any\n\
      \x20            (@clairvoyance ...) spec, like `check`, but prints the raw states.\n\
@@ -1067,6 +1122,11 @@ fn sym_help() -> String {
      \x20 --no-explore-functions       Do not descend into any called function.\n\
      \x20 --full, -f                   Explore all paths, including pure/causally-independent\n\
      \x20                              ones normally pruned.\n\
+     \x20 --solver PATH                (induct only) SMT solver to discharge the residual\n\
+     \x20                              conditions the simplifier cannot. Default: $CLAIRVOYANCE_SMT,\n\
+     \x20                              else z3 or cvc5 if one is on PATH.\n\
+     \x20 --no-smt                     (induct only) do not use a solver, even if one is\n\
+     \x20                              installed.\n\
      \n\
      SPECIFICATIONS:\n\
      \x20 A specification is a Clarity comment directly above a function, inside a\n\

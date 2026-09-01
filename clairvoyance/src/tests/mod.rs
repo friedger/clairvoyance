@@ -6170,3 +6170,132 @@ fn test_continuation_comments() {
         info!("termination state: ==================================\n{}\n", &t.clone().rollup());
     }
 }
+
+// ---------------------------------------------------------------------------
+// SMT backend
+//
+// These need a solver on the box, so each one is a no-op when there is none --
+// the suite has to pass on a machine without z3, the same way the tool does.
+// ---------------------------------------------------------------------------
+
+/// Assert what the solver concludes about `p`, or skip if no solver is installed.
+fn assert_smt(p: Box<Predicate>, expected: crate::smt::Answer, what: &str) {
+    let Some(solver) = crate::smt::find_solver() else {
+        eprintln!("no SMT solver installed; skipping `{}`", what);
+        return;
+    };
+    let got = crate::smt::predicate_is_unsat(&p, &solver);
+    assert_eq!(got, expected, "{}: {}", what, p.to_pretty_string(0));
+}
+
+/// Assert only that the solver does *not* claim `p` is unsatisfiable. This is
+/// the soundness direction: `Unsat` is the only answer the tool acts on, so a
+/// satisfiable formula must never come back `Unsat`, while `Sat` and `Unknown`
+/// are both acceptable.
+fn assert_smt_not_unsat(p: Box<Predicate>, what: &str) {
+    let Some(solver) = crate::smt::find_solver() else {
+        eprintln!("no SMT solver installed; skipping `{}`", what);
+        return;
+    };
+    let got = crate::smt::predicate_is_unsat(&p, &solver);
+    assert!(
+        got != crate::smt::Answer::Unsat,
+        "{}: unsound Unsat on {}",
+        what,
+        p.to_pretty_string(0)
+    );
+}
+
+#[test]
+fn test_smt_contradiction() {
+    assert_smt(
+        pand(vec![pgreater(vu("x"), cu(0)), plesser(vu("x"), cu(0))]),
+        crate::smt::Answer::Unsat,
+        "x > 0 and x < 0",
+    );
+}
+
+#[test]
+fn test_smt_satisfiable_is_not_unsat() {
+    assert_smt(pgreater(vu("x"), cu(0)), crate::smt::Answer::Sat, "x > 0");
+}
+
+/// A `uint` is non-negative, and the encoder has to say so for anything about
+/// underflow to be provable.
+fn modulo(a: Box<SymOp>, b: Box<SymOp>) -> Box<Predicate> {
+    peq(Box::new(SymOp::Modulo(a, b)), cu(0))
+}
+
+#[test]
+fn test_smt_uint_is_non_negative() {
+    assert_smt(plesser(vu("x"), cu(0)), crate::smt::Answer::Unsat, "uint x < 0");
+}
+
+/// The canonical case the algebraic simplifier cannot close: adding 2 to an
+/// even number leaves it even.
+#[test]
+fn test_smt_modular_residual() {
+    assert_smt(
+        pand(vec![
+            modulo(vu("count"), cu(2)),
+            pnot(modulo(add(vec![vu("count"), cu(2)]), cu(2))),
+        ]),
+        crate::smt::Answer::Unsat,
+        "even count stays even after +2",
+    );
+}
+
+/// Adding 1 to an even number does not, and the solver must not pretend it does.
+#[test]
+fn test_smt_modular_residual_real_violation() {
+    assert_smt_not_unsat(
+        pand(vec![
+            modulo(vu("count"), cu(2)),
+            pnot(modulo(add(vec![vu("count"), cu(1)]), cu(2))),
+        ]),
+        "even count after +1",
+    );
+}
+
+/// Nonlinear: `(n+1)^2 = n^2 + 2n + 1`. The simplifier folds `(* n n)` into a
+/// power, so this also covers expanding a constant exponent.
+#[test]
+fn test_smt_nonlinear_square_residual() {
+    assert_smt(
+        pand(vec![
+            peq(vu("sq"), pow(vu("n"), cu(2))),
+            pnot(peq(
+                add(vec![vu("sq"), mul(vec![cu(2), vu("n")]), cu(1)]),
+                pow(add(vec![vu("n"), cu(1)]), cu(2)),
+            )),
+        ]),
+        crate::smt::Answer::Unsat,
+        "(n+1)^2 = n^2 + 2n + 1",
+    );
+}
+
+/// An operation the encoder does not model becomes a fresh constant, which
+/// weakens the formula -- it must never strengthen it into a false `Unsat`.
+#[test]
+fn test_smt_unmodelled_op_is_opaque_not_unsat() {
+    let sqrti = |s| Box::new(SymOp::Sqrti(s));
+    assert_smt_not_unsat(
+        peq(sqrti(vu("x")), sqrti(vu("y"))),
+        "sqrti(x) = sqrti(y)",
+    );
+}
+
+/// The same unmodelled term has to encode to the same constant every time, or
+/// the encoding would lose the one fact it can still carry about it.
+#[test]
+fn test_smt_unmodelled_op_is_shared() {
+    let sqrti = |s| Box::new(SymOp::Sqrti(s));
+    assert_smt(
+        pand(vec![
+            peq(sqrti(vu("x")), cu(1)),
+            peq(sqrti(vu("x")), cu(2)),
+        ]),
+        crate::smt::Answer::Unsat,
+        "sqrti(x) = 1 and sqrti(x) = 2",
+    );
+}

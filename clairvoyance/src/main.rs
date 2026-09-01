@@ -34,6 +34,7 @@ extern crate num;
 
 pub mod cli;
 pub mod core;
+pub mod smt;
 pub mod sym;
 
 #[cfg(test)]

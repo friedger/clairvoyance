@@ -82,7 +82,7 @@ for the full option list.
 | command | what it does |
 | --- | --- |
 | `sym check CONTRACT_ID CODE [FUNCTION]` | Verify a function against its specification and report **PASS / VIOLATED / SPEC ERROR / NO SPEC**, with a meaningful exit code. Omit `FUNCTION`, or pass `--all`, to check every public and read-only function and print a summary. |
-| `sym induct CONTRACT_ID CODE` | Inductive invariant checking: for each `(invariant, mutator)` pair, assume the invariant, run the mutator, and check it still holds. Reports **HOLDS / NOT PROVEN / VIOLATED**. |
+| `sym induct CONTRACT_ID CODE` | Inductive invariant checking: for each `(invariant, mutator)` pair, assume the invariant, run the mutator, and check it still holds. Reports **HOLDS / NOT PROVEN / VIOLATED**. Uses an SMT solver for the residuals when one is installed (`--solver PATH`, `--no-smt`). |
 | `sym exec-func CONTRACT_ID CODE FUNCTION` | Symbolically execute a function and print every terminating state — its path predicate, return value, and state writes. Also enforces any specification. |
 | `sym reachable CONTRACT_ID CODE FUNCTION` | Print the call graph reachable from a function: which data vars and maps it may read and write, transitively. |
 | `contract ast\|context\|analyze CONTRACT_ID CODE` | Inspect the parsed AST, the contract context, or the analysis of a contract. |
@@ -155,8 +155,8 @@ holds, then symbolically executes it:
 ```sh
 $ clairvoyance sym induct SP000000000000000000002Q6VF78.ledger examples/inductive.clar
 invariant-a-eq-b
-  NOT PROVEN bump-both  (fails when: (and (is-eq a b) (not (is-eq (+ a u1) (+ b u1)))))
-  NOT PROVEN bump-a     (fails when: (and (is-eq a b) (not (is-eq (+ a u1) b))))
+  HOLDS      bump-both
+  NOT PROVEN bump-a  (fails when: (and (is-eq a b) (not (is-eq (+ a u1) b))))
   HOLDS      bump-c
 ```
 
@@ -165,16 +165,54 @@ invariant-a-eq-b
 - **NOT PROVEN** — the engine could not rule out a path where `I` fails after
   `M`; the residual condition is printed. This is *either* a real conditional
   violation (a condition you can satisfy — `bump-a` above breaks `a == b`
-  whenever it held) *or* a limit of the simplifier (a condition that is
-  actually contradictory but that the algebraic simplifier cannot reduce —
-  `bump-both` above preserves `a == b`, but proving it needs to cancel the
-  `+ u1` on both sides of an equality, which needs an SMT solver). The printed
-  condition tells you which to suspect.
+  whenever it held) *or* a term neither the simplifier nor the solver could
+  reduce. The printed condition tells you which to suspect: if you can read a
+  counterexample out of it, it is the first kind.
 - **VIOLATED** — `I` fails after `M` unconditionally.
 
 This works by composing the mutator's state effects into the invariant's reads
 — a called function's data-var reads now resolve against the caller's current
 state, so a value the mutator writes flows into the invariant that reads it.
+
+### Discharging the residual with an SMT solver
+
+A NOT PROVEN residual is a formula, and most of the interesting ones are false
+— they just need more arithmetic than an algebraic simplifier has. If a solver is
+on your PATH, `sym induct` hands each residual to it and upgrades the result to
+HOLDS when the solver proves the failing path is infeasible:
+
+```sh
+$ clairvoyance sym induct SP000000000000000000002Q6VF78.smt examples/inductive-smt.clar
+decided by: simplifier + z3
+
+invariant-count-even
+  HOLDS      add-two  (by solver)
+  NOT PROVEN add-one  (fails when: (and (is-eq (mod count u2) u0) ...))
+
+invariant-sq-eq-n-squared
+  HOLDS      inc-n  (by solver)
+
+Summary: 5 holds (2 by solver), 0 violated, 1 not-proven, 0 skipped
+```
+
+`add-two` keeps `count` even and `inc-n` keeps `sq = n^2`; proving them needs
+modular arithmetic and the nonlinear identity `(n+1)^2 = n^2 + 2n + 1`
+respectively, neither of which the simplifier can do. `add-one` genuinely breaks
+the invariant, so it stays NOT PROVEN with its counterexample condition. Pass
+`--no-smt` to see all three fall back.
+
+- Any SMT-LIB 2 solver works. [z3](https://github.com/Z3Prover/z3) is the
+  default (`brew install z3`, `apt install z3`, or `pipx install z3-solver`);
+  cvc5 is tried next. Override with `--solver PATH` or `$CLAIRVOYANCE_SMT`.
+- **Only `unsat` is believed.** The translation to SMT is an over-approximation:
+  anything it cannot model becomes a fresh uninterpreted constant, which only
+  ever makes the formula easier to satisfy. So a solver `unsat` is a real proof
+  of infeasibility, while `sat` proves nothing and is reported as NOT PROVEN,
+  exactly as it would be without a solver. The solver can turn NOT PROVEN into
+  HOLDS; it can never turn HOLDS into a violation, and a missing solver never
+  changes an answer from correct to wrong.
+- Each query gets a 5-second timeout; a timeout, a crash, or a broken pipe all
+  read as "not proven".
 
 ## Limitations
 
@@ -189,12 +227,12 @@ Clairvoyance is young, and it is honest about what it cannot yet do:
   Clarity analyzer needs it present to type-check the call, so a contract that
   calls `pox-5` or the sBTC contracts must be given those as deps (a signature
   stub is enough) — they cannot be treated as opaque.
-- **No SMT solver.** Path feasibility and term equality are decided by a
-  built-in algebraic simplifier, not a complete decision procedure. Nonlinear
-  arithmetic (multiplying or dividing two symbolic values) is where it gives
-  out. When the simplifier cannot reduce a term it now leaves it unsimplified
-  and carries on, rather than aborting — so a hard term shows up as an
-  unresolved formula, not a crash.
+- **The solver is consulted, not relied on.** `sym induct` discharges residual
+  conditions with an SMT solver when one is installed, but the rest of the
+  engine — path feasibility during execution, and all of `sym check` — is
+  still decided by the algebraic simplifier alone. When the simplifier cannot
+  reduce a term it leaves it unsimplified and carries on, rather than aborting,
+  so a hard term shows up as an unresolved formula, not a crash.
 - **Some builtins are unmodelled**, including the Bitcoin transaction reader
   (`get-bitcoin-tx-output?`) and the signature-verification builtins.
 - **Cross-function composition covers data vars and concrete map keys.** A
@@ -202,12 +240,11 @@ Clairvoyance is young, and it is honest about what it cannot yet do:
   compose into the caller. What is not resolved is a read of an *uninitialized*
   slot the caller did not write, and symbolic-key aliasing, so `sym induct`
   reasons best about invariants over data vars and fixed map keys.
-- **Precision is bounded by the simplifier, not an SMT solver.** Equalities and
-  inequalities cancel common terms (`(is-eq (+ a k) (+ b k))` reduces to
-  `(is-eq a b)`, `(<= (+ a k) (+ b k))` to `(<= a b)`), and a comparison with its
-  complement is a contradiction — so an invariant preserved by equal increments
-  now proves. Nonlinear relations (a product or quotient of two symbolic values)
-  may still read as NOT PROVEN.
+- **Not every term reaches the solver.** The translation to SMT is a deliberate
+  over-approximation: an operation it does not model (hashes, `sqrti`, signed
+  division, buffers and sequences) becomes a fresh uninterpreted constant. That
+  is what keeps `Unsat` trustworthy, but it also means an invariant that turns
+  on one of those reads as NOT PROVEN no matter which solver you point at it.
 
 If the engine cannot evaluate a function it says so and exits non-zero, rather
 than reporting a false pass.
@@ -219,6 +256,7 @@ clairvoyance/src/
   main.rs             entry point and log configuration
   cli/                the command-line front end (sym, contract)
   core/               contract loading, the Error type, the proof-failure report
+  smt/                SMT-LIB translation and the solver subprocess
   sym/                the symbolic engine: SymOp, the simplifier, continuations
     command.rs        the (@clairvoyance ...) command interpreter
     command.clar      the command-language reference grammar

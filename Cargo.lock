@@ -234,6 +234,7 @@ version = "0.1.0"
 dependencies = [
  "clarity",
  "clarity-types",
+ "easy-smt",
  "num",
  "serde",
  "serde_derive",
@@ -493,6 +494,16 @@ dependencies = [
  "const-oid",
  "crypto-common",
  "subtle",
+]
+
+[[package]]
+name = "easy-smt"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "515cd4ec35e586919a532a81ed1e9285e2502ed3f49ecb9ba75fa3fe29eb950f"
+dependencies = [
+ "log",
+ "unicode-segmentation",
 ]
 
 [[package]]
@@ -2041,6 +2052,12 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+
+[[package]]
+name = "unicode-segmentation"
+version = "1.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c6f5d3c3b1bf09027a88a6bc961fc00497d651009560b5463668dc81b0fa87a8"
 
 [[package]]
 name = "unicode-xid"
