@@ -3663,6 +3663,19 @@ impl SymOp {
 
     /// apply and-contradiction
     /// X && !X == False
+    /// The logical complement of a comparison, if `op` is one. `<=` and `>`
+    /// negate each other, as do `<` and `>=`, so a conjunction containing both
+    /// a comparison and its complement is a contradiction.
+    fn comparison_complement(op: &SymOp) -> Option<SymOp> {
+        match op {
+            Self::Leq(a, b) => Some(Self::Greater(a.clone(), b.clone())),
+            Self::Greater(a, b) => Some(Self::Leq(a.clone(), b.clone())),
+            Self::Less(a, b) => Some(Self::Geq(a.clone(), b.clone())),
+            Self::Geq(a, b) => Some(Self::Less(a.clone(), b.clone())),
+            _ => None,
+        }
+    }
+
     fn contradiction_and(ops: Vec<Box<SymOp>>) -> Result<SymOp, Error> {
         let mut terms = HashSet::new();
         let mut not_terms = HashSet::new();
@@ -3678,6 +3691,15 @@ impl SymOp {
         }
         if terms.intersection(&not_terms).next().is_some() {
             return Ok(Self::False());
+        }
+        // A comparison and its complement (`(<= a b)` with `(> a b)`, `(< a b)`
+        // with `(>= a b)`) cannot both hold.
+        for term in ops.iter() {
+            if let Some(complement) = Self::comparison_complement(term) {
+                if terms.contains(&complement.to_string()) {
+                    return Ok(Self::False());
+                }
+            }
         }
         Ok(Self::And(ops))
     }
@@ -4823,6 +4845,12 @@ impl SymOp {
                 // TODO: term-gathering
                 let op = Self::simplify_native_2args(">", x, y, |x, y| Self::Greater(x, y))?;
                 if let Self::Greater(x, y) = op {
+                    // Cancel terms common to both sides (sound because
+                    // Clarity's `+` aborts on overflow rather than wrapping),
+                    // then re-simplify.
+                    if let Some((nx, ny)) = Self::cancel_common_addends(&x, &y) {
+                        return Self::Greater(Box::new(nx), Box::new(ny)).simplify();
+                    }
                     // put constants on the right hand side
                     if x.is_constant() && !y.is_constant() {
                         Ok(Self::Less(y, x))
@@ -4843,6 +4871,12 @@ impl SymOp {
                 // TODO: term-gathering
                 let op = Self::simplify_native_2args(">=", x, y, |x, y| Self::Geq(x, y))?;
                 if let Self::Geq(x, y) = op {
+                    // Cancel terms common to both sides (sound because
+                    // Clarity's `+` aborts on overflow rather than wrapping),
+                    // then re-simplify.
+                    if let Some((nx, ny)) = Self::cancel_common_addends(&x, &y) {
+                        return Self::Geq(Box::new(nx), Box::new(ny)).simplify();
+                    }
                     // put constants on the right hand side
                     if x.is_constant() && !y.is_constant() {
                         Ok(Self::Leq(y, x))
@@ -4866,6 +4900,12 @@ impl SymOp {
                 // TODO: term-gathering
                 let op = Self::simplify_native_2args("<=", x, y, |x, y| Self::Leq(x, y))?;
                 if let Self::Leq(x, y) = op {
+                    // Cancel terms common to both sides (sound because
+                    // Clarity's `+` aborts on overflow rather than wrapping),
+                    // then re-simplify.
+                    if let Some((nx, ny)) = Self::cancel_common_addends(&x, &y) {
+                        return Self::Leq(Box::new(nx), Box::new(ny)).simplify();
+                    }
                     // put constants on the right hand side
                     if x.is_constant() && !y.is_constant() {
                         Ok(Self::Geq(y, x))
@@ -4886,6 +4926,12 @@ impl SymOp {
                 // TODO: term-gathering
                 let op = Self::simplify_native_2args("<", x, y, |x, y| Self::Less(x, y))?;
                 if let Self::Less(x, y) = op {
+                    // Cancel terms common to both sides (sound because
+                    // Clarity's `+` aborts on overflow rather than wrapping),
+                    // then re-simplify.
+                    if let Some((nx, ny)) = Self::cancel_common_addends(&x, &y) {
+                        return Self::Less(Box::new(nx), Box::new(ny)).simplify();
+                    }
                     // put constants on the right hand side
                     if x.is_constant() && !y.is_constant() {
                         Ok(Self::Greater(y, x))
