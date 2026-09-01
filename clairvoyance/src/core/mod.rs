@@ -845,7 +845,9 @@ pub enum Error {
     /// Clairvoyance program failed to parse
     Program(ProgramError),
     /// Clairvoyance program failed to run
-    ProofFailure(ProofFailures)
+    ProofFailure(ProofFailures),
+    /// The exploration ran past its step budget without finishing
+    Budget(u64)
 }
 
 impl Error {
@@ -885,6 +887,9 @@ impl fmt::Display for Error {
             Self::ProofFailure(failures) => {
                 write!(f, "Clairvoyance encountered one or more errors while checking halting states:\n")?;
                 write!(f, "{failures}\n")
+            },
+            Self::Budget(steps) => {
+                write!(f, "gave up after {steps} steps (raise or remove --max-steps to keep going)")
             },
             x => {
                 write!(f, "{x:?}")

@@ -26,6 +26,11 @@ use crate::sym::FullName;
 use crate::core::Error;
 use crate::cli;
 
+/// How many evaluation steps a single run may take before the engine reports
+/// that it did not finish. Generous enough that an ordinary contract never
+/// sees it, small enough that a blow-up stops in seconds rather than never.
+const DEFAULT_STEP_BUDGET: Option<u64> = Some(2_000_000);
+
 fn exec_user_function(
     contract_id: QualifiedContractIdentifier,
     src: &str,
@@ -40,7 +45,15 @@ fn exec_user_function(
     contract_tx_sponsor: Option<StandardPrincipalData>,
     skip_functions: bool,
     skip_function_list: Vec<FullName>,
-    explore_all: bool
+    // Abstract a called function that does no I/O as a symbol. It has no state
+    // effects to lose, so this is safe even when the caller is being checked
+    // for what it writes -- and it is most of what keeps exploration finite.
+    skip_pure: bool,
+    // Abstract a called function whose I/O is causally independent of the
+    // current path. This one *can* hide a write, so anything reasoning about
+    // state across a call has to leave it off.
+    skip_causally_independent: bool,
+    step_budget: Option<u64>
 ) -> Result<Vec<Continuation>, Error> {
     let mut contracts : Vec<_> = deps 
         .iter()
@@ -61,8 +74,9 @@ fn exec_user_function(
         .with_tx_sponsor(tx_sponsor)
         .with_contract_caller(contract_caller)
         .with_function_call_exploration(!skip_functions)
-        .skip_pure(!explore_all)
-        .skip_causally_independent(!explore_all);
+        .skip_pure(skip_pure)
+        .skip_causally_independent(skip_causally_independent);
+    symbex.step_budget = step_budget;
 
     for (func_name, traits) in concretized_traits.iter() {
         for (var_name, contract_id) in traits.iter() {
@@ -363,6 +377,16 @@ fn load_contract_tx_sponsor(remaining_args: &mut Vec<String>) -> Result<Option<S
 fn cli_eval_user_function(argv: &[String]) -> (i32, String) {
     let mut remaining_args = argv.to_vec();
 
+    // A path blow-up looks exactly like a hang from outside. A budget turns it
+    // into a result: the run is reported as unfinished, never as holding.
+    let step_budget = match cli::consume_arg(&mut remaining_args, &["--max-steps"], true) {
+        Ok(Some(v)) => match v.parse::<u64>() {
+            Ok(n) => Some(n),
+            Err(_) => return (1, format!("--max-steps expects a number, got '{v}'")),
+        },
+        Ok(None) => DEFAULT_STEP_BUDGET,
+        Err(e) => return (1, e),
+    };
     let tx_sender = match load_tx_sender(&mut remaining_args) {
         Ok(p) => p,
         Err(x) => {
@@ -477,7 +501,9 @@ fn cli_eval_user_function(argv: &[String]) -> (i32, String) {
         contract_tx_sponsor,
         no_explore_opt.is_some(),
         skip_functions,
-        full_explore_opt.is_some()
+        !full_explore_opt.is_some(),
+        !full_explore_opt.is_some(),
+        step_budget
     ) {
         Ok(c) => c,
         Err(e) => {
@@ -534,10 +560,17 @@ fn brief_error(e: &Error) -> String {
             return format!("needs `{name}`; pass --dep {name}:PATH (a signature stub is enough)");
         }
     }
+    // An analyzer error carries a human-readable diagnostic somewhere inside
+    // the dumped AST; that sentence is the whole of what a reader needs.
+    if let Some(rest) = text.split("message: \"").nth(1) {
+        if let Some(message) = rest.split("\", spans").next().or_else(|| rest.split('"').next()) {
+            return message.to_string();
+        }
+    }
     // Otherwise keep the first line, and only as much of it as is readable.
     let line = text.lines().next().unwrap_or("").trim();
     let line = line.split(" { ").next().unwrap_or(line);
-    if line.len() > 120 { format!("{}...", &line[..120]) } else { line.to_string() }
+    if line.len() > 200 { format!("{}...", &line[..200]) } else { line.to_string() }
 }
 
 /// Enumerate the public and read-only function names defined in `src`, in
@@ -658,6 +691,16 @@ fn build_induction_harness(
 fn cli_check(argv: &[String]) -> (i32, String) {
     let mut remaining_args = argv.to_vec();
 
+    // A path blow-up looks exactly like a hang from outside. A budget turns it
+    // into a result: the run is reported as unfinished, never as holding.
+    let step_budget = match cli::consume_arg(&mut remaining_args, &["--max-steps"], true) {
+        Ok(Some(v)) => match v.parse::<u64>() {
+            Ok(n) => Some(n),
+            Err(_) => return (1, format!("--max-steps expects a number, got '{v}'")),
+        },
+        Ok(None) => DEFAULT_STEP_BUDGET,
+        Err(e) => return (1, e),
+    };
     let tx_sender = match load_tx_sender(&mut remaining_args) { Ok(p) => p, Err(x) => return x };
     let tx_sponsor = match load_tx_sponsor(&mut remaining_args) { Ok(p) => p, Err(x) => return x };
     let contract_caller = match load_contract_caller(&mut remaining_args) { Ok(p) => p, Err(x) => return x };
@@ -736,7 +779,9 @@ fn cli_check(argv: &[String]) -> (i32, String) {
             contract_tx_sponsor.clone(),
             no_explore_opt.is_some(),
             skip_functions.clone(),
-            full_explore_opt.is_some(),
+            !full_explore_opt.is_some(),
+            !full_explore_opt.is_some(),
+            step_budget,
         );
         match res {
             Ok(conts) => {
@@ -836,6 +881,16 @@ fn functions_by_kind(
 fn cli_induct(argv: &[String]) -> (i32, String) {
     let mut remaining_args = argv.to_vec();
 
+    // A path blow-up looks exactly like a hang from outside. A budget turns it
+    // into a result: the run is reported as unfinished, never as holding.
+    let step_budget = match cli::consume_arg(&mut remaining_args, &["--max-steps"], true) {
+        Ok(Some(v)) => match v.parse::<u64>() {
+            Ok(n) => Some(n),
+            Err(_) => return (1, format!("--max-steps expects a number, got '{v}'")),
+        },
+        Ok(None) => DEFAULT_STEP_BUDGET,
+        Err(e) => return (1, e),
+    };
     let tx_sender = match load_tx_sender(&mut remaining_args) { Ok(p) => p, Err(x) => return x };
     let tx_sponsor = match load_tx_sponsor(&mut remaining_args) { Ok(p) => p, Err(x) => return x };
     let contract_caller = match load_contract_caller(&mut remaining_args) { Ok(p) => p, Err(x) => return x };
@@ -942,7 +997,13 @@ fn cli_induct(argv: &[String]) -> (i32, String) {
                 std::collections::HashSet::new(),
                 tx_sender.clone(), contract_caller.clone(), tx_sponsor.clone(), contract_tx_sponsor.clone(),
                 false, vec![],
-                true, // explore fully: the mutator and invariant must be inlined for their state to compose
+                // Pure calls stay abstracted -- they cannot carry state
+                // between the mutator and the invariant -- but everything that
+                // touches state is inlined, which is what lets a value the
+                // mutator writes reach the invariant that reads it.
+                true,
+                false,
+                step_budget,
             );
             match res {
                 Ok(conts) => {
@@ -975,6 +1036,14 @@ fn cli_induct(argv: &[String]) -> (i32, String) {
                         let cond = if cond.len() > 160 { format!("{}...", &cond[..160]) } else { cond };
                         report.push_str(&format!("  NOT PROVEN {mutator}  (fails when: {cond})\n"));
                     }
+                }
+                Err(Error::Budget(steps)) => {
+                    // Tried and did not finish, which is a different thing
+                    // from not having tried: it counts against the proof.
+                    n_unproven += 1;
+                    report.push_str(&format!(
+                        "  UNFINISHED {mutator}  (gave up after {steps} steps; raise --max-steps)\n"
+                    ));
                 }
                 Err(e) => {
                     n_skipped += 1;

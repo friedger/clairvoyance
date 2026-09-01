@@ -1683,7 +1683,15 @@ impl SymOp {
             let subs_str = old_subs.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(" ");
             debug!("adds = (+ {adds_str})");
             debug!("subs = (- {subs_str})");
-            return Err(Error::Failed("Cannot simplify: additive/subtractive terms fully cancelled with no residual".into()));
+            // Everything cancelled, which is an answer rather than a failure:
+            // the terms sum to zero. `(- a a)` is u0, not a term the
+            // simplifier gave up on.
+            return Ok(SymOp::Constant(if unsigned == Some(false) {
+                Value::Int(0)
+            }
+            else {
+                Value::UInt(0)
+            }));
         }
 
         if new_subs.len() == 0 {
@@ -4461,7 +4469,11 @@ impl SymOp {
                 // lift out of fields
                 debug!("op is a tuple constructor");
                 let Some((_name, sym)) = fields.iter().find(|(fname, _fop)| *fname == name) else {
-                    return Err(Error::Bug(format!("No such tuple key {name} in {fields:?}")));
+                    // Not a bug: a `(merge base {..})` asks the merged half
+                    // first, and the key it wants may well live in the base.
+                    // "No simplification here" lets the caller go on looking.
+                    debug!("tuple constructor has no key {name}");
+                    return Ok(None);
                 };
                 Ok(Some(*sym.clone()))
             }
@@ -4498,7 +4510,8 @@ impl SymOp {
                     debug!("op is a loaded data-var tuple constructor");
                     // lift out of fields
                     let Some((_name, sym)) = fields.iter().find(|(fname, _fop)| *fname == name) else {
-                        return Err(Error::Bug(format!("No such tuple key {name} in {fields:?}")));
+                        debug!("tuple constructor has no key {name}");
+                        return Ok(None);
                     };
                     Ok(Some(*sym.clone()))
                 }
@@ -4526,7 +4539,8 @@ impl SymOp {
                     // lift out of fields
                     debug!("op is a loaded map entry tuple constructor");
                     let Some((_name, sym)) = fields.iter().find(|(fname, _fop)| *fname == name) else {
-                        return Err(Error::Bug(format!("No such tuple key {name} in {fields:?}")));
+                        debug!("tuple constructor has no key {name}");
+                        return Ok(None);
                     };
                     Ok(Some((*sym.clone()).some()))
                 },
@@ -7053,6 +7067,68 @@ impl Continuation {
 
     /// Find the map entry formula with the given map name and key
     /// key_op must be simplified
+    /// Where STX balances live.
+    ///
+    /// STX is chain state rather than any one contract's: a transfer made
+    /// inside one contract has to be visible to a read made inside another.
+    /// Contract maps are namespaced by the contract that declares them, so STX
+    /// gets a reserved name of its own under the boot address, which no user
+    /// contract can name and therefore cannot collide with.
+    fn stx_unlocked_state_name() -> Result<FullName, Error> {
+        let contract = QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.stx-state")
+            .map_err(|e| Error::Bug(format!("Cannot build the STX state name: {e}")))?;
+        Ok(FullName(contract, "unlocked".try_into()?))
+    }
+
+    /// Look up chain-level state written earlier in this continuation.
+    pub fn lookup_global_entry(&mut self, name: &FullName, key_op: &SymOp) -> Option<&SymOp> {
+        self.reachable_map_reads.remove(name);
+        if self.is_map_deleted(name, key_op) {
+            return None;
+        }
+        self.map_state.get(name)?.get(key_op)
+    }
+
+    /// Record that chain-level state was read, so it counts as an input.
+    pub fn read_global_entry(&mut self, name: &FullName, key_symop: SymOp, line: u32) {
+        if !self.is_map_deleted(name, &key_symop) {
+            self.pre_map_state.entry(name.clone()).or_default().insert(key_symop.clone());
+        }
+        self.map_accesses.insert(MapAccess { name: name.clone(), key: key_symop, line });
+    }
+
+    /// Write chain-level state.
+    pub fn set_global_entry(&mut self, name: &FullName, key_symop: SymOp, val_symop: SymOp) {
+        if let Some(idx) = self.map_tombstones.get_mut(name) {
+            idx.remove(&key_symop);
+        }
+        self.map_state.entry(name.clone()).or_default().insert(key_symop, val_symop);
+        self.reachable_map_writes.remove(name);
+    }
+
+    /// The unlocked STX of `who`: what a transfer in this continuation left
+    /// there, or -- if nothing has touched it -- the account the chain started
+    /// with, which is a free symbol rather than any particular balance.
+    pub fn stx_unlocked(&mut self, who: &SymOp, line: u32) -> Result<SymOp, Error> {
+        let name = Self::stx_unlocked_state_name()?;
+        let existing = self.lookup_global_entry(&name, who).cloned();
+        if let Some(value) = existing {
+            return Ok(value);
+        }
+        self.read_global_entry(&name, who.clone(), line);
+        Ok(SymOp::TupleGet(
+            "unlocked".try_into()?,
+            Box::new(SymOp::StxGetAccount(Box::new(who.clone()))),
+        ))
+    }
+
+    /// Move unlocked STX.
+    pub fn set_stx_unlocked(&mut self, who: SymOp, balance: SymOp) -> Result<(), Error> {
+        let name = Self::stx_unlocked_state_name()?;
+        self.set_global_entry(&name, who, balance);
+        Ok(())
+    }
+
     pub fn lookup_map_entry(&mut self, name: &ClarityName, key_op: &SymOp) -> Option<&SymOp> {
         let name = FullName(self.get_current_contract_id(), name.clone());
 
@@ -8464,6 +8540,13 @@ impl SymContract {
 /// Symbolic execution engine
 #[derive(Debug)]
 pub struct Symbex {
+    /// how many evaluation steps remain before the engine gives up, if a
+    /// caller set a limit. A path blow-up is not always distinguishable from
+    /// a hang, and a tool that stops with "I did not finish" is more useful
+    /// than one that never returns.
+    pub step_budget: Option<u64>,
+    /// steps taken so far
+    steps: u64,
     /// in-RAM contract store
     datastore: BackingStore,
     /// contracts loaded, and their typemaps, symbols, and contexts
@@ -9287,6 +9370,11 @@ impl Symbex {
     pub fn eval(&mut self, mut continuation: Continuation, body: &SymbolicExpression) -> Result<Vec<Continuation>, Error> {
         if continuation.halted() {
             return Ok(vec![continuation]);
+        }
+
+        self.steps = self.steps.saturating_add(1);
+        if let Some(budget) = self.step_budget && self.steps > budget {
+            return Err(Error::Budget(self.steps));
         }
 
         debug!("Simplify continuation {} predicate {}", continuation.id, &continuation.predicate);
@@ -10393,17 +10481,103 @@ impl Symbex {
                                     }
                                     conts
                                 }
-                                "stx-transfer?" => {
-                                    todo!();
-                                }
-                                "stx-transfer-memo?" => {
-                                    todo!();
+                                "stx-transfer?" | "stx-transfer-memo?" => {
+                                    // The memo variant differs only by an
+                                    // argument that cannot move a balance, so
+                                    // both are the same transfer here.
+                                    let args = lv.get(1..4).ok_or_else(|| Error::Bug(format!("Missing arguments to {function_name}")))?;
+                                    let conts = self.eval_native_n_args(
+                                        continuation,
+                                        function_name.as_str(),
+                                        args,
+                                        |mut a| {
+                                            let recipient = a.pop().unwrap_or(SymOp::none());
+                                            let sender = a.pop().unwrap_or(SymOp::none());
+                                            let amount = a.pop().unwrap_or(SymOp::none());
+                                            SymOp::StxTransfer(Box::new(amount), Box::new(sender), Box::new(recipient))
+                                        }
+                                    )?;
+
+                                    let line = body.span.start_line;
+                                    let mut ret = vec![];
+                                    for mut cont in conts.into_iter() {
+                                        if cont.halted() {
+                                            ret.push(cont);
+                                            continue;
+                                        }
+                                        let SymOp::StxTransfer(amount, sender, recipient) = cont.final_formula.clone() else {
+                                            return Err(Error::Bug(format!("{function_name} lost its arguments")));
+                                        };
+
+                                        let from = cont.stx_unlocked(&sender, line)?;
+                                        let to = cont.stx_unlocked(&recipient, line)?;
+                                        let pred = cont.predicate.clone();
+
+                                        // The transfer moves the money only
+                                        // when it can: a positive amount, a
+                                        // balance that covers it, and two
+                                        // different parties. Everything else is
+                                        // an error that leaves every balance
+                                        // alone, so the two paths differ in
+                                        // state as well as in result.
+                                        let permitted = Predicate::And(vec![
+                                            Box::new(Predicate::Geq(from.clone(), *amount.clone())),
+                                            Box::new(Predicate::Greater(*amount.clone(), SymOp::Constant(Value::UInt(0)))),
+                                            Box::new(Predicate::Not(Box::new(Predicate::Equals(vec![*sender.clone(), *recipient.clone()])))),
+                                        ]);
+
+                                        let cont_rc = Rc::new(cont);
+
+                                        let mut success = Continuation::from_parent(cont_rc.clone(), format!("{function_name}.transferred"), line);
+                                        success.predicate = pred.clone().and(permitted.clone());
+                                        success.set_stx_unlocked(
+                                            *sender.clone(),
+                                            SymOp::Subtract(vec![Box::new(from.clone()), amount.clone()]).simplify()?
+                                        )?;
+                                        success.set_stx_unlocked(
+                                            *recipient.clone(),
+                                            SymOp::Add(vec![Box::new(to.clone()), amount.clone()]).simplify()?
+                                        )?;
+                                        success.final_formula = SymOp::ConsOkay(Box::new(SymOp::True()));
+
+                                        let mut failure = Continuation::from_parent(cont_rc.clone(), format!("{function_name}.refused"), line);
+                                        failure.predicate = pred.and(Predicate::Not(Box::new(permitted)));
+                                        failure.final_formula = SymOp::ConsError(Box::new(SymOp::Constant(Value::UInt(1))));
+
+                                        ret.push(success);
+                                        ret.push(failure);
+                                    }
+                                    ret
                                 }
                                 "stx-burn?" => {
                                     todo!();
                                 }
                                 "stx-account" => {
-                                    todo!();
+                                    let Some(addr_sym) = lv.get(1) else {
+                                        return Err(Error::Bug(format!("Missing argument 1 to {function_name}")));
+                                    };
+                                    let addr_cont = Continuation::from_parent(Rc::new(continuation), format!("{function_name}.address-eval"), addr_sym.span.start_line);
+                                    let mut conts = self.eval(addr_cont, addr_sym)?;
+                                    let line = body.span.start_line;
+                                    for cont in conts.iter_mut() {
+                                        if cont.halted() {
+                                            continue;
+                                        }
+                                        let who = cont.final_formula.clone().simplify()?;
+                                        let unlocked = cont.stx_unlocked(&who, line)?;
+
+                                        // Only the unlocked balance moves here.
+                                        // Nothing this engine models locks or
+                                        // unlocks STX, so the other two fields
+                                        // stay whatever the chain had.
+                                        let account = SymOp::StxGetAccount(Box::new(who));
+                                        cont.final_formula = SymOp::TupleCons(vec![
+                                            ("locked".try_into()?, Box::new(SymOp::TupleGet("locked".try_into()?, Box::new(account.clone())))),
+                                            ("unlock-height".try_into()?, Box::new(SymOp::TupleGet("unlock-height".try_into()?, Box::new(account)))),
+                                            ("unlocked".try_into()?, Box::new(unlocked)),
+                                        ]);
+                                    }
+                                    conts
                                 }
                                 "bit-and" => {
                                     self.eval_foldable_native(
@@ -10557,7 +10731,21 @@ impl Symbex {
                                     todo!()
                                 }
                                 "contract-hash?" => {
-                                    todo!()
+                                    // `(contract-hash? p)` is an error for a
+                                    // standard principal. That path returns an
+                                    // error without writing state, which is
+                                    // indistinguishable from the call never
+                                    // having run, so only the contract case is
+                                    // explored. The hash itself is opaque: a
+                                    // deterministic function of the principal
+                                    // that nothing here can see inside, which
+                                    // is all the contract may rely on.
+                                    self.eval_native_1arg(
+                                        continuation,
+                                        function_name.as_str(),
+                                        lv.get(1).ok_or_else(|| Error::Bug(format!("Missing arguments to {function_name}")))?.clone(),
+                                        |initial| SymOp::ConsOkay(Box::new(SymOp::ContractHash(Box::new(initial))))
+                                    )?
                                 }
                                 "to-ascii?" => {
                                     todo!()
@@ -10566,7 +10754,65 @@ impl Symbex {
                                     todo!()
                                 }
                                 "as-contract?" => {
-                                    todo!()
+                                    // `(as-contract? (allowance ...) body ...)`
+                                    // runs the body with tx-sender rebound to
+                                    // this contract, and returns `(ok v)` for
+                                    // the body's value `v`.
+                                    //
+                                    // The allowance list is a post-condition:
+                                    // if the body moves more than it allows,
+                                    // the call returns an error and nothing the
+                                    // body did takes effect. That path writes
+                                    // no state and returns an error, which is
+                                    // the same as the call never having run, so
+                                    // it cannot be why an invariant breaks and
+                                    // is not explored. The allowances are
+                                    // therefore not evaluated either -- which
+                                    // means this over-approximates: a transfer
+                                    // the chain would have refused is explored
+                                    // here, never the other way around.
+                                    let body_exprs = lv.get(2..).ok_or_else(|| Error::Bug(format!("Missing body of {function_name}")))?;
+
+                                    let mut ac_cont = Continuation::from_parent(Rc::new(continuation), function_name.clone(), body.span.start_line);
+                                    let old_tx_sender = ac_cont.get_tx_sender();
+                                    ac_cont.tx_sender = Some(SymOp::Constant(Value::Principal(ac_cont.get_current_contract())));
+
+                                    let mut ret = vec![];
+                                    let mut conts = vec![vec![ac_cont]];
+                                    for (i, symexp) in body_exprs.iter().enumerate() {
+                                        let mut new_conts = vec![];
+                                        for cont_set in conts.into_iter() {
+                                            for cont in cont_set.into_iter() {
+                                                if cont.halted() {
+                                                    ret.push(cont);
+                                                    continue;
+                                                }
+                                                if cont.predicate.clone().simplify()? == Predicate::False {
+                                                    continue;
+                                                }
+                                                let next_conts = self.eval(Continuation::from_parent(Rc::new(cont), format!("{function_name}.expr[{i}]"), symexp.span.start_line), symexp)?;
+                                                new_conts.push(self.reduce_continuations(next_conts));
+                                            }
+                                        }
+                                        conts = new_conts;
+                                    }
+                                    for cont_set in conts.into_iter() {
+                                        ret.extend(cont_set.into_iter());
+                                    }
+
+                                    for cont in ret.iter_mut() {
+                                        // Put tx-sender back for whatever
+                                        // follows the call.
+                                        cont.tx_sender = Some(old_tx_sender.clone());
+                                        if cont.halted() || cont.early_return {
+                                            // A `try!` in the body returns from
+                                            // the enclosing function, so there
+                                            // is no `(ok ..)` to wrap.
+                                            continue;
+                                        }
+                                        cont.final_formula = SymOp::ConsOkay(Box::new(cont.final_formula.clone()));
+                                    }
+                                    ret
                                 }
                                 "secp256r1-verify?" => {
                                     todo!()
@@ -11862,15 +12108,23 @@ impl Symbex {
         let mut conts = vec![(continuation, vec![])];
         for (i, symexp) in function_arg_values.iter().enumerate() {
             let mut new_conts = vec![];
-            for (cont, mut symops) in conts.into_iter() {
+            for (cont, symops) in conts.into_iter() {
                 let arg_conts = self.eval(Continuation::from_parent(Rc::new(cont), format!("{}.arg[{}]={}", &fq_function, i, &func.arguments[i]), symexp.span.start_line), symexp)?;
                 for arg_cont in arg_conts.into_iter() {
                     if arg_cont.halted() {
-                        new_conts.push((arg_cont, vec![]));
+                        // Keep what was collected so far: this branch is over,
+                        // but throwing the list away would misreport it as an
+                        // argument-count bug rather than a halt.
+                        new_conts.push((arg_cont, symops.clone()));
                         continue;
                     }
-                    symops.push(arg_cont.final_formula.clone());
-                    new_conts.push((arg_cont, symops.clone()));
+                    // Each branch gets its own list. Evaluating one argument
+                    // can fork the path -- a transfer that may or may not go
+                    // through, say -- and a shared accumulator would give the
+                    // second branch the first branch's argument as well.
+                    let mut branch_symops = symops.clone();
+                    branch_symops.push(arg_cont.final_formula.clone());
+                    new_conts.push((arg_cont, branch_symops));
                 }
             }
             conts = new_conts;
@@ -12117,6 +12371,8 @@ impl Symbex {
         }
 
         let symbex = Symbex {
+            step_budget: None,
+            steps: 0,
             datastore,
             callgraph: None,
             contracts: contract_state,
