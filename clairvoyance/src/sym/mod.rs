@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, LazyLock};
 use std::collections::BTreeSet;
 use std::borrow::Borrow;
-use std::hash::{Hash, Hasher};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::convert::TryFrom;
 
 use clarity_types::Value;
@@ -192,7 +192,7 @@ impl fmt::Display for Sym {
             Self::Sequence(s, stype) => write!(f, "({} {})", s, TypeSignature::SequenceType(stype.clone())),
             Self::Principal(s) => write!(f, "({} {})", s, TypeSignature::PrincipalType),
             Self::Tuple(s, _ttype) => {
-                write!(f, "({} {{ .. }}))", s)
+                write!(f, "({} {{ .. }})", s)
             }
             Self::Optional(s, otype) => write!(f, "({} {})", s, TypeSignature::OptionalType(Box::new(otype.clone()))),
             Self::Response(s, oktype, errtype) => write!(f, "({} {})", s, TypeSignature::ResponseType(Box::new((oktype.clone(), errtype.clone())))),
@@ -408,28 +408,91 @@ pub enum SymOp {
     FunctionCall(FullName, Vec<Box<SymOp>>),
 }
 
-/// Compare two vectors of symops, as part of comparing a commutative operation where order doesn't
-/// matter.  Unfortunately, we can't sort these since PartialOrd isn't implementable for Value
-/// (precluding PartialOrd for SymOp::Constant), so for now, we cheat by comparing the string
-/// representations (which uniquely identify a symop) 
-fn cmp_commutative_symop(s1: &[Box<SymOp>], s2: &[Box<SymOp>]) -> bool {
+/// The most terms a conjunction is expanded into when distributing it over
+/// its disjunctions (see `SymOp::simplify_and`).
+const MAX_DNF_TERMS : usize = 64;
+
+/// Order-independent digest of a sequence of structural hashes. Both
+/// accumulators commute, so any permutation of the same multiset digests the
+/// same way; carrying two of them keeps distinct multisets from colliding as
+/// easily as a plain sum would.
+fn unordered_digest<I: Iterator<Item = u64>>(hashes: I) -> (u64, u64) {
+    let mut sum : u64 = 0;
+    let mut prod : u64 = 1;
+    for h in hashes {
+        sum = sum.wrapping_add(h);
+        prod = prod.wrapping_mul(h | 1);
+    }
+    (sum, prod)
+}
+
+/// Hash `x` on its own, with a fixed-key hasher, so the result depends only on
+/// the value and can be combined order-independently by `unordered_digest`.
+fn standalone_hash<T: Hash + ?Sized>(x: &T) -> u64 {
+    let mut h = DefaultHasher::new();
+    x.hash(&mut h);
+    h.finish()
+}
+
+/// Compare two operand lists as multisets, for a commutative operation.
+///
+/// Operands are bucketed by structural hash and matched within a bucket with
+/// `==`, so the common case costs one hash per operand rather than the string
+/// rendering of every subtree that comparing sorted `to_string()`s used to.
+fn cmp_commutative<T: Hash + PartialEq>(s1: &[T], s2: &[T]) -> bool {
     if s1.len() != s2.len() {
         return false;
     }
+    if s1.len() <= 1 {
+        return s1 == s2;
+    }
+    // Same order is the overwhelmingly common case (a term compared with its
+    // own simplification, say); settle it without hashing every subtree of
+    // every commutative node on the way down.
+    if s1 == s2 {
+        return true;
+    }
 
-    let mut terms_1 : Vec<_> = s1
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+    let mut h1 : Vec<(u64, usize)> = s1.iter().enumerate().map(|(i, x)| (standalone_hash(x), i)).collect();
+    let mut h2 : Vec<(u64, usize)> = s2.iter().enumerate().map(|(i, x)| (standalone_hash(x), i)).collect();
+    h1.sort_unstable_by_key(|(h, _)| *h);
+    h2.sort_unstable_by_key(|(h, _)| *h);
 
-    let mut terms_2 : Vec<_> = s2
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+    // walk the two sorted hash lists bucket by bucket
+    let (mut i, mut j) = (0, 0);
+    while i < h1.len() {
+        let h = h1[i].0;
+        if j >= h2.len() || h2[j].0 != h {
+            return false;
+        }
+        let i_end = h1[i..].iter().position(|(x, _)| *x != h).map(|k| i + k).unwrap_or(h1.len());
+        let j_end = h2[j..].iter().position(|(x, _)| *x != h).map(|k| j + k).unwrap_or(h2.len());
+        if i_end - i != j_end - j {
+            return false;
+        }
+        // match the bucket as a multiset; buckets are almost always size 1
+        let mut used = vec![false; j_end - j];
+        for (_, a) in h1[i..i_end].iter() {
+            let mut found = false;
+            for (k, (_, b)) in h2[j..j_end].iter().enumerate() {
+                if !used[k] && s1[*a] == s2[*b] {
+                    used[k] = true;
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                return false;
+            }
+        }
+        i = i_end;
+        j = j_end;
+    }
+    true
+}
 
-    terms_1.sort();
-    terms_2.sort();
-    terms_1 == terms_2
+fn cmp_commutative_symop(s1: &[Box<SymOp>], s2: &[Box<SymOp>]) -> bool {
+    cmp_commutative(s1, s2)
 }
 
 /// Equality implementation that takes into account commutativity
@@ -488,14 +551,15 @@ impl PartialEq for SymOp {
             (Self::InsertEntry(n1, s11, s12), Self::InsertEntry(n2, s21, s22)) => n1 == n2 && s11 == s21 && s12 == s22,
             (Self::DeleteEntry(n1, s1), Self::DeleteEntry(n2, s2)) => n1 == n2 && s1 == s2,
             (Self::TupleCons(t1), Self::TupleCons(t2)) => {
-                // equal if sorted
-                let mut t1_sorted = t1.clone();
-                t1_sorted.sort_by(|a, b| a.0.cmp(&b.0));
-
-                let mut t2_sorted = t2.clone();
-                t2_sorted.sort_by(|a, b| a.0.cmp(&b.0));
-
-                t1_sorted.eq(&t2_sorted)
+                // equal as sets of (key, value): field order does not matter
+                if t1.len() != t2.len() {
+                    return false;
+                }
+                let mut i1 : Vec<&(ClarityName, Box<SymOp>)> = t1.iter().collect();
+                let mut i2 : Vec<&(ClarityName, Box<SymOp>)> = t2.iter().collect();
+                i1.sort_by(|a, b| a.0.cmp(&b.0));
+                i2.sort_by(|a, b| a.0.cmp(&b.0));
+                i1.iter().zip(i2.iter()).all(|(a, b)| a.0 == b.0 && a.1 == b.1)
             }
             (Self::TupleGet(n1, s1), Self::TupleGet(n2, s2)) => n1 == n2 && s1 == s2,
             (Self::TupleMerge(s11, s12), Self::TupleMerge(s21, s22)) => s11 == s21 && s12 == s22,
@@ -665,11 +729,91 @@ impl SymOp {
     }
 }
 
+/// Structural hash, consistent with `PartialEq`: commutative operands and
+/// tuple fields are digested order-independently, everything else in order.
+/// Rendering the tree to a string and hashing that -- which is what this used
+/// to do -- made every hash and every commutative comparison serialise whole
+/// formulae, and dominated the engine's run time on large records.
 impl Hash for SymOp {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        // hack: use .to_string() to guarantee hash equality modulo commutativity
-        let self_s = self.to_string();
-        self_s.hash(state);
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Self::Constant(v) => v.hash(state),
+            Self::Variable(s) => s.hash(state),
+            Self::FetchVar(n) | Self::GetTokenSupply(n) => n.hash(state),
+            Self::AllowanceAll | Self::Panic => {}
+
+            Self::LoadedDataVariable(n, a)
+            | Self::SetVar(n, a)
+            | Self::FetchEntry(n, a)
+            | Self::DeleteEntry(n, a)
+            | Self::GetTokenBalance(n, a)
+            | Self::GetNftOwner(n, a)
+            | Self::BurnToken(n, a) => { n.hash(state); a.hash(state); }
+            Self::SetEntry(n, a, b)
+            | Self::InsertEntry(n, a, b)
+            | Self::MintToken(n, a, b)
+            | Self::MintNft(n, a, b)
+            | Self::BurnNft(n, a, b) => { n.hash(state); a.hash(state); b.hash(state); }
+            Self::LoadedMapEntry(n, a, b) => { n.hash(state); a.hash(state); b.hash(state); }
+            Self::TransferToken(n, a, b, c)
+            | Self::TransferNft(n, a, b, c) => { n.hash(state); a.hash(state); b.hash(state); c.hash(state); }
+            Self::FunctionCall(n, args) => { n.hash(state); args.hash(state); }
+
+            // commutative
+            Self::Add(ops)
+            | Self::Multiply(ops)
+            | Self::And(ops)
+            | Self::Or(ops)
+            | Self::Equals(ops)
+            | Self::BitwiseAnd(ops)
+            | Self::BitwiseOr(ops)
+            | Self::BitwiseXor(ops) => {
+                ops.len().hash(state);
+                unordered_digest(ops.iter().map(|op| standalone_hash(op))).hash(state);
+            }
+            // ordered
+            Self::Subtract(ops)
+            | Self::Divide(ops)
+            | Self::Concat(ops)
+            | Self::ListCons(ops) => ops.hash(state),
+
+            Self::TupleCons(fields) => {
+                fields.len().hash(state);
+                unordered_digest(fields.iter().map(|kv| standalone_hash(kv))).hash(state);
+            }
+
+            Self::ToInt(a) | Self::ToUInt(a) | Self::Sqrti(a) | Self::Log2(a) | Self::Not(a)
+            | Self::Len(a) | Self::BuffToIntLe(a) | Self::BuffToUIntLe(a) | Self::BuffToIntBe(a)
+            | Self::BuffToUIntBe(a) | Self::IsStandard(a) | Self::PrincipalDestruct(a)
+            | Self::StringToInt(a) | Self::StringToUInt(a) | Self::IntToAscii(a) | Self::IntToUtf8(a)
+            | Self::Hash160(a) | Self::Sha256(a) | Self::Sha512(a) | Self::Sha512Trunc256(a)
+            | Self::Keccak256(a) | Self::ContractOf(a) | Self::PrincipalOf(a) | Self::IsOkay(a)
+            | Self::IsErr(a) | Self::IsSome(a) | Self::IsNone(a) | Self::UnwrapPanic(a)
+            | Self::UnwrapErrPanic(a) | Self::ConsError(a) | Self::ConsOkay(a) | Self::ConsSome(a)
+            | Self::GetStxBalance(a) | Self::StxBurn(a) | Self::StxGetAccount(a) | Self::BitwiseNot(a)
+            | Self::ToConsensusBuff(a) | Self::ContractHash(a) | Self::ToAscii(a)
+            | Self::AllowanceWithStx(a) | Self::AllowanceWithStacking(a) => a.hash(state),
+
+            Self::Modulo(a, b) | Self::Power(a, b) | Self::Greater(a, b) | Self::Geq(a, b)
+            | Self::Leq(a, b) | Self::Less(a, b) | Self::Append(a, b) | Self::AsMaxLen(a, b)
+            | Self::ElementAt(a, b) | Self::IndexOf(a, b) | Self::TupleMerge(a, b)
+            | Self::Secp256k1Recover(a, b) | Self::BitwiseLShift(a, b) | Self::BitwiseRShift(a, b)
+            | Self::AsContractSafe(a, b) | Self::GetBitcoinTxOutput(a, b) => { a.hash(state); b.hash(state); }
+
+            Self::Secp256k1Verify(a, b, c) | Self::StxTransfer(a, b, c) | Self::Slice(a, b, c)
+            | Self::ReplaceAt(a, b, c) | Self::RestrictAssets(a, b, c)
+            | Self::Secp256r1Verify(a, b, c) => { a.hash(state); b.hash(state); c.hash(state); }
+
+            Self::StxTransferMemo(a, b, c, d) => { a.hash(state); b.hash(state); c.hash(state); d.hash(state); }
+            Self::VerifyMerkleProof(a, b, c, d, e) => { a.hash(state); b.hash(state); c.hash(state); d.hash(state); e.hash(state); }
+            Self::PrincipalConstruct(a, b, c) => { a.hash(state); b.hash(state); c.hash(state); }
+
+            Self::TupleGet(n, a) | Self::GetBurnBlockInfo(n, a) | Self::GetStacksBlockInfo(n, a)
+            | Self::GetTenureInfo(n, a) => { n.hash(state); a.hash(state); }
+            Self::AllowanceWithFt(a, n, b) | Self::AllowanceWithNft(a, n, b) => { a.hash(state); n.hash(state); b.hash(state); }
+            Self::FromConsensusBuff(t, a) => { t.hash(state); a.hash(state); }
+        }
     }
 }
 
@@ -1167,21 +1311,19 @@ impl SymOp {
             }
             Self::And(symops) => {
                 // the typechecker will have determined that there are at least two symops
-                let first = symops.get(0).ok_or_else(|| Error::Bug("And has 0 arguments".into()))?;
-                let mut pred = first.try_as_predicate()?;
-                for next in symops.get(1..).ok_or_else(|| Error::Bug("And has 1 argument".into()))?.iter() {
-                    pred = pred.and(next.try_as_predicate()?);
+                if symops.len() < 2 {
+                    return Err(Error::Bug(format!("And has {} argument(s)", symops.len())));
                 }
-                Ok(pred)
+                let preds = symops.iter().map(|op| op.try_as_predicate()).collect::<Result<Vec<_>, _>>()?;
+                Ok(Predicate::and_all(preds))
             }
             Self::Or(symops) => {
                 // the typechecker will have determined that there are at least two symops
-                let first = symops.get(0).ok_or_else(|| Error::Bug("is-eq has 0 arguments".into()))?;
-                let mut pred = first.try_as_predicate()?;
-                for next in symops.get(1..).ok_or_else(|| Error::Bug("is-eq has 1 argument".into()))?.iter() {
-                    pred = pred.or(next.try_as_predicate()?);
+                if symops.len() < 2 {
+                    return Err(Error::Bug(format!("Or has {} argument(s)", symops.len())));
                 }
-                Ok(pred)
+                let preds = symops.iter().map(|op| op.try_as_predicate()).collect::<Result<Vec<_>, _>>()?;
+                Ok(Predicate::or_all(preds))
             }
             Self::Not(symop) => {
                 let p = symop.try_as_predicate()?;
@@ -2465,11 +2607,8 @@ impl SymOp {
         // (and (is-eq a1 b1 c1 b2 c2)), since both (is-eq ..) lists
         // contain at least one such term a1.
       
-        // debug output
-        let before_s : Vec<_> = ops.iter().map(|s| s.to_string()).collect();
-
         // map which terms are found in which ops (identified by op index and term index)
-        let mut terms : HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+        let mut terms : HashMap<&SymOp, Vec<(usize, usize)>> = HashMap::new();
         
         // list of recombined terms
         let mut combined_terms : Vec<Box<SymOp>> = vec![];
@@ -2477,13 +2616,7 @@ impl SymOp {
         for (i, op) in ops.iter().enumerate() {
             if let Self::Equals(inner) = &**op {
                 for (j, term) in inner.iter().enumerate() {
-                    let term_s = term.to_string();
-                    if let Some(eq_ops) = terms.get_mut(&term_s) {
-                        eq_ops.push((i, j));
-                    }
-                    else {
-                        terms.insert(term_s, vec![(i, j)]);
-                    }
+                    terms.entry(&**term).or_insert_with(Vec::new).push((i, j));
                 }
             }
             else {
@@ -2575,23 +2708,17 @@ impl SymOp {
         let combined_eqs : Vec<_> = combined_eqs
             .into_iter()
             .map(|(_, ops)| {
-                let uniq : HashMap<String, Box<SymOp>> = ops
+                let op_uniq : Vec<Box<SymOp>> = ops
                     .into_iter()
-                    .map(|op| (op.to_string(), op))
-                    .collect();
-
-                let op_uniq : Vec<Box<SymOp>> = uniq
+                    .collect::<HashSet<_>>()
                     .into_iter()
-                    .map(|(_, op)| op)
                     .collect();
 
                 Box::new(Self::Equals(op_uniq))
             })
             .collect();
 
-        let after_s : Vec<_> = combined_eqs.iter().map(|s| s.to_string()).collect();
-        debug!("and_flatten_equals: before:        {:?}", &before_s);
-        debug!("and_flatten_equals: combined_eqs:  {:?}", &after_s);
+        debug!("and_flatten_equals: combined_eqs:  {:?}", &combined_eqs);
         
         combined_terms.extend(combined_eqs.into_iter());
        
@@ -2606,33 +2733,16 @@ impl SymOp {
     ///
     /// NOTE: all terms in each (is-eq ..) in `combined_terms` must be unique!
     fn and_equals_contradiction(combined_terms: Vec<Box<SymOp>>) -> Result<Vec<Box<SymOp>>, Error> {
-        let mut terms : HashMap<String, Vec<(usize, usize)>> = HashMap::new();
-        let mut not_terms : HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+        // each term of a (not (is-eq ..)), to the (op index, term index) pairs it appears at
+        let mut not_terms : HashMap<&SymOp, Vec<(usize, usize)>> = HashMap::new();
 
         // search for contradictions.
         //   (and (is-eq a b c d e) (not (is-eq a b f g h))) is a contradiction
         for (i, op) in combined_terms.iter().enumerate() {
-            if let Self::Equals(inner) = &**op {
-                for (j, term) in inner.iter().enumerate() {
-                    let term_s = term.to_string();
-                    if let Some(eq_ops) = terms.get_mut(&term_s) {
-                        eq_ops.push((i, j));
-                    }
-                    else {
-                        terms.insert(term_s, vec![(i, j)]);
-                    }
-                }
-            }
-            else if let Self::Not(neq) = &**op {
+            if let Self::Not(neq) = &**op {
                 if let Self::Equals(inner) = &**neq {
                     for (j, term) in inner.iter().enumerate() {
-                        let term_s = term.to_string();
-                        if let Some(eq_ops) = not_terms.get_mut(&term_s) {
-                            eq_ops.push((i, j));
-                        }
-                        else {
-                            not_terms.insert(term_s, vec![(i, j)]);
-                        }
+                        not_terms.entry(&**term).or_insert_with(Vec::new).push((i, j));
                     }
                 }
             }
@@ -2651,10 +2761,8 @@ impl SymOp {
             };
 
             for term in inner.iter() {
-                let term_s = term.to_string();
-
                 // is this term explicitly _not_ equal to other terms?
-                let Some(neq_idx) = not_terms.get(&term_s) else {
+                let Some(neq_idx) = not_terms.get(&**term) else {
                     continue;
                 };
 
@@ -2668,7 +2776,7 @@ impl SymOp {
                     let Some(not_term) = not_inner.get(*term_idx) else {
                         continue;
                     };
-                    if term_s == not_term.to_string() {
+                    if **term == **not_term {
                         if let Some(neg_set) = negated.get_mut(&i) {
                             if neg_set.contains(&op_idx) {
                                 // at least two terms in this (is-eq ..) list have appeared in the
@@ -2721,9 +2829,9 @@ impl SymOp {
         let mut expanded_neq = vec![];
         let mut untouched = vec![];
 
-        let mut term_eqs : HashMap<String, Vec<usize>> = HashMap::new();
-        let mut term_neqs : HashMap<String, Vec<usize>> = HashMap::new();
-        for (op_i, op) in combined_terms.clone().into_iter().enumerate() {
+        let mut term_eqs : HashMap<SymOp, Vec<usize>> = HashMap::new();
+        let mut term_neqs : HashMap<SymOp, Vec<usize>> = HashMap::new();
+        for (op_i, op) in combined_terms.into_iter().enumerate() {
             if let Self::Equals(inner) = &*op {
                 // find all constants (even if there's more than one).
                 let mut constants = HashSet::new();
@@ -2753,14 +2861,7 @@ impl SymOp {
                     if *inner_op != inner_const {
                         let l = expanded_eq.len();
                         expanded_eq.push((inner_op.clone(), inner_const.clone(), op_i));
-
-                        let term_s = inner_op.to_string();
-                        if let Some(pos) = term_eqs.get_mut(&term_s) {
-                            pos.push(l);
-                        }
-                        else {
-                            term_eqs.insert(inner_op.to_string(), vec![l]);
-                        }
+                        term_eqs.entry((**inner_op).clone()).or_insert_with(Vec::new).push(l);
                     }
                 }
             }
@@ -2795,14 +2896,7 @@ impl SymOp {
                         if inner_op != inner_const {
                             let l = expanded_neq.len();
                             expanded_neq.push((inner_op.clone(), inner_const.clone(), op_i));
-                            
-                            let term_s = inner_op.to_string();
-                            if let Some(pos) = term_neqs.get_mut(&term_s) {
-                                pos.push(l);
-                            }
-                            else {
-                                term_neqs.insert(inner_op.to_string(), vec![l]);
-                            }
+                            term_neqs.entry((**inner_op).clone()).or_insert_with(Vec::new).push(l);
                         }
                     }
                 }
@@ -2856,7 +2950,7 @@ impl SymOp {
                 }
 
                 // this not-equals is redundant
-                debug!("and_eqs_redundant: redundant term {neq} in {}", &combined_terms[expanded_neq[*neq].2]);
+                debug!("and_eqs_redundant: redundant term {neq} (from op {})", expanded_neq[*neq].2);
                 redundant_neqs.insert(*neq);
             }
         }
@@ -3685,15 +3779,15 @@ impl SymOp {
     }
 
     fn contradiction_and(ops: Vec<Box<SymOp>>) -> Result<SymOp, Error> {
-        let mut terms = HashSet::new();
-        let mut not_terms = HashSet::new();
+        let mut terms : HashSet<&SymOp> = HashSet::new();
+        let mut not_terms : HashSet<&SymOp> = HashSet::new();
         for term in ops.iter() {
             match &**term {
                 Self::Not(x) => {
-                    not_terms.insert(x.to_string());
+                    not_terms.insert(&**x);
                 }
                 x => {
-                    terms.insert(x.to_string());
+                    terms.insert(x);
                 }
             }
         }
@@ -3704,7 +3798,7 @@ impl SymOp {
         // with `(>= a b)`) cannot both hold.
         for term in ops.iter() {
             if let Some(complement) = Self::comparison_complement(term) {
-                if terms.contains(&complement.to_string()) {
+                if terms.contains(&complement) {
                     return Ok(Self::False());
                 }
             }
@@ -3715,76 +3809,55 @@ impl SymOp {
     /// apply consensus
     /// (X && Y) || (!X && Z) || (Y && Z) == (X && Y) || (!X && Z)
     fn consensus_or(ops: Vec<Box<SymOp>>) -> Result<SymOp, Error> {
-        let (and_terms, _) : (Vec<Box<SymOp>>, Vec<Box<SymOp>>) = ops.clone().into_iter().partition(|op| if let Self::And(..) = &**op { true } else { false });
-
+        // the conjunctions among the disjuncts, split into positive terms and
+        // the operands of negated terms
+        let and_terms : Vec<&Vec<Box<SymOp>>> = ops
+            .iter()
+            .filter_map(|op| if let Self::And(terms) = &**op { Some(terms) } else { None })
+            .collect();
         let num_and_terms = and_terms.len();
-        let mut and_positive = vec![HashMap::new(); num_and_terms];
-        let mut and_negative = vec![HashMap::new(); num_and_terms];
-
-        for (i, and_term) in and_terms.clone().into_iter().enumerate() {
-            let Self::And(terms) = *and_term else {
-                return Err(Error::Bug("unreachable".into()));
-            };
-            for term in terms.into_iter() {
-                if let Self::Not(nterm) = *term {
-                    and_negative[i].insert(nterm.to_string(), nterm);
+        let mut and_positive : Vec<HashSet<&SymOp>> = vec![HashSet::new(); num_and_terms];
+        let mut and_negative : Vec<HashSet<&SymOp>> = vec![HashSet::new(); num_and_terms];
+        for (i, terms) in and_terms.iter().enumerate() {
+            for term in terms.iter() {
+                if let Self::Not(nterm) = &**term {
+                    and_negative[i].insert(&**nterm);
                 }
                 else {
-                    and_positive[i].insert(term.to_string(), term);
+                    and_positive[i].insert(&**term);
                 }
             }
         }
 
-        let and_positive_sets : Vec<HashSet<String>> = and_positive.iter().map(|terms| terms.keys().map(|term_s| term_s.to_string()).collect::<HashSet<_>>()).collect();
-        let and_negative_sets : Vec<HashSet<String>> = and_negative.iter().map(|terms| terms.keys().map(|term_s| term_s.to_string()).collect::<HashSet<_>>()).collect();
-
-        debug!("consensus_or: and_positive_sets = {and_positive_sets:?}");
-        debug!("consensus_or: and_negative_sets = {and_negative_sets:?}");
-
-        // find terms X where both X and !X are present in different conjunctions
-        let mut complements = vec![];
+        // find terms X where X is in one conjunction and !X in another, and
+        // for each, the Y and Z terms: everything else in those conjunctions
+        let mut consensus_terms : HashSet<SymOp> = HashSet::new();
         for i in 0..num_and_terms {
             for j in 0..num_and_terms {
                 if i == j {
                     continue;
                 }
-                for term_s in and_positive_sets[i].intersection(&and_negative_sets[j]) {
-                    let neg_term = and_negative[j].get(term_s).expect("unreachable");
-                    let neg_term_s = SymOp::Not(neg_term.clone()).to_string();
-                    complements.push((term_s.clone(), neg_term_s, i, j));
+                for x in and_positive[i].intersection(&and_negative[j]) {
+                    let not_x = SymOp::Not(Box::new((*x).clone()));
+                    let mut yz_terms : Vec<Box<SymOp>> = vec![];
+                    for v in and_terms[i].iter().chain(and_terms[j].iter()) {
+                        if **v == **x || **v == not_x {
+                            continue;
+                        }
+                        if !yz_terms.iter().any(|y| **y == **v) {
+                            yz_terms.push(v.clone());
+                        }
+                    }
+                    consensus_terms.insert(SymOp::And(yz_terms));
                 }
             }
-        }
-
-        // find the Y and Z terms
-        let mut consensus_terms = HashSet::new();
-        for (term_s, not_term_s, i, j) in complements.iter() {
-            let SymOp::And(pos) = &*and_terms[*i] else { unreachable!() };
-            let SymOp::And(neg) = &*and_terms[*j] else { unreachable!() };
-            let mut yz_terms = HashMap::new();
-            for v in pos.iter() {
-                let t = v.to_string();
-                if *term_s == t || *not_term_s == t {
-                    continue;
-                }
-                yz_terms.insert(t.clone(), v.clone());
-            }
-            for v in neg.iter() {
-                let t = v.to_string();
-                if *term_s == t || *not_term_s == t {
-                    continue;
-                }
-                yz_terms.insert(t.clone(), v.clone());
-            }
-            let yz_term = SymOp::And(yz_terms.into_iter().map(|(_, v)| v).collect());
-            consensus_terms.insert(yz_term.to_string());
         }
 
         debug!("consensus_or: consensus_terms = {consensus_terms:?}");
 
         let mut final_terms : Vec<_> = ops
             .into_iter()
-            .filter(|op| !consensus_terms.contains(&op.to_string()))
+            .filter(|op| !consensus_terms.contains(&**op))
             .collect();
 
         match final_terms.len() {
@@ -3797,40 +3870,135 @@ impl SymOp {
     /// apply and-absorption
     /// X && (X || Y) ==> X
     fn absorption_and(ops: Vec<Box<SymOp>>) -> Result<SymOp, Error> {
-        let mut x_terms = HashSet::new();
-        for op in ops.clone().into_iter() {
-            x_terms.insert(op);
-        }
-
-        let mut retain_ops = vec![];
-
-        // look for X || Y
-        for op in ops.into_iter() {
-            if let SymOp::Or(inner) = *op {
-                let inner_set : HashSet<_> = inner.into_iter().collect();
-                let mut absorb = false;
-                for x_term in x_terms.iter() {
-                    if inner_set.contains(x_term) {
-                        // this is X || Y, so it can be absorbed
-                        absorb = true;
-                        break;
-                    }
+        // look for X || Y: an inner term that is also one of the outer
+        // terms makes the whole Or absorbable.
+        let x_terms : HashSet<&SymOp> = ops.iter().map(|op| &**op).collect();
+        let absorbed : Vec<bool> = ops
+            .iter()
+            .map(|op| {
+                if let SymOp::Or(inner) = &**op {
+                    inner.iter().any(|term| x_terms.contains(&**term))
                 }
-                if absorb {
-                    continue;
+                else {
+                    false
                 }
-                retain_ops.push(Box::new(SymOp::Or(inner_set.into_iter().collect())));
-            }
-            else {
-                retain_ops.push(op);
-            }
-        }
+            })
+            .collect();
+
+        let mut retain_ops : Vec<Box<SymOp>> = ops
+            .into_iter()
+            .zip(absorbed.into_iter())
+            .filter(|(_, absorbed)| !*absorbed)
+            .map(|(op, _)| op)
+            .collect();
 
         if retain_ops.len() == 1 {
             return Ok(*retain_ops.pop().expect("unreachable"));
         }
 
         Ok(SymOp::And(retain_ops))
+    }
+
+    /// Simplify a conjunction that holds disjunctions it will not distribute
+    /// over (see `simplify_and`): use the other conjuncts as context.
+    ///
+    /// For `(and C (or R1 R2 ..))`, with `C` the plain conjuncts:
+    ///   - a disjunct that contradicts `C` (it, or one of its own conjuncts,
+    ///     is the complement of a term of `C`) is dropped: `C && (!c && X)`
+    ///     is false;
+    ///   - a term of `C` inside a disjunct is redundant there:
+    ///     `C && (c && X || Y)` is `C && (X || Y)`;
+    ///   - a disjunction left with no disjuncts makes the whole conjunction
+    ///     false, and one left with a single disjunct becomes that disjunct.
+    /// All of these are equivalences, not approximations.
+    fn prune_or_conjuncts(ops: Vec<Box<SymOp>>) -> Result<SymOp, Error> {
+        let context : HashSet<&SymOp> = ops
+            .iter()
+            .filter(|op| !matches!(&***op, Self::Or(_)))
+            .map(|op| &**op)
+            .collect();
+        let contradicts = |term: &SymOp| -> bool {
+            let negated = match term {
+                Self::Not(x) => (**x).clone(),
+                x => Self::Not(Box::new(x.clone())),
+            };
+            if context.contains(&negated) {
+                return true;
+            }
+            if let Some(complement) = Self::comparison_complement(term) {
+                if context.contains(&complement) {
+                    return true;
+                }
+            }
+            false
+        };
+
+        let mut pruned : Vec<Box<SymOp>> = vec![];
+        let mut lifted : Vec<Box<SymOp>> = vec![];
+        for op in ops.iter() {
+            let Self::Or(disjuncts) = &**op else {
+                pruned.push(op.clone());
+                continue;
+            };
+            let mut kept : Vec<Box<SymOp>> = vec![];
+            for disjunct in disjuncts.iter() {
+                let terms : Vec<&SymOp> = match &**disjunct {
+                    Self::And(inner) => inner.iter().map(|t| &**t).collect(),
+                    x => vec![x],
+                };
+                if terms.iter().any(|t| contradicts(t)) {
+                    continue;
+                }
+                let residual : Vec<Box<SymOp>> = terms
+                    .into_iter()
+                    .filter(|t| !context.contains(*t))
+                    .map(|t| Box::new(t.clone()))
+                    .collect();
+                match residual.len() {
+                    // every term is already implied by the context, so this
+                    // disjunct is true under it and the disjunction is too
+                    0 => {
+                        kept.clear();
+                        break;
+                    }
+                    1 => kept.extend(residual.into_iter()),
+                    _ => kept.push(Box::new(Self::And(residual))),
+                }
+            }
+            match kept.len() {
+                0 => {
+                    // either no disjunct survived (false), or one was found to
+                    // be true under the context; tell them apart by whether
+                    // the loop ran to its end with nothing kept.
+                    let all_contradict = disjuncts.iter().all(|d| {
+                        let terms : Vec<&SymOp> = match &**d {
+                            Self::And(inner) => inner.iter().map(|t| &**t).collect(),
+                            x => vec![x],
+                        };
+                        terms.iter().any(|t| contradicts(t))
+                    });
+                    if all_contradict {
+                        return Ok(Self::False());
+                    }
+                    // the disjunction is true under the context: drop it
+                }
+                1 => lifted.push(kept.pop().expect("infallible: len checked")),
+                _ => pruned.push(Box::new(Self::Or(kept))),
+            }
+        }
+        // a disjunction reduced to a single disjunct is now a conjunct (or
+        // several, if it was itself a conjunction)
+        for op in lifted.into_iter() {
+            match *op {
+                Self::And(inner) => pruned.extend(inner.into_iter()),
+                x => pruned.push(Box::new(x)),
+            }
+        }
+        match pruned.len() {
+            0 => Ok(Self::True()),
+            1 => Ok(*pruned.pop().expect("infallible: len checked")),
+            _ => Ok(Self::And(pruned)),
+        }
     }
 
     /// distribute and across or.
@@ -3903,9 +4071,32 @@ impl SymOp {
         }
         debug!("simplify_and: consolidated_ops = {}", consolidated_ops.iter().map(|op| op.to_string()).collect::<Vec<_>>().join(", "));
       
-        let consolidated_and = Self::distribute_and(consolidated_ops)?;
-        let SymOp::And(consolidated_ops) = consolidated_and else {
-            return Ok(consolidated_and);
+        // Distribute over the disjunctions only while the disjunctive normal
+        // form stays small. A conjunction of large disjunctions -- the path
+        // condition of continuations merged at every step of a fold, say --
+        // would otherwise expand to the product of their sizes, and the
+        // formula would grow exponentially in the number of steps. Past the
+        // cap the disjunctions stay in place, and are pruned against the rest
+        // of the conjunction instead, which recovers the contradictions that
+        // distribution would have found between a disjunct and its context.
+        let dnf_terms = consolidated_ops
+            .iter()
+            .map(|op| if let Self::Or(inner) = &**op { inner.len() } else { 1 })
+            .fold(1usize, |acc, n| acc.saturating_mul(n));
+        let consolidated_ops = if dnf_terms <= MAX_DNF_TERMS {
+            let consolidated_and = Self::distribute_and(consolidated_ops)?;
+            let SymOp::And(consolidated_ops) = consolidated_and else {
+                return Ok(consolidated_and);
+            };
+            consolidated_ops
+        }
+        else {
+            match Self::prune_or_conjuncts(consolidated_ops)? {
+                SymOp::And(ops) => ops,
+                x => {
+                    return Ok(x);
+                }
+            }
         };
         
         debug!("simplify_and: distribute_and: consolidated_ops = {}", consolidated_ops.iter().map(|op| op.to_string()).collect::<Vec<_>>().join(", "));
@@ -4014,34 +4205,27 @@ impl SymOp {
     /// apply or-absorption
     /// X || (X && Y) ==> X
     fn absorption_or(ops: Vec<Box<SymOp>>) -> Result<SymOp, Error> {
-        let mut x_terms = HashSet::new();
-        for op in ops.clone().into_iter() {
-            x_terms.insert(op);
-        }
-
-        let mut retain_ops = vec![];
-
-        // look for X && Y
-        for op in ops.into_iter() {
-            if let SymOp::And(inner) = *op {
-                let inner_set : HashSet<_> = inner.into_iter().collect();
-                let mut absorb = false;
-                for x_term in x_terms.iter() {
-                    if inner_set.contains(x_term) {
-                        // this is X && Y, so it can be absorbed
-                        absorb = true;
-                        break;
-                    }
+        // look for X && Y: an inner term that is also one of the outer
+        // terms makes the whole And absorbable.
+        let x_terms : HashSet<&SymOp> = ops.iter().map(|op| &**op).collect();
+        let absorbed : Vec<bool> = ops
+            .iter()
+            .map(|op| {
+                if let SymOp::And(inner) = &**op {
+                    inner.iter().any(|term| x_terms.contains(&**term))
                 }
-                if absorb {
-                    continue;
+                else {
+                    false
                 }
-                retain_ops.push(Box::new(SymOp::And(inner_set.into_iter().collect())));
-            }
-            else {
-                retain_ops.push(op);
-            }
-        }
+            })
+            .collect();
+
+        let mut retain_ops : Vec<Box<SymOp>> = ops
+            .into_iter()
+            .zip(absorbed.into_iter())
+            .filter(|(_, absorbed)| !*absorbed)
+            .map(|(op, _)| op)
+            .collect();
 
         if retain_ops.len() == 1 {
             return Ok(*retain_ops.pop().expect("unreachable"));
@@ -4197,24 +4381,103 @@ impl SymOp {
         }
     }
     
+    /// Largest number of distinct atoms `prop_entails` will case-split on.
+    /// 2^16 evaluations of two small formulae is well under a millisecond.
+    const MAX_PROP_ATOMS : usize = 16;
+
+    /// The propositional atom this literal stands for, and its polarity.
+    /// `(not x)`, `(is-none x)` and the strict/non-strict comparison pairs are
+    /// the negations of `x`, `(is-some x)`, `(> x y)` and `(>= x y)`; anything
+    /// that is not a boolean connective is an atom of its own.
+    fn prop_literal(op: &SymOp) -> (SymOp, bool) {
+        match op {
+            Self::Not(x) => {
+                let (atom, positive) = Self::prop_literal(x);
+                (atom, !positive)
+            },
+            Self::IsNone(x) => (Self::IsSome(x.clone()), false),
+            Self::Leq(x, y) => (Self::Greater(x.clone(), y.clone()), false),
+            Self::Less(x, y) => (Self::Geq(x.clone(), y.clone()), false),
+            other => (other.clone(), true),
+        }
+    }
+
+    /// Collect the propositional atoms of a boolean formula, in first-seen order.
+    fn prop_atoms(op: &SymOp, atoms: &mut Vec<SymOp>) {
+        match op {
+            Self::Constant(Value::Bool(_)) => {},
+            Self::And(ops) | Self::Or(ops) => {
+                for op in ops.iter() {
+                    Self::prop_atoms(op, atoms);
+                }
+            },
+            Self::Not(x) => Self::prop_atoms(x, atoms),
+            other => {
+                let (atom, _) = Self::prop_literal(other);
+                if !atoms.contains(&atom) {
+                    atoms.push(atom);
+                }
+            },
+        }
+    }
+
+    /// Evaluate a boolean formula under an assignment of its atoms.
+    fn prop_eval(op: &SymOp, assignment: &HashMap<&SymOp, bool>) -> bool {
+        match op {
+            Self::Constant(Value::Bool(b)) => *b,
+            Self::And(ops) => ops.iter().all(|op| Self::prop_eval(op, assignment)),
+            Self::Or(ops) => ops.iter().any(|op| Self::prop_eval(op, assignment)),
+            Self::Not(x) => !Self::prop_eval(x, assignment),
+            other => {
+                let (atom, positive) = Self::prop_literal(other);
+                // an atom we did not collect cannot occur; treat it as unknown-false
+                let value = assignment.get(&atom).copied().unwrap_or(false);
+                value == positive
+            },
+        }
+    }
+
+    /// Decide `a => b` propositionally: every assignment of the atoms of `a`
+    /// and `b` that satisfies `a` also satisfies `b`. Atoms are treated as
+    /// independent booleans (with the negation pairs of `prop_literal`
+    /// identified), so a `true` verdict is sound; relations between atoms that
+    /// only a theory would see (`(> x u3)` vs `(>= x u4)`) go unnoticed and give
+    /// `false`. Returns `None` when there are too many atoms to case-split.
+    pub fn prop_entails(a: &SymOp, b: &SymOp) -> Option<bool> {
+        let mut atoms = vec![];
+        Self::prop_atoms(a, &mut atoms);
+        Self::prop_atoms(b, &mut atoms);
+        if atoms.len() > Self::MAX_PROP_ATOMS {
+            return None;
+        }
+        for bits in 0u64..(1u64 << atoms.len()) {
+            let assignment : HashMap<&SymOp, bool> = atoms
+                .iter()
+                .enumerate()
+                .map(|(i, atom)| (atom, bits & (1u64 << i) != 0))
+                .collect();
+            if Self::prop_eval(a, &assignment) && !Self::prop_eval(b, &assignment) {
+                return Some(false);
+            }
+        }
+        Some(true)
+    }
+
+    /// Decide `a <=> b` propositionally (see `prop_entails`).
+    pub fn prop_equivalent(a: &SymOp, b: &SymOp) -> Option<bool> {
+        Some(Self::prop_entails(a, b)? && Self::prop_entails(b, a)?)
+    }
+
     /// Deduplicate pure and read-only boolean formulae
     /// (i.e. ones that don't do mutable I/O)
     fn dedup_readonly_booleans(ops: Vec<Box<SymOp>>) -> Result<Vec<Box<SymOp>>, Error> {
-        // remove pure duplicates and simplfiy
-        let mut pure_distinct = HashSet::new();
-        let mut simplified = vec![];
-        for op in ops.into_iter() {
-            if op.is_read_only() {
-                if !pure_distinct.contains(&op) {
-                    pure_distinct.insert(op.clone());
-                    simplified.push(op);
-                }
-            }
-            else {
-                simplified.push(op);
-            }
-        }
-        Ok(simplified)
+        // remove pure duplicates: keep the first of each read-only term
+        let mut pure_distinct : HashSet<&SymOp> = HashSet::new();
+        let keep : Vec<bool> = ops
+            .iter()
+            .map(|op| !op.is_read_only() || pure_distinct.insert(&**op))
+            .collect();
+        Ok(ops.into_iter().zip(keep.into_iter()).filter(|(_, keep)| *keep).map(|(op, _)| op).collect())
     }
 
     // fold and propagate constants for an Equals(..)
@@ -4480,12 +4743,21 @@ impl SymOp {
             Self::TupleMerge(base, merged) => {
                 // lift out of merged, then base
                 debug!("op is a tuple-merge");
+                let merged_has_key = Self::tuple_cons_has_key(&merged, &name);
                 if let Some(sym) = Self::inner_simplify_tuple_get(name.clone(), *merged)? {
                     return Ok(Some(sym));
                 };
-                if let Some(sym) = Self::inner_simplify_tuple_get(name.clone(), *base)? {
+                if let Some(sym) = Self::inner_simplify_tuple_get(name.clone(), *base.clone())? {
                     return Ok(Some(sym));
                 };
+                // The merged half is a constructor that provably lacks the
+                // key, so the get reads through to the base: `(get k (merge
+                // base {..}))` is `(get k base)`. Without this the merged
+                // half -- which may be arbitrarily large -- rides along in a
+                // term whose value never depended on it.
+                if merged_has_key == Some(false) {
+                    return Ok(Some(Self::TupleGet(name, base)));
+                }
                 Ok(None)
             }
             Self::ConsSome(some_inner_op) => {
@@ -4547,6 +4819,30 @@ impl SymOp {
                 x => Ok(Some(Self::LoadedMapEntry(map_name, map_key, Some(Box::new(x)))))
             }
             _ => Ok(None)
+        }
+    }
+
+    /// Whether the operation is a tuple constructor, symbolic or constant.
+    fn is_tuple_cons(op: &SymOp) -> bool {
+        matches!(op, Self::TupleCons(_) | Self::Constant(Value::Tuple(_)))
+    }
+
+    /// Whether a tuple constructor (symbolic or constant) has the given key.
+    /// `None` when the operation is not a constructor, so nothing is known.
+    fn tuple_cons_has_key(op: &SymOp, name: &ClarityName) -> Option<bool> {
+        match op {
+            Self::TupleCons(fields) => Some(fields.iter().any(|(fname, _)| fname == name)),
+            Self::Constant(Value::Tuple(data)) => Some(data.data_map.contains_key(name)),
+            _ => None,
+        }
+    }
+
+    /// The fields of a tuple constructor (symbolic or constant), if it is one.
+    fn tuple_cons_fields(op: SymOp) -> Result<Vec<(ClarityName, Box<SymOp>)>, SymOp> {
+        match op {
+            Self::TupleCons(fields) => Ok(fields),
+            Self::Constant(Value::Tuple(data)) => Ok(data.data_map.into_iter().map(|(name, val)| (name, Box::new(Self::Constant(val)))).collect()),
+            other => Err(other),
         }
     }
 
@@ -5238,6 +5534,19 @@ impl SymOp {
                         }
                         Ok(Self::TupleCons(merged.into_iter().collect()))
                     },
+                    // `(merge (merge base A) B)` with constructors `A` and `B`
+                    // is `(merge base A+B)`, `B`'s fields winning. Keeps a
+                    // record that is updated in a loop from nesting one merge
+                    // per iteration.
+                    (Self::TupleMerge(inner_base, inner_merged), src) if Self::is_tuple_cons(&inner_merged) && Self::is_tuple_cons(&src) => {
+                        let inner_fields = Self::tuple_cons_fields(*inner_merged).map_err(|_| Error::Bug("checked constructor".into()))?;
+                        let src_fields = Self::tuple_cons_fields(src).map_err(|_| Error::Bug("checked constructor".into()))?;
+                        let mut merged : BTreeMap<_, _> = inner_fields.into_iter().collect();
+                        for (name, symop) in src_fields.into_iter() {
+                            merged.insert(name, symop);
+                        }
+                        Ok(Self::TupleMerge(inner_base, Box::new(Self::TupleCons(merged.into_iter().collect()))))
+                    },
                     (x, y) => Ok(Self::TupleMerge(Box::new(x), Box::new(y)))
                 }
             }
@@ -5495,7 +5804,6 @@ impl SymOp {
         }
         check_deadline()?;
 
-        let old = cur.clone();
         loop {
             debug!("simplify: {cur}");
             let new = Self::inner_simplify(cur.clone())?;
@@ -5505,8 +5813,8 @@ impl SymOp {
             cur = new;
         }
 
-        set_simplified(cur.clone());
-        debug!("simplified({}): {old} ==> {cur}", old == cur);
+        set_simplified(&cur);
+        debug!("simplified: {cur}");
         Ok(cur)
     }
 
@@ -6046,7 +6354,7 @@ impl SymOp {
 
 /// Predicates over operations over symbols.
 /// not all relations are well-defined here; we rely on the Clarity type-checker for this.
-#[derive(Debug, Clone, Hash, Eq)]
+#[derive(Debug, Clone, Eq)]
 pub enum Predicate {
     True,
     False,
@@ -6067,9 +6375,77 @@ pub enum Predicate {
 
 impl PartialEq for Predicate {
     fn eq(&self, other: &Self) -> bool {
-        let self_as_symop = self.clone().as_symop();
-        let other_as_symop = other.clone().as_symop();
-        self_as_symop.eq(&other_as_symop)
+        match (self, other) {
+            (Self::True, Self::True) | (Self::False, Self::False) => true,
+            (Self::Identity(a), Self::Identity(b)) => a == b,
+            (Self::And(a), Self::And(b)) | (Self::Or(a), Self::Or(b)) => cmp_commutative(a, b),
+            (Self::Not(a), Self::Not(b)) => a == b,
+            (Self::Equals(a), Self::Equals(b)) => cmp_commutative(a, b),
+            (Self::Geq(a1, a2), Self::Geq(b1, b2))
+            | (Self::Leq(a1, a2), Self::Leq(b1, b2))
+            | (Self::Less(a1, a2), Self::Less(b1, b2))
+            | (Self::Greater(a1, a2), Self::Greater(b1, b2)) => a1 == b1 && a2 == b2,
+            (Self::IsSome(a), Self::IsSome(b))
+            | (Self::IsNone(a), Self::IsNone(b))
+            | (Self::IsOkay(a), Self::IsOkay(b))
+            | (Self::IsErr(a), Self::IsErr(b)) => a == b,
+            // Different shapes can still denote the same formula (`True` and
+            // `Identity(true)`, or `Identity(Equals(..))` and `Equals(..)`).
+            // Only an `Identity` can stand in for another shape, and only for
+            // the shape its operation has; everything else is distinct.
+            (Self::Identity(op), p) | (p, Self::Identity(op)) => {
+                Self::identity_may_equal(op, p) && op.eq(&p.clone().as_symop())
+            }
+            (_, _) => false,
+        }
+    }
+}
+
+impl Predicate {
+    /// Whether this predicate implies `other` propositionally (see
+    /// `SymOp::prop_entails`); `None` when the formulae are too big to decide.
+    pub fn entails(&self, other: &Predicate) -> Option<bool> {
+        SymOp::prop_entails(&self.clone().as_symop(), &other.clone().as_symop())
+    }
+
+    /// Whether this predicate and `other` are propositionally equivalent.
+    pub fn equivalent(&self, other: &Predicate) -> Option<bool> {
+        SymOp::prop_equivalent(&self.clone().as_symop(), &other.clone().as_symop())
+    }
+
+    /// Whether `Identity(op)` could denote the same formula as the non-Identity
+    /// predicate `p`: the operation must be of `p`'s shape.
+    fn identity_may_equal(op: &SymOp, p: &Predicate) -> bool {
+        match (op, p) {
+            (SymOp::Constant(_), Self::True) | (SymOp::Constant(_), Self::False) => true,
+            (SymOp::And(_), Self::And(_)) | (SymOp::Or(_), Self::Or(_)) | (SymOp::Not(_), Self::Not(_)) => true,
+            (SymOp::Equals(_), Self::Equals(_)) => true,
+            (SymOp::Geq(..), Self::Geq(..)) | (SymOp::Leq(..), Self::Leq(..))
+            | (SymOp::Less(..), Self::Less(..)) | (SymOp::Greater(..), Self::Greater(..)) => true,
+            (SymOp::IsSome(_), Self::IsSome(_)) | (SymOp::IsNone(_), Self::IsNone(_))
+            | (SymOp::IsOkay(_), Self::IsOkay(_)) | (SymOp::IsErr(_), Self::IsErr(_)) => true,
+            (_, _) => false,
+        }
+    }
+}
+
+impl Hash for Predicate {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Self::True | Self::False => {}
+            Self::Identity(a) | Self::IsSome(a) | Self::IsNone(a) | Self::IsOkay(a) | Self::IsErr(a) => a.hash(state),
+            Self::Not(a) => a.hash(state),
+            Self::And(ps) | Self::Or(ps) => {
+                ps.len().hash(state);
+                unordered_digest(ps.iter().map(|p| standalone_hash(p))).hash(state);
+            }
+            Self::Equals(ops) => {
+                ops.len().hash(state);
+                unordered_digest(ops.iter().map(|op| standalone_hash(op))).hash(state);
+            }
+            Self::Geq(a, b) | Self::Leq(a, b) | Self::Less(a, b) | Self::Greater(a, b) => { a.hash(state); b.hash(state); }
+        }
     }
 }
 
@@ -6135,108 +6511,93 @@ impl fmt::Display for Predicate {
 }
 
 impl Predicate {
-    fn merge_and1(mut ps1: Vec<Box<Predicate>>, p: Box<Predicate>) -> Predicate {
-        if ps1.iter().find(|x| ***x == *p).is_none() {
-            // check for obvious contradictions
-            let contra = p.clone().not();
-            if ps1.iter().find(|x| ***x == contra).is_some() {
-                return Self::False;
-            }
-            ps1.push(p);
+    /// The literal a predicate asserts or denies: `(not x)` denies `x`, any
+    /// other predicate asserts itself. Matches `Predicate::not`.
+    fn polarity(p: &Predicate) -> (&Predicate, bool) {
+        match p {
+            Self::Not(x) => (x, false),
+            x => (x, true),
         }
-        Self::And(ps1)
+    }
+
+    /// Conjoin (`conjunction`) or disjoin the predicates: drop the identity
+    /// element and duplicates, flatten nested connectives of the same kind,
+    /// and collapse to the absorbing element when a predicate and its
+    /// negation both occur. Each predicate is hashed once and compared only
+    /// against the bucket its hash selects, so a wide connective costs its
+    /// size, not its size squared.
+    fn merge_many<I>(preds: I, conjunction: bool) -> Predicate
+    where
+        I: IntoIterator<Item = Predicate>
+    {
+        let mut kept : Vec<Box<Predicate>> = vec![];
+        // literal hash -> indexes into `kept` whose literal has that hash
+        let mut buckets : HashMap<u64, Vec<usize>> = HashMap::new();
+        let mut pending : Vec<Predicate> = preds.into_iter().collect();
+        pending.reverse();
+        while let Some(p) = pending.pop() {
+            match (&p, conjunction) {
+                (Self::True, true) | (Self::False, false) => continue,
+                (Self::False, true) => return Self::False,
+                (Self::True, false) => return Self::True,
+                (Self::And(ps), true) | (Self::Or(ps), false) => {
+                    // flatten; keep the original order
+                    for inner in ps.iter().rev() {
+                        pending.push(*inner.clone());
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            let (literal, positive) = Self::polarity(&p);
+            let h = standalone_hash(literal);
+            if let Some(idxs) = buckets.get(&h) {
+                let mut duplicate = false;
+                for &i in idxs.iter() {
+                    let (kept_literal, kept_positive) = Self::polarity(&kept[i]);
+                    if *kept_literal == *literal {
+                        if kept_positive == positive {
+                            duplicate = true;
+                            break;
+                        }
+                        // `x` and `(not x)` together
+                        return if conjunction { Self::False } else { Self::True };
+                    }
+                }
+                if duplicate {
+                    continue;
+                }
+            }
+            buckets.entry(h).or_default().push(kept.len());
+            kept.push(Box::new(p));
+        }
+        match kept.len() {
+            0 => if conjunction { Self::True } else { Self::False },
+            1 => *kept.pop().expect("checked len"),
+            _ => if conjunction { Self::And(kept) } else { Self::Or(kept) },
+        }
     }
 
     fn merge_and(p1: Predicate, p2: Predicate) -> Self {
-        match (p1, p2) {
-            (Self::True, p2) => p2,
-            (p1, Self::True) => p1,
-            (Self::False, _p2) => Self::False,
-            (_p1, Self::False) => Self::False,
-            (Self::And(mut ps1), Self::And(ps2)) => {
-                for p in ps2 {
-                    ps1 = match Self::merge_and1(ps1, p) {
-                        Self::And(ps) => ps,
-                        x => {
-                            return x;
-                        }
-                    };
-                }
-                Self::And(ps1)
-            },
-            (Self::And(ps), x) => {
-                Self::merge_and1(ps, Box::new(x))
-            },
-            (x, Self::And(ps)) => {
-                Self::merge_and1(ps, Box::new(x))
-            },
-            (x, y) => {
-                let ps = if x == y {
-                    return x;
-                }
-                else if x.clone().not() == y || y.clone().not() == x {
-                    return Self::False;
-                }
-                else {
-                    vec![Box::new(x), Box::new(y)]
-                };
-                Self::And(ps)
-            }
-        }
+        Self::merge_many([p1, p2], true)
     }
 
     pub fn and(self, p: Predicate) -> Self {
         Self::merge_and(self, p)
     }
-    
-    fn merge_or1(mut ps1: Vec<Box<Predicate>>, p: Box<Predicate>) -> Predicate {
-        if ps1.iter().find(|x| ***x == *p).is_none() {
-            // check for obvious contradictions
-            let contra = p.clone().not();
-            if ps1.iter().find(|x| ***x == contra).is_some() {
-                return Self::True;
-            }
-            ps1.push(p);
-        }
-        Self::Or(ps1)
+
+    /// Conjoin many predicates at once (see `merge_many`).
+    pub fn and_all<I: IntoIterator<Item = Predicate>>(preds: I) -> Self {
+        Self::merge_many(preds, true)
     }
 
     fn merge_or(p1: Predicate, p2: Predicate) -> Self {
-        match (p1, p2) {
-            (Self::True, _p2) => Self::True,
-            (_p1, Self::True) => Self::True,
-            (Self::False, p2) => p2,
-            (p1, Self::False) => p1,
-            (Self::Or(mut ps1), Self::Or(ps2)) => {
-                for p in ps2 {
-                    ps1 = match Self::merge_or1(ps1, p) {
-                        Self::Or(ps) => ps,
-                        x => {
-                            return x;
-                        }
-                    };
-                }
-                Self::Or(ps1)
-            },
-            (Self::Or(ps), x) => {
-                Self::merge_or1(ps, Box::new(x))
-            },
-            (x, Self::Or(ps)) => {
-                Self::merge_or1(ps, Box::new(x))
-            },
-            (x, y) => {
-                let ps = if x == y {
-                    return x;
-                }
-                else if x.clone().not() == y || y.clone().not() == x {
-                    return Self::True;
-                }
-                else {
-                    vec![Box::new(x), Box::new(y)]
-                };
-                Self::Or(ps)
-            }
-        }
+        Self::merge_many([p1, p2], false)
+    }
+
+    /// Disjoin many predicates at once (see `merge_many`).
+    pub fn or_all<I: IntoIterator<Item = Predicate>>(preds: I) -> Self {
+        Self::merge_many(preds, false)
     }
 
     pub fn or(self, p: Predicate) -> Self {
@@ -6269,6 +6630,73 @@ impl Predicate {
             Self::IsNone(op) => SymOp::IsNone(Box::new(op)),
             Self::IsOkay(op) => SymOp::IsOkay(Box::new(op)),
             Self::IsErr(op) => SymOp::IsErr(Box::new(op)),
+        }
+    }
+
+    /// The conjuncts of a predicate: the operands of an `And`, or the
+    /// predicate itself.
+    fn conjuncts(p: &Predicate) -> Vec<&Predicate> {
+        match p {
+            Self::And(ps) => ps.iter().map(|p| &**p).collect(),
+            x => vec![x],
+        }
+    }
+
+    /// The disjunction of `preds`, with the conjuncts common to all of them
+    /// factored out: `(or (and C X) (and C Y))` becomes `(and C (or X Y))`.
+    ///
+    /// Continuations that are merged descend from a common ancestor, so their
+    /// path conditions share that ancestor's condition; writing the
+    /// disjunction as the ancestor's condition and a disjunction of what each
+    /// path added keeps the merged condition linear in the number of paths
+    /// rather than repeating the shared part in every disjunct. The result is
+    /// equivalent to the plain disjunction.
+    pub fn factored_or(preds: Vec<Box<Predicate>>) -> Predicate {
+        if preds.len() < 2 {
+            return Self::Or(preds);
+        }
+        let all_conjuncts : Vec<Vec<&Predicate>> = preds.iter().map(|p| Self::conjuncts(p)).collect();
+        let mut common : Vec<&Predicate> = vec![];
+        for candidate in all_conjuncts[0].iter() {
+            if common.contains(candidate) {
+                continue;
+            }
+            if all_conjuncts[1..].iter().all(|cs| cs.contains(candidate)) {
+                common.push(candidate);
+            }
+        }
+        if common.is_empty() {
+            return Self::Or(preds);
+        }
+        let mut residuals : Vec<Box<Predicate>> = vec![];
+        for cs in all_conjuncts.iter() {
+            let residual : Vec<Box<Predicate>> = cs
+                .iter()
+                .filter(|c| !common.contains(c))
+                .map(|c| Box::new((*c).clone()))
+                .collect();
+            match residual.len() {
+                // this path added nothing to the shared condition, so the
+                // disjunction of residuals is true
+                0 => {
+                    residuals.clear();
+                    break;
+                }
+                1 => residuals.extend(residual.into_iter()),
+                _ => residuals.push(Box::new(Self::And(residual))),
+            }
+        }
+        let mut factored : Vec<Box<Predicate>> = common.into_iter().map(|c| Box::new(c.clone())).collect();
+        match residuals.len() {
+            0 => {}
+            1 => factored.extend(residuals.into_iter()),
+            _ => factored.push(Box::new(Self::Or(residuals))),
+        }
+        if factored.len() == 1 {
+            *factored.pop().expect("infallible: len checked")
+        }
+        else {
+            Self::And(factored)
         }
     }
 
@@ -6422,15 +6850,38 @@ fn last_cont_id() -> u64 {
 // The set of already-simplified terms is a per-thread memo, for the same
 // reason the id counters are: it is a cache, safe to keep per analysis, and
 // keeping it thread-local avoids a lock shared across concurrent analyses.
+//
+// The memo holds a 128-bit fingerprint of each simplified term, not the term:
+// keeping the terms made the memo a copy of every formula the analysis ever
+// simplified, and looking one up meant a full structural comparison. The
+// fingerprint is two independently keyed structural hashes, so a false hit
+// (which would only leave a term unsimplified, never mis-simplify it) needs a
+// collision in both.
 thread_local! {
-    static SIMPLIFIED: std::cell::RefCell<HashSet<SymOp>> = std::cell::RefCell::new(HashSet::new());
-}
-fn is_simplified(op: &SymOp) -> bool {
-    SIMPLIFIED.with(|s| s.borrow().contains(op))
+    static SIMPLIFIED: std::cell::RefCell<HashSet<(u64, u64)>> = std::cell::RefCell::new(HashSet::new());
+    static FINGERPRINT_KEYS: (std::collections::hash_map::RandomState, std::collections::hash_map::RandomState) =
+        (std::collections::hash_map::RandomState::new(), std::collections::hash_map::RandomState::new());
 }
 
-fn set_simplified(op: SymOp) {
-    SIMPLIFIED.with(|s| { s.borrow_mut().insert(op); });
+fn fingerprint(op: &SymOp) -> (u64, u64) {
+    use std::hash::BuildHasher;
+    FINGERPRINT_KEYS.with(|(k1, k2)| {
+        let mut h1 = k1.build_hasher();
+        op.hash(&mut h1);
+        let mut h2 = k2.build_hasher();
+        op.hash(&mut h2);
+        (h1.finish(), h2.finish())
+    })
+}
+
+fn is_simplified(op: &SymOp) -> bool {
+    let fp = fingerprint(op);
+    SIMPLIFIED.with(|s| s.borrow().contains(&fp))
+}
+
+fn set_simplified(op: &SymOp) {
+    let fp = fingerprint(op);
+    SIMPLIFIED.with(|s| { s.borrow_mut().insert(fp); });
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -7593,8 +8044,14 @@ impl Continuation {
         let caller = snapshot.caller;
         let panicking = snapshot.panicked;
 
-        let old_cont_str = self.to_string();
-        let old_trace = self.trace();
+        // only ever printed at debug level, and formatting a continuation is
+        // not cheap: skip it otherwise
+        let (old_cont_str, old_trace_str) = if is_debug() {
+            (self.to_string(), self.trace().to_string())
+        }
+        else {
+            (String::new(), String::new())
+        };
 
         let merged = Self {
             id: next_cont_id(),
@@ -7643,7 +8100,7 @@ impl Continuation {
         debug!("Continuation:\n{}", &merged);
         debug!("Trace:\n{}", &merged.trace());
         debug!("Old continuation:\n{old_cont_str}");
-        debug!("Old trace:\n{old_trace}");
+        debug!("Old trace:\n{old_trace_str}");
         merged
     }
     
@@ -7829,6 +8286,27 @@ impl Continuation {
     /// * they have the same storage reads and writes so far
     /// * they have the same formula
     /// * they have the same early_return and panicked values
+    /// A hash over everything `can_combine_with` compares (bar the panic
+    /// snapshot), so that continuations can be bucketed before the pairwise
+    /// scan: two that can combine always share it. Order-independent over the
+    /// maps and sets, like the structural hashes of the operations themselves.
+    pub fn combine_key_hash(&self) -> u64 {
+        let mut h = DefaultHasher::new();
+        self.caller.as_ref().map(|c| c.id).hash(&mut h);
+        self.panicking.hash(&mut h);
+        (self.early_return || self.halted()).hash(&mut h);
+        self.final_formula.hash(&mut h);
+        unordered_digest(self.bound_formulae.iter().map(|(k, v)| standalone_hash(&(k, v)))).hash(&mut h);
+        unordered_digest(self.var_state.iter().map(|(k, v)| standalone_hash(&(k, v)))).hash(&mut h);
+        unordered_digest(self.map_tombstones.iter().map(|(k, v)| {
+            standalone_hash(&(k, unordered_digest(v.iter().map(|op| standalone_hash(op)))))
+        })).hash(&mut h);
+        unordered_digest(self.map_state.iter().map(|(k, v)| {
+            standalone_hash(&(k, unordered_digest(v.iter().map(|(mk, mv)| standalone_hash(&(mk, mv))))))
+        })).hash(&mut h);
+        h.finish()
+    }
+
     pub fn can_combine_with<F>(&self, other: &Continuation, cmp_final_formula: F) -> bool
     where
         F: Fn(&SymOp, &SymOp) -> bool
@@ -7850,7 +8328,7 @@ impl Continuation {
         let self_state = self.snapshot_access_state(None);
         let self_panicked = self_state.panicked;
 
-        let other_state = self.snapshot_access_state(None);
+        let other_state = other.snapshot_access_state(None);
         let other_panicked = other_state.panicked;
 
         if self.var_state != other.var_state
@@ -7952,7 +8430,7 @@ impl Continuation {
         }
 
         let function_path = format!("{self_prefix}.COMBINE({})", suffixes.join(", "));
-        let predicate_combined = Predicate::Or(preds.clone());
+        let predicate_combined = Predicate::factored_or(preds.clone());
 
         let combined = Self {
             id: next_cont_id(),
@@ -8887,6 +9365,12 @@ impl Symbex {
                 formulae.pop().expect("unreachable")
             };
 
+            // Only continuations with the same combine key can combine, so
+            // the pairwise scan runs within key buckets rather than over the
+            // whole set: comparing two large but different states is a full
+            // structural walk, and most pairs differ.
+            let key_hashes : Vec<u64> = filtered_conts.iter().map(|c| c.combine_key_hash()).collect();
+
             let mut combineable : HashMap<_, Vec<_>> = HashMap::new();
             let mut droppable = HashSet::new();
             for (i, cont_i) in filtered_conts.iter().enumerate() {
@@ -8895,6 +9379,9 @@ impl Symbex {
                 }
 
                 for (j, cont_j) in filtered_conts[(i+1)..].iter().enumerate() {
+                    if key_hashes[i] != key_hashes[i + 1 + j] {
+                        continue;
+                    }
                     if cont_i.can_combine_with(cont_j, cmp_final_formulae) {
                         info!("continuation {} ({}) can combine with continuation {} ({})", cont_i.get_function_path(), cont_i.id, cont_j.get_function_path(), cont_j.id);
                         if let Some(combined) = combineable.get_mut(&i) {
@@ -8923,8 +9410,17 @@ impl Symbex {
 
                 let combineable : Vec<_> = filtered_conts.iter().enumerate().filter_map(|(idx, c)| if js.contains(&idx) { Some(c.clone()) } else { None }).collect();
 
-                let c = filtered_conts[i].clone().combine(combineable, merge_final_formulae).expect("BUG: failed to combine continuation");
-                combined.push(c);
+                match filtered_conts[i].clone().combine(combineable, merge_final_formulae) {
+                    Ok(c) => combined.push(c),
+                    Err(e) => {
+                        // Most often the deadline, raised from a simplify
+                        // inside the merge. Nothing is lost by not merging:
+                        // hand the set back as it was and let the next
+                        // `eval` report the budget.
+                        warn!("Could not combine continuations, keeping them apart: {e:?}");
+                        return filtered_conts;
+                    }
+                }
             }
 
             return combined;

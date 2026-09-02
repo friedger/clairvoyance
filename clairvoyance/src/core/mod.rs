@@ -487,12 +487,22 @@ impl ProofFailures {
             let mut formula_match: Option<Continuation> = None;
             for (i, cont) in conts.iter().enumerate() {
                 let formula_eq = cont.final_formula.clone().simplify()? == h.formula.clone().simplify()?;
-                let matches = if let Some(cond) = h.condition.as_ref() {
+                // The simplifier's normal form is compared first; where it
+                // differs, a propositional case-split decides whether the
+                // two predicates are nonetheless the same condition (or, for a
+                // halt with a condition, whether the path implies it).
+                let matches = if !formula_eq {
+                    false
+                }
+                else if let Some(cond) = h.condition.as_ref() {
                     let implication = cont.predicate.clone().not().or(*cond.clone()).simplify()?;
-                    formula_eq && implication == Predicate::True
+                    implication == Predicate::True
+                        || cont.predicate.clone().simplify()?.entails(&cond.clone().simplify()?) == Some(true)
                 }
                 else {
-                    formula_eq && cont.predicate.clone().simplify()? == h.predicate.clone().simplify()?
+                    let computed = cont.predicate.clone().simplify()?;
+                    let given = h.predicate.clone().simplify()?;
+                    computed == given || computed.equivalent(&given) == Some(true)
                 };
                 if !matches && formula_eq && formula_match.is_none() {
                     formula_match = Some(cont.clone());
