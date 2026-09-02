@@ -406,7 +406,52 @@ pub enum SymOp {
     Panic,
     // INTERNAL -- a "stub" function call that will not be explored.
     FunctionCall(FullName, Vec<Box<SymOp>>),
+    // INTERNAL -- `(if cond then else)` as a value. Produced when two paths
+    // are joined (see `Continuation::join`): the joined path carries one
+    // formula that reads as either branch's, under that branch's condition.
+    If(Box<SymOp>, Box<SymOp>, Box<SymOp>),
+    // INTERNAL -- a name for a big formula. The name is the definition's
+    // fingerprint, so equal definitions get equal names; the definition
+    // travels with the name, shared between its uses. The simplifier treats
+    // a name as an atom, the SMT backend asserts it equal to its definition.
+    // Produced when paths are joined (see `SymOp::name_leaves`), where the
+    // values of a loop's iterations would otherwise nest without bound.
+    Named((u64, u64), NamedDef),
 }
+
+/// The definition behind a `SymOp::Named`. Shared, and printed by name
+/// alone in debug output: the names exist because the definitions are big
+/// and used many times over, and spelling one out at each use would make a
+/// log line grow with the number of uses of every name under it.
+#[derive(Clone)]
+pub struct NamedDef(Rc<SymOp>);
+
+impl std::ops::Deref for NamedDef {
+    type Target = SymOp;
+    fn deref(&self) -> &SymOp {
+        &self.0
+    }
+}
+
+impl PartialEq for NamedDef {
+    /// Two names are compared by name (see `SymOp::eq`); this is only here
+    /// so `SymOp` can derive `Eq`.
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0) || *self.0 == *other.0
+    }
+}
+
+impl Eq for NamedDef {}
+
+impl fmt::Debug for NamedDef {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "NamedDef(..)")
+    }
+}
+
+/// Printed size above which a formula is named rather than copied around
+/// (see `SymOp::named`).
+const NAME_THRESHOLD: usize = 512;
 
 /// The most terms a conjunction is expanded into when distributing it over
 /// its disjunctions (see `SymOp::simplify_and`).
@@ -563,6 +608,8 @@ impl PartialEq for SymOp {
             }
             (Self::TupleGet(n1, s1), Self::TupleGet(n2, s2)) => n1 == n2 && s1 == s2,
             (Self::TupleMerge(s11, s12), Self::TupleMerge(s21, s22)) => s11 == s21 && s12 == s22,
+            (Self::If(c1, a1, b1), Self::If(c2, a2, b2)) => c1 == c2 && a1 == a2 && b1 == b2,
+            (Self::Named(n1, _), Self::Named(n2, _)) => n1 == n2,
             (Self::Hash160(s1), Self::Hash160(s2)) => s1 == s2,
             (Self::Sha256(s1), Self::Sha256(s2)) => s1 == s2,
             (Self::Sha512(s1), Self::Sha512(s2)) => s1 == s2,
@@ -740,6 +787,7 @@ impl Hash for SymOp {
         match self {
             Self::Constant(v) => v.hash(state),
             Self::Variable(s) => s.hash(state),
+            Self::Named(n, _) => n.hash(state),
             Self::FetchVar(n) | Self::GetTokenSupply(n) => n.hash(state),
             Self::AllowanceAll | Self::Panic => {}
 
@@ -803,7 +851,7 @@ impl Hash for SymOp {
 
             Self::Secp256k1Verify(a, b, c) | Self::StxTransfer(a, b, c) | Self::Slice(a, b, c)
             | Self::ReplaceAt(a, b, c) | Self::RestrictAssets(a, b, c)
-            | Self::Secp256r1Verify(a, b, c) => { a.hash(state); b.hash(state); c.hash(state); }
+            | Self::Secp256r1Verify(a, b, c) | Self::If(a, b, c) => { a.hash(state); b.hash(state); c.hash(state); }
 
             Self::StxTransferMemo(a, b, c, d) => { a.hash(state); b.hash(state); c.hash(state); d.hash(state); }
             Self::VerifyMerkleProof(a, b, c, d, e) => { a.hash(state); b.hash(state); c.hash(state); d.hash(state); e.hash(state); }
@@ -814,6 +862,104 @@ impl Hash for SymOp {
             Self::AllowanceWithFt(a, n, b) | Self::AllowanceWithNft(a, n, b) => { a.hash(state); n.hash(state); b.hash(state); }
             Self::FromConsensusBuff(t, a) => { t.hash(state); a.hash(state); }
         }
+    }
+}
+
+
+impl SymOp {
+    /// The immediate operands of this formula, in no particular order.
+    pub fn children(&self) -> Vec<&SymOp> {
+        match self {
+            Self::Constant(..) | Self::Variable(..) | Self::FetchVar(..) | Self::GetTokenSupply(..)
+            | Self::AllowanceAll | Self::Panic => vec![],
+            Self::Named(_, def) => vec![&**def],
+
+            Self::LoadedDataVariable(_, a)
+            | Self::SetVar(_, a)
+            | Self::FetchEntry(_, a)
+            | Self::DeleteEntry(_, a)
+            | Self::GetTokenBalance(_, a)
+            | Self::GetNftOwner(_, a)
+            | Self::BurnToken(_, a) => vec![&**a],
+            Self::SetEntry(_, a, b)
+            | Self::InsertEntry(_, a, b)
+            | Self::MintToken(_, a, b)
+            | Self::MintNft(_, a, b)
+            | Self::BurnNft(_, a, b) => vec![&**a, &**b],
+            Self::LoadedMapEntry(_, a, b) => { let mut v = vec![&**a]; if let Some(b) = b { v.push(&**b); } v },
+            Self::TransferToken(_, a, b, c)
+            | Self::TransferNft(_, a, b, c) => vec![&**a, &**b, &**c],
+            Self::FunctionCall(_, args) => args.iter().map(|a| &**a).collect(),
+
+            // commutative
+            Self::Add(ops)
+            | Self::Multiply(ops)
+            | Self::And(ops)
+            | Self::Or(ops)
+            | Self::Equals(ops)
+            | Self::BitwiseAnd(ops)
+            | Self::BitwiseOr(ops)
+            | Self::BitwiseXor(ops) => ops.iter().map(|op| &**op).collect(),
+            // ordered
+            Self::Subtract(ops)
+            | Self::Divide(ops)
+            | Self::Concat(ops)
+            | Self::ListCons(ops) => ops.iter().map(|op| &**op).collect(),
+
+            Self::TupleCons(fields) => fields.iter().map(|(_, op)| &**op).collect(),
+
+            Self::ToInt(a) | Self::ToUInt(a) | Self::Sqrti(a) | Self::Log2(a) | Self::Not(a)
+            | Self::Len(a) | Self::BuffToIntLe(a) | Self::BuffToUIntLe(a) | Self::BuffToIntBe(a)
+            | Self::BuffToUIntBe(a) | Self::IsStandard(a) | Self::PrincipalDestruct(a)
+            | Self::StringToInt(a) | Self::StringToUInt(a) | Self::IntToAscii(a) | Self::IntToUtf8(a)
+            | Self::Hash160(a) | Self::Sha256(a) | Self::Sha512(a) | Self::Sha512Trunc256(a)
+            | Self::Keccak256(a) | Self::ContractOf(a) | Self::PrincipalOf(a) | Self::IsOkay(a)
+            | Self::IsErr(a) | Self::IsSome(a) | Self::IsNone(a) | Self::UnwrapPanic(a)
+            | Self::UnwrapErrPanic(a) | Self::ConsError(a) | Self::ConsOkay(a) | Self::ConsSome(a)
+            | Self::GetStxBalance(a) | Self::StxBurn(a) | Self::StxGetAccount(a) | Self::BitwiseNot(a)
+            | Self::ToConsensusBuff(a) | Self::ContractHash(a) | Self::ToAscii(a)
+            | Self::AllowanceWithStx(a) | Self::AllowanceWithStacking(a) => vec![&**a],
+
+            Self::Modulo(a, b) | Self::Power(a, b) | Self::Greater(a, b) | Self::Geq(a, b)
+            | Self::Leq(a, b) | Self::Less(a, b) | Self::Append(a, b) | Self::AsMaxLen(a, b)
+            | Self::ElementAt(a, b) | Self::IndexOf(a, b) | Self::TupleMerge(a, b)
+            | Self::Secp256k1Recover(a, b) | Self::BitwiseLShift(a, b) | Self::BitwiseRShift(a, b)
+            | Self::AsContractSafe(a, b) | Self::GetBitcoinTxOutput(a, b) => vec![&**a, &**b],
+
+            Self::Secp256k1Verify(a, b, c) | Self::StxTransfer(a, b, c) | Self::Slice(a, b, c)
+            | Self::ReplaceAt(a, b, c) | Self::RestrictAssets(a, b, c)
+            | Self::Secp256r1Verify(a, b, c) | Self::If(a, b, c) => vec![&**a, &**b, &**c],
+
+            Self::StxTransferMemo(a, b, c, d) => vec![&**a, &**b, &**c, &**d],
+            Self::VerifyMerkleProof(a, b, c, d, e) => vec![&**a, &**b, &**c, &**d, &**e],
+            Self::PrincipalConstruct(a, b, c) => { let mut v = vec![&**a, &**b]; if let Some(c) = c { v.push(&**c); } v },
+
+            Self::TupleGet(_, a) | Self::GetBurnBlockInfo(_, a) | Self::GetStacksBlockInfo(_, a)
+            | Self::GetTenureInfo(_, a) => vec![&**a],
+            Self::AllowanceWithFt(a, _, b) | Self::AllowanceWithNft(a, _, b) => vec![&**a, &**b],
+            Self::FromConsensusBuff(_, a) => vec![&**a],
+        }
+    }
+
+    /// The named formulas this one is built from -- its own and, after each,
+    /// those its definition is built from -- each once, in the order they
+    /// are first met. What `Display` prints by name is spelled out here.
+    pub fn names(&self) -> Vec<((u64, u64), SymOp)> {
+        let mut seen = HashSet::new();
+        let mut out = vec![];
+        let mut stack : Vec<&SymOp> = vec![self];
+        while let Some(op) = stack.pop() {
+            if let Self::Named(n, def) = op {
+                if !seen.insert(*n) {
+                    continue;
+                }
+                out.push((*n, (**def).clone()));
+            }
+            let mut kids = op.children();
+            kids.reverse();
+            stack.extend(kids);
+        }
+        out
     }
 }
 
@@ -919,6 +1065,8 @@ impl fmt::Display for SymOp {
             }
             Self::TupleGet(name, op1) => write!(f, "(get {name} {op1})"),
             Self::TupleMerge(op1, op2) => write!(f, "(merge {op1} {op2})"),
+            Self::If(c, a, b) => write!(f, "(if {c} {a} {b})"),
+            Self::Named(n, _) => write!(f, "n{:016x}{:016x}", n.0, n.1),
             Self::Hash160(op1) => write!(f, "(hash160 {op1})"),
             Self::Sha256(op1) => write!(f, "(sha256 {op1})"),
             Self::Sha512(op1) => write!(f, "(sha512 {op1})"),
@@ -1012,6 +1160,7 @@ impl SymOp {
                 Self::UnwrapErrPanic(op) => op.inner_loaded(),
                 Self::ConsSome(op) => op.inner_loaded(),
                 Self::TupleGet(name, op) => Self::TupleGet(name.clone(), op.clone()).inner_loaded(),
+                Self::If(_, a, b) => Self::UnwrapPanic(a.clone()).inner_loaded().or_else(|| Self::UnwrapPanic(b.clone()).inner_loaded()),
                 _ => None,
             },
             Self::UnwrapErrPanic(op) => op.inner_loaded(),
@@ -1032,10 +1181,14 @@ impl SymOp {
                     merge_op.inner_loaded().or_else(|| tuple_op.inner_loaded())
                 },
                 Self::ConsSome(op) => op.inner_loaded(),
+                Self::If(_, a, b) => Self::TupleGet(name.clone(), a.clone()).inner_loaded().or_else(|| Self::TupleGet(name.clone(), b.clone()).inner_loaded()),
                 _ => None,
             }
             Self::Constant(..) => Some(self.clone()),
             Self::Variable(..) => Some(self.clone()),
+            // either branch has the type of the whole
+            Self::If(_, a, b) => a.inner_loaded().or_else(|| b.inner_loaded()),
+            Self::Named(_, def) => def.inner_loaded(),
             _ => None
         }
     }
@@ -1050,6 +1203,7 @@ impl SymOp {
             Self::Variable(Sym::Int(..)) => Some(false),
             Self::Variable(Sym::UInt(..)) => Some(true),
             Self::LoadedDataVariable(_, op) => op.is_unsigned(),
+            Self::Named(_, def) => def.is_unsigned(),
             Self::Add(ops) 
             | Self::Subtract(ops)
             | Self::Multiply(ops)
@@ -1095,6 +1249,7 @@ impl SymOp {
             Self::TupleGet(_name, op) => op.inner_loaded().and_then(|op| op.is_unsigned()),
             Self::UnwrapPanic(op) => op.inner_loaded().and_then(|op| op.is_unsigned()),
             Self::UnwrapErrPanic(op) => op.inner_loaded().and_then(|op| op.is_unsigned()),
+            Self::If(_, a, b) => a.is_unsigned().or_else(|| b.is_unsigned()),
             _ => None
         }
     }
@@ -1119,6 +1274,8 @@ impl SymOp {
             | Self::ConsSome(..)
             | Self::FromConsensusBuff(..) => true,
             Self::LoadedDataVariable(_, sym) => sym.maybe_produces_optional_tuple(),
+            Self::If(_, a, b) => a.maybe_produces_optional_tuple() || b.maybe_produces_optional_tuple(),
+            Self::Named(_, def) => def.maybe_produces_optional_tuple(),
             _ => false
         }
     }
@@ -1328,6 +1485,16 @@ impl SymOp {
             Self::Not(symop) => {
                 let p = symop.try_as_predicate()?;
                 Ok(Predicate::Not(Box::new(p)))
+            }
+            Self::If(cond, a, b) => {
+                // (if c a b) == (or (and c a) (and (not c) b))
+                let c = cond.try_as_predicate()?;
+                let a = a.try_as_predicate()?;
+                let b = b.try_as_predicate()?;
+                Ok(Predicate::or_all(vec![
+                    Predicate::and_all(vec![c.clone(), a]),
+                    Predicate::and_all(vec![Predicate::Not(Box::new(c)), b]),
+                ]))
             }
             x => {
                 Ok(Predicate::Identity(x.clone()))
@@ -3774,6 +3941,11 @@ impl SymOp {
             Self::Greater(a, b) => Some(Self::Leq(a.clone(), b.clone())),
             Self::Less(a, b) => Some(Self::Geq(a.clone(), b.clone())),
             Self::Geq(a, b) => Some(Self::Less(a.clone(), b.clone())),
+            // An optional is one or the other, and so is a response.
+            Self::IsSome(x) => Some(Self::IsNone(x.clone())),
+            Self::IsNone(x) => Some(Self::IsSome(x.clone())),
+            Self::IsOkay(x) => Some(Self::IsErr(x.clone())),
+            Self::IsErr(x) => Some(Self::IsOkay(x.clone())),
             _ => None,
         }
     }
@@ -4345,6 +4517,8 @@ impl SymOp {
             },
             // (not (not x)) == x
             Self::Not(x) => Ok(*x),
+            // (not (if c a b)) == (if c (not a) (not b))
+            Self::If(c, a, b) => Self::If(c, Box::new(Self::Not(a)), Box::new(Self::Not(b))).simplify(),
             // (not (> x y)) == (<= x y)
             Self::Greater(x, y) => Ok(Self::Leq(x, y)),
             // (not (>= x y)) == (< x y)
@@ -4578,6 +4752,9 @@ impl SymOp {
         if simplified.len() == 2 {
             if let Some((nx, ny)) = Self::cancel_common_addends(&simplified[0], &simplified[1]) {
                 return Self::Equals(vec![Box::new(nx), Box::new(ny)]).simplify();
+            }
+            if let Some(pushed) = Self::distribute_if_2(&simplified[0], &simplified[1], |x, y| Self::Equals(vec![x, y])) {
+                return pushed.simplify();
             }
         }
 
@@ -4846,8 +5023,190 @@ impl SymOp {
         }
     }
 
+    /// Does this formula denote a boolean? Conservative: `false` means
+    /// "unknown", not "not a boolean".
+    fn looks_boolean(&self) -> bool {
+        match self {
+            Self::Constant(Value::Bool(_))
+            | Self::Variable(Sym::Bool(_))
+            | Self::And(..) | Self::Or(..) | Self::Not(..)
+            | Self::Greater(..) | Self::Geq(..) | Self::Leq(..) | Self::Less(..)
+            | Self::Equals(..)
+            | Self::IsOkay(..) | Self::IsErr(..) | Self::IsSome(..) | Self::IsNone(..)
+            | Self::IsStandard(..) => true,
+            Self::LoadedDataVariable(_, op) => op.looks_boolean(),
+            Self::If(_, a, b) => a.looks_boolean() || b.looks_boolean(),
+            Self::Named(_, def) => def.looks_boolean(),
+            _ => false,
+        }
+    }
+
+    /// Is this formula small enough to copy into each branch of an `If` it is
+    /// compared against? Constants, symbols, and field reads of those.
+    fn is_atomic(&self) -> bool {
+        match self {
+            Self::Constant(..) | Self::Variable(..) | Self::Named(..) | Self::FetchVar(..) | Self::GetTokenSupply(..) => true,
+            Self::LoadedDataVariable(_, op)
+            | Self::TupleGet(_, op)
+            | Self::UnwrapPanic(op)
+            | Self::UnwrapErrPanic(op)
+            | Self::ToInt(op)
+            | Self::ToUInt(op)
+            | Self::Len(op) => op.is_atomic(),
+            Self::LoadedMapEntry(_, key, val) => key.is_atomic() && val.as_ref().map(|v| v.is_atomic()).unwrap_or(true),
+            _ => false,
+        }
+    }
+
+    /// The static type of this formula, when it can be read off its shape.
+    fn static_type(&self) -> Option<TypeSignature> {
+        match self {
+            Self::Constant(v) => TypeSignature::type_of(v).ok(),
+            Self::Variable(s) => Some(s.type_sig()),
+            Self::Named(_, def) => def.static_type(),
+            Self::LoadedDataVariable(_, op) => op.static_type(),
+            Self::LoadedMapEntry(_, _, Some(op)) => op.static_type(),
+            Self::UnwrapPanic(op) => match op.static_type()? {
+                TypeSignature::OptionalType(t) => Some(*t),
+                TypeSignature::ResponseType(okerr) => Some(okerr.0),
+                _ => None,
+            },
+            Self::UnwrapErrPanic(op) => match op.static_type()? {
+                TypeSignature::ResponseType(okerr) => Some(okerr.1),
+                _ => None,
+            },
+            Self::ConsSome(op) => Some(TypeSignature::OptionalType(Box::new(op.static_type()?))),
+            Self::TupleGet(name, op) => match op.static_type()? {
+                TypeSignature::TupleType(t) => t.field_type(name).cloned(),
+                _ => None,
+            },
+            Self::TupleCons(fields) => {
+                let mut typed = vec![];
+                for (name, op) in fields.iter() {
+                    typed.push((name.clone(), op.static_type()?));
+                }
+                TupleTypeSignature::try_from(typed).ok().map(TypeSignature::TupleType)
+            },
+            Self::If(_, a, b) => a.static_type().or_else(|| b.static_type()),
+            _ => None,
+        }
+    }
+
+    /// `(if c a b)`.
+    ///   - a constant or negated condition picks or swaps the branches;
+    ///   - equal branches collapse;
+    ///   - a branch that tests the same condition again keeps only its
+    ///     reachable half;
+    ///   - a boolean `if` becomes `(or (and c a) (and (not c) b))`, so the
+    ///     propositional machinery sees through it;
+    ///   - an `if` over two constructors of the same shape (tuples with the
+    ///     same fields, `some`/`ok`/`err`) is pushed into the constructor, so
+    ///     the fields that both branches agree on come out of the `if`.
+    fn simplify_if(cond: SymOp, a: SymOp, b: SymOp) -> Result<SymOp, Error> {
+        let cond = cond.simplify()?;
+        if cond == Self::True() {
+            return a.simplify();
+        }
+        if cond == Self::False() {
+            return b.simplify();
+        }
+        if let Self::Not(inner) = cond {
+            return Self::simplify_if(*inner, b, a);
+        }
+        let a = match a.simplify()? {
+            Self::If(c2, a2, _) if *c2 == cond => *a2,
+            x => x,
+        };
+        let b = match b.simplify()? {
+            Self::If(c2, _, b2) if *c2 == cond => *b2,
+            x => x,
+        };
+        if a == b {
+            return Ok(a);
+        }
+        // A panic only ever lands in a branch of an `If` when a destructor
+        // was pushed through it, and the evaluator forks on a destructor
+        // before it applies it: the continuation that holds this value is
+        // the one where the destructor succeeded, so the panicking branch is
+        // the one its predicate rules out.
+        if a == Self::Panic {
+            return Ok(b);
+        }
+        if b == Self::Panic {
+            return Ok(a);
+        }
+        if a.looks_boolean() || b.looks_boolean() {
+            let not_cond = Self::Not(Box::new(cond.clone()));
+            return Self::Or(vec![
+                Box::new(Self::And(vec![Box::new(cond), Box::new(a)])),
+                Box::new(Self::And(vec![Box::new(not_cond), Box::new(b)])),
+            ]).simplify();
+        }
+        match (a, b) {
+            (Self::ConsSome(x), Self::ConsSome(y)) => Ok(Self::ConsSome(Box::new(Self::If(Box::new(cond), x, y).simplify()?))),
+            (Self::ConsOkay(x), Self::ConsOkay(y)) => Ok(Self::ConsOkay(Box::new(Self::If(Box::new(cond), x, y).simplify()?))),
+            (Self::ConsError(x), Self::ConsError(y)) => Ok(Self::ConsError(Box::new(Self::If(Box::new(cond), x, y).simplify()?))),
+            (a, b) if Self::is_tuple_cons(&a) && Self::is_tuple_cons(&b) => {
+                let fa : BTreeMap<_, _> = Self::tuple_cons_fields(a).map_err(|_| Error::Bug("checked constructor".into()))?.into_iter().collect();
+                let mut fb : BTreeMap<_, _> = Self::tuple_cons_fields(b).map_err(|_| Error::Bug("checked constructor".into()))?.into_iter().collect();
+                if fa.len() != fb.len() || !fa.keys().all(|k| fb.contains_key(k)) {
+                    let a = Self::TupleCons(fa.into_iter().collect());
+                    let b = Self::TupleCons(fb.into_iter().collect());
+                    return Ok(Self::If(Box::new(cond), Box::new(a), Box::new(b)));
+                }
+                let mut fields = vec![];
+                for (name, va) in fa.into_iter() {
+                    let vb = fb.remove(&name).expect("checked key");
+                    fields.push((name, Box::new(Self::If(Box::new(cond.clone()), va, vb).simplify()?)));
+                }
+                Ok(Self::TupleCons(fields))
+            },
+            (a, b) => Ok(Self::If(Box::new(cond), Box::new(a), Box::new(b))),
+        }
+    }
+
+    /// Push a unary operator into the branches of an `If` operand:
+    /// `(op (if c a b))` is `(if c (op a) (op b))`. Size-preserving, and it
+    /// lets `(unwrap-panic (if c (some x) (some y)))` become `(if c x y)`.
+    fn distribute_if_1<F>(op: SymOp, cons: F) -> Result<SymOp, Error>
+    where
+        F: Fn(Box<SymOp>) -> SymOp
+    {
+        match op {
+            Self::If(c, a, b) => Self::If(c, Box::new(cons(a)), Box::new(cons(b))).simplify(),
+            op => Ok(cons(Box::new(op))),
+        }
+    }
+
+    /// Push a binary operator into the branches of an `If` operand when the
+    /// other operand is cheap to copy, or when both operands branch on the
+    /// same condition. `None` when neither applies.
+    fn distribute_if_2<F>(x: &SymOp, y: &SymOp, cons: F) -> Option<SymOp>
+    where
+        F: Fn(Box<SymOp>, Box<SymOp>) -> SymOp
+    {
+        match (x, y) {
+            (Self::If(c1, a1, b1), Self::If(c2, a2, b2)) if c1 == c2 => {
+                Some(Self::If(c1.clone(), Box::new(cons(a1.clone(), a2.clone())), Box::new(cons(b1.clone(), b2.clone()))))
+            },
+            (Self::If(c, a, b), y) if y.is_atomic() => {
+                Some(Self::If(c.clone(), Box::new(cons(a.clone(), Box::new(y.clone()))), Box::new(cons(b.clone(), Box::new(y.clone())))))
+            },
+            (x, Self::If(c, a, b)) if x.is_atomic() => {
+                Some(Self::If(c.clone(), Box::new(cons(Box::new(x.clone()), a.clone())), Box::new(cons(Box::new(x.clone()), b.clone()))))
+            },
+            _ => None,
+        }
+    }
+
     fn simplify_tuple_get(name: ClarityName, op: SymOp) -> Result<SymOp, Error> {
         match op {
+            Self::Named(n, def) => {
+                Self::project_named(&format!("get {name}"), n, &def, |d| Self::TupleGet(name, d))
+            },
+            Self::If(c, a, b) => {
+                Self::If(c, Box::new(Self::TupleGet(name.clone(), a)), Box::new(Self::TupleGet(name, b))).simplify()
+            },
             Self::Constant(..)
             | Self::TupleCons(..)
             | Self::TupleMerge(..)
@@ -4958,6 +5317,7 @@ impl SymOp {
         match symop {
             Self::Constant(v) => Ok(Self::Constant(v)),
             Self::Variable(v) => Ok(Self::Variable(v)),
+            Self::Named(n, def) => Ok(Self::Named(n, def)),
             Self::LoadedDataVariable(name, op) => {
                 let simplified = op.clone().simplify()?;
                 if let Self::Constant(v) = simplified {
@@ -5155,6 +5515,9 @@ impl SymOp {
                 // TODO: term-gathering
                 let op = Self::simplify_native_2args(">", x, y, |x, y| Self::Greater(x, y))?;
                 if let Self::Greater(x, y) = op {
+                    if let Some(pushed) = Self::distribute_if_2(&x, &y, |x, y| Self::Greater(x, y)) {
+                        return pushed.simplify();
+                    }
                     // Cancel terms common to both sides (sound because
                     // Clarity's `+` aborts on overflow rather than wrapping),
                     // then re-simplify.
@@ -5181,6 +5544,9 @@ impl SymOp {
                 // TODO: term-gathering
                 let op = Self::simplify_native_2args(">=", x, y, |x, y| Self::Geq(x, y))?;
                 if let Self::Geq(x, y) = op {
+                    if let Some(pushed) = Self::distribute_if_2(&x, &y, |x, y| Self::Geq(x, y)) {
+                        return pushed.simplify();
+                    }
                     // Cancel terms common to both sides (sound because
                     // Clarity's `+` aborts on overflow rather than wrapping),
                     // then re-simplify.
@@ -5210,6 +5576,9 @@ impl SymOp {
                 // TODO: term-gathering
                 let op = Self::simplify_native_2args("<=", x, y, |x, y| Self::Leq(x, y))?;
                 if let Self::Leq(x, y) = op {
+                    if let Some(pushed) = Self::distribute_if_2(&x, &y, |x, y| Self::Leq(x, y)) {
+                        return pushed.simplify();
+                    }
                     // Cancel terms common to both sides (sound because
                     // Clarity's `+` aborts on overflow rather than wrapping),
                     // then re-simplify.
@@ -5236,6 +5605,9 @@ impl SymOp {
                 // TODO: term-gathering
                 let op = Self::simplify_native_2args("<", x, y, |x, y| Self::Less(x, y))?;
                 if let Self::Less(x, y) = op {
+                    if let Some(pushed) = Self::distribute_if_2(&x, &y, |x, y| Self::Less(x, y)) {
+                        return pushed.simplify();
+                    }
                     // Cancel terms common to both sides (sound because
                     // Clarity's `+` aborts on overflow rather than wrapping),
                     // then re-simplify.
@@ -5547,9 +5919,34 @@ impl SymOp {
                         }
                         Ok(Self::TupleMerge(inner_base, Box::new(Self::TupleCons(merged.into_iter().collect()))))
                     },
+                    // `(merge (if c a b) src)` is `(if c (merge a src) (merge b src))`
+                    (Self::If(c, a, b), src) => {
+                        Self::If(c, Box::new(Self::TupleMerge(a, Box::new(src.clone()))), Box::new(Self::TupleMerge(b, Box::new(src)))).simplify()
+                    },
+                    // When paths are joined, a merge into a record of known
+                    // type is written out as a constructor: the fields `src`
+                    // sets, and a read of `base` for each of the rest. Joined
+                    // records then push their `if` into the fields, and the
+                    // fields the branches agree on stay flat.
+                    (base, src) if join_paths() && Self::is_tuple_cons(&src) => {
+                        let Some(TypeSignature::TupleType(ttype)) = base.static_type() else {
+                            return Ok(Self::TupleMerge(Box::new(base), Box::new(src)));
+                        };
+                        let src_fields : BTreeMap<_, _> = Self::tuple_cons_fields(src).map_err(|_| Error::Bug("checked constructor".into()))?.into_iter().collect();
+                        let mut fields = vec![];
+                        for name in ttype.get_type_map().keys() {
+                            let value = match src_fields.get(name) {
+                                Some(v) => v.clone(),
+                                None => Box::new(Self::TupleGet(name.clone(), Box::new(base.clone())).simplify()?),
+                            };
+                            fields.push((name.clone(), value));
+                        }
+                        Ok(Self::TupleCons(fields))
+                    },
                     (x, y) => Ok(Self::TupleMerge(Box::new(x), Box::new(y)))
                 }
             }
+            Self::If(c, a, b) => Self::simplify_if(*c, *a, *b),
             Self::Hash160(op) => {
                 Self::simplify_native_1arg("hash160", op, |x| Self::Hash160(x))
             }
@@ -5580,6 +5977,8 @@ impl SymOp {
             Self::GetBurnBlockInfo(prop, op) => Ok(Self::GetBurnBlockInfo(prop, Box::new(op.simplify()?))),
             Self::IsOkay(op) => {
                 match op.simplify()? {
+                    Self::Named(n, def) => Self::project_named("is-ok", n, &def, |d| Self::IsOkay(d)),
+                    Self::If(c, a, b) => Self::If(c, Box::new(Self::IsOkay(a)), Box::new(Self::IsOkay(b))).simplify(),
                     Self::ConsError(_inner) => {
                         // this can wholesale be converted to False
                         Ok(Self::False())
@@ -5595,6 +5994,8 @@ impl SymOp {
             }
             Self::IsErr(op) => {
                 match op.simplify()? {
+                    Self::Named(n, def) => Self::project_named("is-err", n, &def, |d| Self::IsErr(d)),
+                    Self::If(c, a, b) => Self::If(c, Box::new(Self::IsErr(a)), Box::new(Self::IsErr(b))).simplify(),
                     Self::ConsError(_inner) => {
                         // this can wholesale be converted to True
                         Ok(Self::True())
@@ -5610,6 +6011,8 @@ impl SymOp {
             }
             Self::IsSome(op) => {
                 match op.simplify()? {
+                    Self::Named(n, def) => Self::project_named("is-some", n, &def, |d| Self::IsSome(d)),
+                    Self::If(c, a, b) => Self::If(c, Box::new(Self::IsSome(a)), Box::new(Self::IsSome(b))).simplify(),
                     x if x == Self::none() => {
                         // this can wholesale be converted to False
                         Ok(Self::False())
@@ -5625,6 +6028,8 @@ impl SymOp {
             }
             Self::IsNone(op) => {
                 match op.simplify()? {
+                    Self::Named(n, def) => Self::project_named("is-none", n, &def, |d| Self::IsNone(d)),
+                    Self::If(c, a, b) => Self::If(c, Box::new(Self::IsNone(a)), Box::new(Self::IsNone(b))).simplify(),
                     Self::ConsSome(..) => {
                         // this can wholesale be converted to False
                         Ok(Self::False())
@@ -5636,6 +6041,8 @@ impl SymOp {
             }
             Self::UnwrapPanic(op) => {
                 match op.simplify()? {
+                    Self::Named(n, def) => Self::project_named("unwrap-panic", n, &def, |d| Self::UnwrapPanic(d)),
+                    Self::If(c, a, b) => Self::If(c, Box::new(Self::UnwrapPanic(a)), Box::new(Self::UnwrapPanic(b))).simplify(),
                     Self::ConsOkay(inner) => {
                         Ok(*inner)
                     }
@@ -5663,6 +6070,8 @@ impl SymOp {
             }
             Self::UnwrapErrPanic(op) => {
                 match op.simplify()? {
+                    Self::Named(n, def) => Self::project_named("unwrap-err-panic", n, &def, |d| Self::UnwrapErrPanic(d)),
+                    Self::If(c, a, b) => Self::If(c, Box::new(Self::UnwrapErrPanic(a)), Box::new(Self::UnwrapErrPanic(b))).simplify(),
                     Self::ConsOkay(..) => {
                         Ok(Self::Panic)
                     }
@@ -5818,18 +6227,82 @@ impl SymOp {
         Ok(cur)
     }
 
-    fn bind_symbol_in_list(ops: Vec<Box<SymOp>>, sym_id: SymId, symop: SymOp) -> Vec<Box<SymOp>> {
+    /// A name for `def`, when `def` is big enough that copying it around
+    /// would cost more than looking through the name; `def` itself
+    /// otherwise, so that small formulas stay visible to the simplifier.
+    pub fn named(def: SymOp) -> SymOp {
+        if matches!(def, Self::Named(..)) || def.to_string().len() <= NAME_THRESHOLD {
+            return def;
+        }
+        Self::Named(fingerprint(&def), NamedDef(Rc::new(def)))
+    }
+
+    /// Name the big formulas under this one's shape. An `if`, a tuple, and
+    /// the `some`/`ok`/`err` constructors stay visible, so destructors and
+    /// the simplifier still see them; what they hold gets named if big.
+    pub fn name_leaves(self) -> SymOp {
+        match self {
+            Self::If(c, a, b) => Self::If(Box::new(Self::named(*c)), Box::new(a.name_leaves()), Box::new(b.name_leaves())),
+            Self::TupleCons(fields) => Self::TupleCons(fields.into_iter().map(|(n, op)| (n, Box::new(op.name_leaves()))).collect()),
+            Self::ConsSome(op) => Self::ConsSome(Box::new(op.name_leaves())),
+            Self::ConsOkay(op) => Self::ConsOkay(Box::new(op.name_leaves())),
+            Self::ConsError(op) => Self::ConsError(Box::new(op.name_leaves())),
+            other => Self::named(other),
+        }
+    }
+
+    /// Rewrite the definition of a named formula with `rewrite`, once per
+    /// rewrite pass however many times the name is used. A definition the
+    /// rewrite leaves alone keeps its name; one it changes is simplified
+    /// and named afresh -- or inlined, if it has become small.
+    fn rewrite_named<F: FnOnce(SymOp) -> SymOp>(n: (u64, u64), def: NamedDef, rewrite: F) -> SymOp {
+        if let Some(done) = RewritePass::lookup(n) {
+            return done;
+        }
+        let new_def = rewrite((*def).clone());
+        let out = if new_def == *def {
+            Self::Named(n, def)
+        }
+        else {
+            let new_def = new_def.clone().simplify().unwrap_or(new_def);
+            Self::named(new_def)
+        };
+        RewritePass::record(n, out.clone());
+        out
+    }
+
+    /// Apply a destructor (`get`, `unwrap-panic`, `is-some`, ..) to a named
+    /// formula by looking through the name: the destructor is applied to the
+    /// definition and simplified, and the result named afresh if it is still
+    /// big. Memoized per destructor and name, so a name used many times over
+    /// -- an argument a callee body mentions at every turn -- is looked
+    /// through once.
+    fn project_named<F>(tag: &str, n: (u64, u64), def: &NamedDef, cons: F) -> Result<SymOp, Error>
+    where
+        F: FnOnce(Box<SymOp>) -> SymOp
+    {
+        let key = (tag.to_string(), n);
+        if let Some(hit) = PROJECTIONS.with(|m| m.borrow().get(&key).cloned()) {
+            return Ok(hit);
+        }
+        let out = Self::named(cons(Box::new((**def).clone())).simplify()?);
+        PROJECTIONS.with(|m| m.borrow_mut().insert(key, out.clone()));
+        Ok(out)
+    }
+
+    fn bind_symbol_in_list(ops: Vec<Box<SymOp>>, sym_id: &SymId, symop: &SymOp) -> Vec<Box<SymOp>> {
         let mut new = vec![];
         for op in ops.into_iter() {
-            let new_op = op.bind_symbol(sym_id.clone(), symop.clone());
+            let new_op = op.bind_symbol(sym_id, symop);
             new.push(new_op);
         }
         new
     }
 
     /// Bind a formula to a symbol in this symop
-    pub fn bind_symbol(self, sym_id: SymId, symop: SymOp) -> Box<SymOp> {
+    pub fn bind_symbol(self, sym_id: &SymId, symop: &SymOp) -> Box<SymOp> {
         debug!("Bind symbol '{sym_id}' to {symop} in {self}");
+        let _pass = RewritePass::enter();
         let op = match self {
             Self::Constant(v) => Self::Constant(v),
             Self::Variable(v) => {
@@ -5837,9 +6310,10 @@ impl SymOp {
                     Self::Variable(v)
                 }
                 else {
-                    symop
+                    symop.clone()
                 }
             }
+            Self::Named(n, def) => Self::rewrite_named(n, def, |d| *d.bind_symbol(sym_id, symop)),
             Self::LoadedDataVariable(name, op) => Self::LoadedDataVariable(name, op.bind_symbol(sym_id, symop)),
             Self::Add(ops) => Self::Add(Self::bind_symbol_in_list(ops, sym_id, symop)),
             Self::Subtract(ops) => Self::Subtract(Self::bind_symbol_in_list(ops, sym_id, symop)),
@@ -5847,24 +6321,24 @@ impl SymOp {
             Self::Divide(ops) => Self::Divide(Self::bind_symbol_in_list(ops, sym_id, symop)),
             Self::ToInt(op) => Self::ToInt(op.bind_symbol(sym_id, symop)),
             Self::ToUInt(op) => Self::ToUInt(op.bind_symbol(sym_id, symop)),
-            Self::Modulo(op1, op2) => Self::Modulo(op1.bind_symbol(sym_id.clone(), symop.clone()), op2.bind_symbol(sym_id.clone(), symop.clone())),
-            Self::Power(base_op, exp_op) => Self::Power(base_op.bind_symbol(sym_id.clone(), symop.clone()), exp_op.bind_symbol(sym_id.clone(), symop.clone())),
+            Self::Modulo(op1, op2) => Self::Modulo(op1.bind_symbol(sym_id, symop), op2.bind_symbol(sym_id, symop)),
+            Self::Power(base_op, exp_op) => Self::Power(base_op.bind_symbol(sym_id, symop), exp_op.bind_symbol(sym_id, symop)),
             Self::Sqrti(op) => Self::Sqrti(op.bind_symbol(sym_id, symop)),
             Self::Log2(op) => Self::Log2(op.bind_symbol(sym_id, symop)),
             Self::And(ops) => Self::And(Self::bind_symbol_in_list(ops, sym_id, symop)),
             Self::Or(ops) => Self::Or(Self::bind_symbol_in_list(ops, sym_id, symop)),
             Self::Not(op) => Self::Not(op.bind_symbol(sym_id, symop)),
-            Self::Greater(x, y) => Self::Greater(x.bind_symbol(sym_id.clone(), symop.clone()), y.bind_symbol(sym_id.clone(), symop.clone())),
-            Self::Geq(x, y) => Self::Geq(x.bind_symbol(sym_id.clone(), symop.clone()), y.bind_symbol(sym_id.clone(), symop.clone())),
+            Self::Greater(x, y) => Self::Greater(x.bind_symbol(sym_id, symop), y.bind_symbol(sym_id, symop)),
+            Self::Geq(x, y) => Self::Geq(x.bind_symbol(sym_id, symop), y.bind_symbol(sym_id, symop)),
             Self::Equals(ops) => Self::Equals(Self::bind_symbol_in_list(ops, sym_id, symop)),
-            Self::Leq(x, y) => Self::Leq(x.bind_symbol(sym_id.clone(), symop.clone()), y.bind_symbol(sym_id.clone(), symop.clone())),
-            Self::Less(x, y) => Self::Less(x.bind_symbol(sym_id.clone(), symop.clone()), y.bind_symbol(sym_id.clone(), symop.clone())),
-            Self::Append(list_op, val_op) => Self::Append(list_op.bind_symbol(sym_id.clone(), symop.clone()), val_op.bind_symbol(sym_id.clone(), symop.clone())),
+            Self::Leq(x, y) => Self::Leq(x.bind_symbol(sym_id, symop), y.bind_symbol(sym_id, symop)),
+            Self::Less(x, y) => Self::Less(x.bind_symbol(sym_id, symop), y.bind_symbol(sym_id, symop)),
+            Self::Append(list_op, val_op) => Self::Append(list_op.bind_symbol(sym_id, symop), val_op.bind_symbol(sym_id, symop)),
             Self::Concat(ops) => Self::Concat(Self::bind_symbol_in_list(ops, sym_id, symop)),
-            Self::AsMaxLen(op1, op2) => Self::AsMaxLen(op1.bind_symbol(sym_id.clone(), symop.clone()), op2.bind_symbol(sym_id.clone(), symop.clone())),
+            Self::AsMaxLen(op1, op2) => Self::AsMaxLen(op1.bind_symbol(sym_id, symop), op2.bind_symbol(sym_id, symop)),
             Self::Len(op) => Self::Len(op.bind_symbol(sym_id, symop)),
-            Self::ElementAt(op1, op2) => Self::ElementAt(op1.bind_symbol(sym_id.clone(), symop.clone()), op2.bind_symbol(sym_id.clone(), symop.clone())),
-            Self::IndexOf(op1, op2) => Self::IndexOf(op1.bind_symbol(sym_id.clone(), symop.clone()), op2.bind_symbol(sym_id.clone(), symop.clone())),
+            Self::ElementAt(op1, op2) => Self::ElementAt(op1.bind_symbol(sym_id, symop), op2.bind_symbol(sym_id, symop)),
+            Self::IndexOf(op1, op2) => Self::IndexOf(op1.bind_symbol(sym_id, symop), op2.bind_symbol(sym_id, symop)),
             Self::BuffToIntLe(op) => Self::BuffToIntLe(op.bind_symbol(sym_id, symop)),
             Self::BuffToUIntLe(op) => Self::BuffToUIntLe(op.bind_symbol(sym_id, symop)),
             Self::BuffToIntBe(op) => Self::BuffToIntBe(op.bind_symbol(sym_id, symop)),
@@ -5873,12 +6347,12 @@ impl SymOp {
             Self::PrincipalDestruct(op) => Self::PrincipalDestruct(op.bind_symbol(sym_id, symop)),
             Self::PrincipalConstruct(op1, op2, op3_opt) => {
                 let new_op3_opt = if let Some(op3) = op3_opt {
-                    Some(op3.bind_symbol(sym_id.clone(), symop.clone()))
+                    Some(op3.bind_symbol(sym_id, symop))
                 }
                 else {
                     None
                 };
-                Self::PrincipalConstruct(op1.bind_symbol(sym_id.clone(), symop.clone()), op2.bind_symbol(sym_id.clone(), symop.clone()), new_op3_opt)
+                Self::PrincipalConstruct(op1.bind_symbol(sym_id, symop), op2.bind_symbol(sym_id, symop), new_op3_opt)
             },
             Self::StringToInt(op) => Self::StringToInt(op.bind_symbol(sym_id, symop)),
             Self::StringToUInt(op) => Self::StringToUInt(op.bind_symbol(sym_id, symop)),
@@ -5890,33 +6364,34 @@ impl SymOp {
             Self::FetchEntry(name, op) => Self::FetchEntry(name, op.bind_symbol(sym_id, symop)),
             Self::LoadedMapEntry(name, key_op, value_op_opt) => {
                 let new_value_op_opt = if let Some(op) = value_op_opt {
-                    Some(op.bind_symbol(sym_id.clone(), symop.clone()))
+                    Some(op.bind_symbol(sym_id, symop))
                 }
                 else {
                     None
                 };
                 Self::LoadedMapEntry(name, key_op.bind_symbol(sym_id, symop), new_value_op_opt)
             }
-            Self::SetEntry(name, op1, op2) => Self::SetEntry(name, op1.bind_symbol(sym_id.clone(), symop.clone()), op2.bind_symbol(sym_id.clone(), symop.clone())),
-            Self::InsertEntry(name, op1, op2) => Self::InsertEntry(name, op1.bind_symbol(sym_id.clone(), symop.clone()), op2.bind_symbol(sym_id.clone(), symop.clone())),
+            Self::SetEntry(name, op1, op2) => Self::SetEntry(name, op1.bind_symbol(sym_id, symop), op2.bind_symbol(sym_id, symop)),
+            Self::InsertEntry(name, op1, op2) => Self::InsertEntry(name, op1.bind_symbol(sym_id, symop), op2.bind_symbol(sym_id, symop)),
             Self::DeleteEntry(name, op) => Self::DeleteEntry(name, op.bind_symbol(sym_id, symop)),
             Self::TupleCons(fields) => {
                 let mut new_fields = vec![];
                 for (key, value) in fields.into_iter() {
-                    let new_value = value.bind_symbol(sym_id.clone(), symop.clone());
+                    let new_value = value.bind_symbol(sym_id, symop);
                     new_fields.push((key, new_value));
                 }
                 Self::TupleCons(new_fields)
             }
             Self::TupleGet(name, op) => Self::TupleGet(name, op.bind_symbol(sym_id, symop)),
-            Self::TupleMerge(op1, op2) => Self::TupleMerge(op1.bind_symbol(sym_id.clone(), symop.clone()), op2.bind_symbol(sym_id.clone(), symop.clone())),
+            Self::TupleMerge(op1, op2) => Self::TupleMerge(op1.bind_symbol(sym_id, symop), op2.bind_symbol(sym_id, symop)),
+            Self::If(c, a, b) => Self::If(c.bind_symbol(sym_id, symop), a.bind_symbol(sym_id, symop), b.bind_symbol(sym_id, symop)),
             Self::Hash160(op) => Self::Hash160(op.bind_symbol(sym_id, symop)),
             Self::Sha256(op) => Self::Sha256(op.bind_symbol(sym_id, symop)),
             Self::Sha512(op) => Self::Sha512(op.bind_symbol(sym_id, symop)),
             Self::Sha512Trunc256(op) => Self::Sha512Trunc256(op.bind_symbol(sym_id, symop)),
             Self::Keccak256(op) => Self::Keccak256(op.bind_symbol(sym_id, symop)),
-            Self::Secp256k1Recover(op1, op2) => Self::Secp256k1Recover(op1.bind_symbol(sym_id.clone(), symop.clone()), op2.bind_symbol(sym_id.clone(), symop.clone())),
-            Self::Secp256k1Verify(op1, op2, op3) => Self::Secp256k1Verify(op1.bind_symbol(sym_id.clone(), symop.clone()), op2.bind_symbol(sym_id.clone(), symop.clone()), op3.bind_symbol(sym_id.clone(), symop.clone())),
+            Self::Secp256k1Recover(op1, op2) => Self::Secp256k1Recover(op1.bind_symbol(sym_id, symop), op2.bind_symbol(sym_id, symop)),
+            Self::Secp256k1Verify(op1, op2, op3) => Self::Secp256k1Verify(op1.bind_symbol(sym_id, symop), op2.bind_symbol(sym_id, symop), op3.bind_symbol(sym_id, symop)),
             Self::ContractOf(op1) => Self::ContractOf(op1.bind_symbol(sym_id, symop)),
             Self::PrincipalOf(op1) => Self::PrincipalOf(op1.bind_symbol(sym_id, symop)),
             Self::GetBurnBlockInfo(prop, op) => Self::GetBurnBlockInfo(prop, op.bind_symbol(sym_id, symop)),
@@ -5931,56 +6406,56 @@ impl SymOp {
             Self::ConsSome(op) => Self::ConsSome(op.bind_symbol(sym_id, symop)),
             Self::GetTokenBalance(name, op) => Self::GetTokenBalance(name, op.bind_symbol(sym_id, symop)),
             Self::GetNftOwner(name, op) => Self::GetNftOwner(name, op.bind_symbol(sym_id, symop)),
-            Self::TransferToken(name, op1, op2, op3) => Self::TransferToken(name, op1.bind_symbol(sym_id.clone(), symop.clone()), op2.bind_symbol(sym_id.clone(), symop.clone()), op3.bind_symbol(sym_id.clone(), symop.clone())),
-            Self::TransferNft(name, op1, op2, op3) => Self::TransferNft(name, op1.bind_symbol(sym_id.clone(), symop.clone()), op2.bind_symbol(sym_id.clone(), symop.clone()), op3.bind_symbol(sym_id.clone(), symop.clone())),
-            Self::MintToken(name, op1, op2) => Self::MintToken(name, op1.bind_symbol(sym_id.clone(), symop.clone()), op2.bind_symbol(sym_id.clone(), symop.clone())),
-            Self::MintNft(name, op1, op2) => Self::MintNft(name, op1.bind_symbol(sym_id.clone(), symop.clone()), op2.bind_symbol(sym_id.clone(), symop.clone())),
+            Self::TransferToken(name, op1, op2, op3) => Self::TransferToken(name, op1.bind_symbol(sym_id, symop), op2.bind_symbol(sym_id, symop), op3.bind_symbol(sym_id, symop)),
+            Self::TransferNft(name, op1, op2, op3) => Self::TransferNft(name, op1.bind_symbol(sym_id, symop), op2.bind_symbol(sym_id, symop), op3.bind_symbol(sym_id, symop)),
+            Self::MintToken(name, op1, op2) => Self::MintToken(name, op1.bind_symbol(sym_id, symop), op2.bind_symbol(sym_id, symop)),
+            Self::MintNft(name, op1, op2) => Self::MintNft(name, op1.bind_symbol(sym_id, symop), op2.bind_symbol(sym_id, symop)),
             Self::GetTokenSupply(name) => Self::GetTokenSupply(name),
             Self::BurnToken(name, op) => Self::BurnToken(name, op.bind_symbol(sym_id, symop)),
-            Self::BurnNft(name, op1, op2) => Self::BurnNft(name, op1.bind_symbol(sym_id.clone(), symop.clone()), op2.bind_symbol(sym_id.clone(), symop.clone())),
+            Self::BurnNft(name, op1, op2) => Self::BurnNft(name, op1.bind_symbol(sym_id, symop), op2.bind_symbol(sym_id, symop)),
             Self::GetStxBalance(op) => Self::GetStxBalance(op.bind_symbol(sym_id, symop)),
-            Self::StxTransfer(op1, op2, op3) => Self::StxTransfer(op1.bind_symbol(sym_id.clone(), symop.clone()), op2.bind_symbol(sym_id.clone(), symop.clone()), op3.bind_symbol(sym_id.clone(), symop.clone())),
-            Self::StxTransferMemo(op1, op2, op3, op4) => Self::StxTransferMemo(op1.bind_symbol(sym_id.clone(), symop.clone()), op2.bind_symbol(sym_id.clone(), symop.clone()), op3.bind_symbol(sym_id.clone(), symop.clone()), op4.bind_symbol(sym_id.clone(), symop.clone())),
+            Self::StxTransfer(op1, op2, op3) => Self::StxTransfer(op1.bind_symbol(sym_id, symop), op2.bind_symbol(sym_id, symop), op3.bind_symbol(sym_id, symop)),
+            Self::StxTransferMemo(op1, op2, op3, op4) => Self::StxTransferMemo(op1.bind_symbol(sym_id, symop), op2.bind_symbol(sym_id, symop), op3.bind_symbol(sym_id, symop), op4.bind_symbol(sym_id, symop)),
             Self::StxBurn(op1) => Self::StxBurn(op1.bind_symbol(sym_id, symop)),
             Self::StxGetAccount(op1) => Self::StxGetAccount(op1.bind_symbol(sym_id, symop)),
             Self::BitwiseAnd(ops) => Self::BitwiseAnd(Self::bind_symbol_in_list(ops, sym_id, symop)),
             Self::BitwiseOr(ops) => Self::BitwiseOr(Self::bind_symbol_in_list(ops, sym_id, symop)),
             Self::BitwiseXor(ops) => Self::BitwiseXor(Self::bind_symbol_in_list(ops, sym_id, symop)),
             Self::BitwiseNot(op) => Self::BitwiseNot(op.bind_symbol(sym_id, symop)),
-            Self::BitwiseLShift(op1, op2) => Self::BitwiseLShift(op1.bind_symbol(sym_id.clone(), symop.clone()), op2.bind_symbol(sym_id.clone(), symop.clone())),
-            Self::BitwiseRShift(op1, op2) => Self::BitwiseRShift(op1.bind_symbol(sym_id.clone(), symop.clone()), op2.bind_symbol(sym_id.clone(), symop.clone())),
-            Self::Slice(op1, op2, op3) => Self::Slice(op1.bind_symbol(sym_id.clone(), symop.clone()), op2.bind_symbol(sym_id.clone(), symop.clone()), op3.bind_symbol(sym_id.clone(), symop.clone())),
+            Self::BitwiseLShift(op1, op2) => Self::BitwiseLShift(op1.bind_symbol(sym_id, symop), op2.bind_symbol(sym_id, symop)),
+            Self::BitwiseRShift(op1, op2) => Self::BitwiseRShift(op1.bind_symbol(sym_id, symop), op2.bind_symbol(sym_id, symop)),
+            Self::Slice(op1, op2, op3) => Self::Slice(op1.bind_symbol(sym_id, symop), op2.bind_symbol(sym_id, symop), op3.bind_symbol(sym_id, symop)),
             Self::ToConsensusBuff(op) => Self::ToConsensusBuff(op.bind_symbol(sym_id, symop)),
             Self::FromConsensusBuff(ts, op) => Self::FromConsensusBuff(ts, op.bind_symbol(sym_id, symop)),
-            Self::ReplaceAt(op1, op2, op3) => Self::ReplaceAt(op1.bind_symbol(sym_id.clone(), symop.clone()), op2.bind_symbol(sym_id.clone(), symop.clone()), op3.bind_symbol(sym_id.clone(), symop.clone())),
+            Self::ReplaceAt(op1, op2, op3) => Self::ReplaceAt(op1.bind_symbol(sym_id, symop), op2.bind_symbol(sym_id, symop), op3.bind_symbol(sym_id, symop)),
             Self::GetStacksBlockInfo(name, op) => Self::GetStacksBlockInfo(name, op.bind_symbol(sym_id, symop)),
             Self::GetTenureInfo(name, op) => Self::GetTenureInfo(name, op.bind_symbol(sym_id, symop)),
             Self::ContractHash(op) => Self::ContractHash(op.bind_symbol(sym_id, symop)),
             Self::ToAscii(op) => Self::ToAscii(op.bind_symbol(sym_id, symop)),
-            Self::RestrictAssets(op1, op2, op3) => Self::RestrictAssets(op1.bind_symbol(sym_id.clone(), symop.clone()), op2.bind_symbol(sym_id.clone(), symop.clone()), op3.bind_symbol(sym_id.clone(), symop.clone())),
-            Self::AsContractSafe(op1, op2) => Self::AsContractSafe(op1.bind_symbol(sym_id.clone(), symop.clone()), op2.bind_symbol(sym_id.clone(), symop.clone())),
+            Self::RestrictAssets(op1, op2, op3) => Self::RestrictAssets(op1.bind_symbol(sym_id, symop), op2.bind_symbol(sym_id, symop), op3.bind_symbol(sym_id, symop)),
+            Self::AsContractSafe(op1, op2) => Self::AsContractSafe(op1.bind_symbol(sym_id, symop), op2.bind_symbol(sym_id, symop)),
             Self::AllowanceWithStx(op) => Self::AllowanceWithStx(op.bind_symbol(sym_id, symop)),
-            Self::AllowanceWithFt(op1, name, op2) => Self::AllowanceWithFt(op1.bind_symbol(sym_id.clone(), symop.clone()), name, op2.bind_symbol(sym_id.clone(), symop.clone())),
-            Self::AllowanceWithNft(op1, name, op2) => Self::AllowanceWithNft(op1.bind_symbol(sym_id.clone(), symop.clone()), name, op2.bind_symbol(sym_id.clone(), symop.clone())),
+            Self::AllowanceWithFt(op1, name, op2) => Self::AllowanceWithFt(op1.bind_symbol(sym_id, symop), name, op2.bind_symbol(sym_id, symop)),
+            Self::AllowanceWithNft(op1, name, op2) => Self::AllowanceWithNft(op1.bind_symbol(sym_id, symop), name, op2.bind_symbol(sym_id, symop)),
             Self::AllowanceWithStacking(op) => Self::AllowanceWithStacking(op.bind_symbol(sym_id, symop)),
             Self::AllowanceAll => Self::AllowanceAll,
-            Self::Secp256r1Verify(op1, op2, op3) => Self::Secp256r1Verify(op1.bind_symbol(sym_id.clone(), symop.clone()), op2.bind_symbol(sym_id.clone(), symop.clone()), op3.bind_symbol(sym_id.clone(), symop.clone())),
+            Self::Secp256r1Verify(op1, op2, op3) => Self::Secp256r1Verify(op1.bind_symbol(sym_id, symop), op2.bind_symbol(sym_id, symop), op3.bind_symbol(sym_id, symop)),
             Self::VerifyMerkleProof(op1, op2, op3, op4, op5) => Self::VerifyMerkleProof(
-                op1.bind_symbol(sym_id.clone(), symop.clone()),
-                op2.bind_symbol(sym_id.clone(), symop.clone()),
-                op3.bind_symbol(sym_id.clone(), symop.clone()),
-                op4.bind_symbol(sym_id.clone(), symop.clone()),
-                op5.bind_symbol(sym_id.clone(), symop.clone()),
+                op1.bind_symbol(sym_id, symop),
+                op2.bind_symbol(sym_id, symop),
+                op3.bind_symbol(sym_id, symop),
+                op4.bind_symbol(sym_id, symop),
+                op5.bind_symbol(sym_id, symop),
             ),
             Self::GetBitcoinTxOutput(op1, op2) => Self::GetBitcoinTxOutput(
-                op1.bind_symbol(sym_id.clone(), symop.clone()),
-                op2.bind_symbol(sym_id.clone(), symop.clone()),
+                op1.bind_symbol(sym_id, symop),
+                op2.bind_symbol(sym_id, symop),
             ),
             Self::Panic => Self::Panic,
             Self::FunctionCall(name, args) => {
                 let mut new_args = vec![];
                 for arg in args.into_iter() {
-                    let new_arg = arg.bind_symbol(sym_id.clone(), symop.clone());
+                    let new_arg = arg.bind_symbol(sym_id, symop);
                     new_args.push(new_arg);
                 }
                 Self::FunctionCall(name, new_args)
@@ -5989,82 +6464,106 @@ impl SymOp {
         Box::new(op)
     }
 
-    fn bind_loaded_vars_in_list(ops: Vec<Box<SymOp>>, subs: &HashMap<FullName, SymOp>) -> Vec<Box<SymOp>> {
-        ops.into_iter().map(|op| op.bind_loaded_vars(subs)).collect()
+
+
+
+    fn bind_env_in_list(ops: Vec<Box<SymOp>>, env: &CallEnv) -> Vec<Box<SymOp>> {
+        ops.into_iter().map(|op| op.bind_env(env)).collect()
     }
 
-    /// Simultaneously replace every read of each data var in `subs` -- a
-    /// `LoadedDataVariable(name, _)` node -- with its mapped formula, in one
-    /// pass (the replacements are not themselves rewritten, so vars that refer
-    /// to one another compose correctly). This is what lets a caller's current
-    /// value of a data var flow into a callee that reads it, and what composes
-    /// an invariant's reads onto a mutator's pre- or post-state. Mirrors
-    /// `bind_symbol`, but keys on the variable's fully-qualified name and
-    /// replaces the whole node rather than a leaf symbol.
-    fn bind_map_reads_in_list(ops: Vec<Box<SymOp>>, map_subs: &HashMap<FullName, HashMap<String, SymOp>>) -> Vec<Box<SymOp>> {
-        ops.into_iter().map(|op| op.bind_map_reads(map_subs)).collect()
+    /// A map key (or balance owner) after binding, simplified so that it
+    /// matches the caller's write by string form: `(get who arg)` of a bound
+    /// tuple argument reads as the field, not as the projection.
+    fn bound_key(key: Box<SymOp>) -> Box<SymOp> {
+        match key.clone().simplify() {
+            Ok(simple) => Box::new(simple),
+            Err(_) => key,
+        }
     }
 
-    /// Resolve a callee's map reads against the caller's map writes: a
-    /// `(map-get? m k)` for a key `k` the caller wrote becomes `(some value)`.
-    /// Keys are matched by their string form after this same pass has run on
-    /// them, so a key computed from a data var the caller set matches once the
-    /// var pass (`bind_loaded_vars`) has run first. The map analogue of
-    /// `bind_loaded_vars`.
-    pub fn bind_map_reads(self, map_subs: &HashMap<FullName, HashMap<String, SymOp>>) -> Box<SymOp> {
+    /// Bind a callee's formula into its caller's terms in one pass: the
+    /// callee's free symbols (its arguments and the globals), its data-var
+    /// reads and its map and balance reads are all replaced by the caller's
+    /// values at the call site, at once. One pass rather than one per kind,
+    /// because a value substituted in is already in the caller's terms: a
+    /// var read inside an argument is the caller's read, and must not be
+    /// resolved again against the caller's own writes. (Three passes in
+    /// sequence did exactly that, so a callee paid an amount it computed
+    /// from a record the caller had since overwritten.) Map keys are
+    /// matched by string form after binding and simplifying them, so a key
+    /// computed from an argument or a data var matches the caller's write.
+    pub fn bind_env(self, env: &CallEnv) -> Box<SymOp> {
+        let _pass = RewritePass::enter();
         let op = match self {
             Self::Constant(v) => Self::Constant(v),
-            Self::Variable(v) => Self::Variable(v),
-            Self::LoadedDataVariable(name, op) => Self::LoadedDataVariable(name, op.bind_map_reads(map_subs)),
-            Self::Add(ops) => Self::Add(Self::bind_map_reads_in_list(ops, map_subs)),
-            Self::Subtract(ops) => Self::Subtract(Self::bind_map_reads_in_list(ops, map_subs)),
-            Self::Multiply(ops) => Self::Multiply(Self::bind_map_reads_in_list(ops, map_subs)),
-            Self::Divide(ops) => Self::Divide(Self::bind_map_reads_in_list(ops, map_subs)),
-            Self::ToInt(op) => Self::ToInt(op.bind_map_reads(map_subs)),
-            Self::ToUInt(op) => Self::ToUInt(op.bind_map_reads(map_subs)),
-            Self::Modulo(op1, op2) => Self::Modulo(op1.bind_map_reads(map_subs), op2.bind_map_reads(map_subs)),
-            Self::Power(base_op, exp_op) => Self::Power(base_op.bind_map_reads(map_subs), exp_op.bind_map_reads(map_subs)),
-            Self::Sqrti(op) => Self::Sqrti(op.bind_map_reads(map_subs)),
-            Self::Log2(op) => Self::Log2(op.bind_map_reads(map_subs)),
-            Self::And(ops) => Self::And(Self::bind_map_reads_in_list(ops, map_subs)),
-            Self::Or(ops) => Self::Or(Self::bind_map_reads_in_list(ops, map_subs)),
-            Self::Not(op) => Self::Not(op.bind_map_reads(map_subs)),
-            Self::Greater(x, y) => Self::Greater(x.bind_map_reads(map_subs), y.bind_map_reads(map_subs)),
-            Self::Geq(x, y) => Self::Geq(x.bind_map_reads(map_subs), y.bind_map_reads(map_subs)),
-            Self::Equals(ops) => Self::Equals(Self::bind_map_reads_in_list(ops, map_subs)),
-            Self::Leq(x, y) => Self::Leq(x.bind_map_reads(map_subs), y.bind_map_reads(map_subs)),
-            Self::Less(x, y) => Self::Less(x.bind_map_reads(map_subs), y.bind_map_reads(map_subs)),
-            Self::Append(list_op, val_op) => Self::Append(list_op.bind_map_reads(map_subs), val_op.bind_map_reads(map_subs)),
-            Self::Concat(ops) => Self::Concat(Self::bind_map_reads_in_list(ops, map_subs)),
-            Self::AsMaxLen(op1, op2) => Self::AsMaxLen(op1.bind_map_reads(map_subs), op2.bind_map_reads(map_subs)),
-            Self::Len(op) => Self::Len(op.bind_map_reads(map_subs)),
-            Self::ElementAt(op1, op2) => Self::ElementAt(op1.bind_map_reads(map_subs), op2.bind_map_reads(map_subs)),
-            Self::IndexOf(op1, op2) => Self::IndexOf(op1.bind_map_reads(map_subs), op2.bind_map_reads(map_subs)),
-            Self::BuffToIntLe(op) => Self::BuffToIntLe(op.bind_map_reads(map_subs)),
-            Self::BuffToUIntLe(op) => Self::BuffToUIntLe(op.bind_map_reads(map_subs)),
-            Self::BuffToIntBe(op) => Self::BuffToIntBe(op.bind_map_reads(map_subs)),
-            Self::BuffToUIntBe(op) => Self::BuffToUIntBe(op.bind_map_reads(map_subs)),
-            Self::IsStandard(op) => Self::IsStandard(op.bind_map_reads(map_subs)),
-            Self::PrincipalDestruct(op) => Self::PrincipalDestruct(op.bind_map_reads(map_subs)),
+            Self::Variable(v) => {
+                if let Some(value) = env.symbols.get(v.id()) {
+                    // The caller's value, verbatim: it is already in the
+                    // caller's terms, so nothing in it is rewritten.
+                    value.clone()
+                }
+                else {
+                    Self::Variable(v)
+                }
+            }
+            Self::Named(n, def) => Self::rewrite_named(n, def, |d| *d.bind_env(env)),
+            Self::LoadedDataVariable(name, op) => {
+                if let Some(value) = env.vars.get(&name) {
+                    value.clone()
+                }
+                else {
+                    Self::LoadedDataVariable(name, op.bind_env(env))
+                }
+            }
+            Self::Add(ops) => Self::Add(Self::bind_env_in_list(ops, env)),
+            Self::Subtract(ops) => Self::Subtract(Self::bind_env_in_list(ops, env)),
+            Self::Multiply(ops) => Self::Multiply(Self::bind_env_in_list(ops, env)),
+            Self::Divide(ops) => Self::Divide(Self::bind_env_in_list(ops, env)),
+            Self::ToInt(op) => Self::ToInt(op.bind_env(env)),
+            Self::ToUInt(op) => Self::ToUInt(op.bind_env(env)),
+            Self::Modulo(op1, op2) => Self::Modulo(op1.bind_env(env), op2.bind_env(env)),
+            Self::Power(base_op, exp_op) => Self::Power(base_op.bind_env(env), exp_op.bind_env(env)),
+            Self::Sqrti(op) => Self::Sqrti(op.bind_env(env)),
+            Self::Log2(op) => Self::Log2(op.bind_env(env)),
+            Self::And(ops) => Self::And(Self::bind_env_in_list(ops, env)),
+            Self::Or(ops) => Self::Or(Self::bind_env_in_list(ops, env)),
+            Self::Not(op) => Self::Not(op.bind_env(env)),
+            Self::Greater(x, y) => Self::Greater(x.bind_env(env), y.bind_env(env)),
+            Self::Geq(x, y) => Self::Geq(x.bind_env(env), y.bind_env(env)),
+            Self::Equals(ops) => Self::Equals(Self::bind_env_in_list(ops, env)),
+            Self::Leq(x, y) => Self::Leq(x.bind_env(env), y.bind_env(env)),
+            Self::Less(x, y) => Self::Less(x.bind_env(env), y.bind_env(env)),
+            Self::Append(list_op, val_op) => Self::Append(list_op.bind_env(env), val_op.bind_env(env)),
+            Self::Concat(ops) => Self::Concat(Self::bind_env_in_list(ops, env)),
+            Self::AsMaxLen(op1, op2) => Self::AsMaxLen(op1.bind_env(env), op2.bind_env(env)),
+            Self::Len(op) => Self::Len(op.bind_env(env)),
+            Self::ElementAt(op1, op2) => Self::ElementAt(op1.bind_env(env), op2.bind_env(env)),
+            Self::IndexOf(op1, op2) => Self::IndexOf(op1.bind_env(env), op2.bind_env(env)),
+            Self::BuffToIntLe(op) => Self::BuffToIntLe(op.bind_env(env)),
+            Self::BuffToUIntLe(op) => Self::BuffToUIntLe(op.bind_env(env)),
+            Self::BuffToIntBe(op) => Self::BuffToIntBe(op.bind_env(env)),
+            Self::BuffToUIntBe(op) => Self::BuffToUIntBe(op.bind_env(env)),
+            Self::IsStandard(op) => Self::IsStandard(op.bind_env(env)),
+            Self::PrincipalDestruct(op) => Self::PrincipalDestruct(op.bind_env(env)),
             Self::PrincipalConstruct(op1, op2, op3_opt) => {
                 let new_op3_opt = if let Some(op3) = op3_opt {
-                    Some(op3.bind_map_reads(map_subs))
+                    Some(op3.bind_env(env))
                 }
                 else {
                     None
                 };
-                Self::PrincipalConstruct(op1.bind_map_reads(map_subs), op2.bind_map_reads(map_subs), new_op3_opt)
+                Self::PrincipalConstruct(op1.bind_env(env), op2.bind_env(env), new_op3_opt)
             },
-            Self::StringToInt(op) => Self::StringToInt(op.bind_map_reads(map_subs)),
-            Self::StringToUInt(op) => Self::StringToUInt(op.bind_map_reads(map_subs)),
-            Self::IntToAscii(op) => Self::IntToAscii(op.bind_map_reads(map_subs)),
-            Self::IntToUtf8(op) => Self::IntToUtf8(op.bind_map_reads(map_subs)),
-            Self::ListCons(ops) => Self::ListCons(Self::bind_map_reads_in_list(ops, map_subs)),
+            Self::StringToInt(op) => Self::StringToInt(op.bind_env(env)),
+            Self::StringToUInt(op) => Self::StringToUInt(op.bind_env(env)),
+            Self::IntToAscii(op) => Self::IntToAscii(op.bind_env(env)),
+            Self::IntToUtf8(op) => Self::IntToUtf8(op.bind_env(env)),
+            Self::ListCons(ops) => Self::ListCons(Self::bind_env_in_list(ops, env)),
             Self::FetchVar(name) => Self::FetchVar(name),
-            Self::SetVar(name, op) => Self::SetVar(name, op.bind_map_reads(map_subs)),
+            Self::SetVar(name, op) => Self::SetVar(name, op.bind_env(env)),
             Self::FetchEntry(name, op) => {
-                let key = op.bind_map_reads(map_subs);
-                if let Some(value) = map_subs.get(&name).and_then(|m| m.get(&key.to_string())) {
+                let key = Self::bound_key(op.bind_env(env));
+                if let Some(value) = env.maps.get(&name).and_then(|m| m.get(&key.to_string())) {
                     // The caller wrote this key, so `(map-get? name key)` is `(some value)`.
                     Self::ConsSome(Box::new(value.clone()))
                 }
@@ -6073,113 +6572,129 @@ impl SymOp {
                 }
             }
             Self::LoadedMapEntry(name, key_op, value_op_opt) => {
-                let key = key_op.bind_map_reads(map_subs);
-                if let Some(value) = map_subs.get(&name).and_then(|m| m.get(&key.to_string())) {
+                let key = Self::bound_key(key_op.bind_env(env));
+                if let Some(value) = env.maps.get(&name).and_then(|m| m.get(&key.to_string())) {
                     // The caller wrote this key, so the entry is `(some value)`.
                     Self::ConsSome(Box::new(value.clone()))
                 }
                 else {
-                    let new_value_op_opt = value_op_opt.map(|op| op.bind_map_reads(map_subs));
+                    let new_value_op_opt = value_op_opt.map(|op| op.bind_env(env));
                     Self::LoadedMapEntry(name, key, new_value_op_opt)
                 }
             }
-            Self::SetEntry(name, op1, op2) => Self::SetEntry(name, op1.bind_map_reads(map_subs), op2.bind_map_reads(map_subs)),
-            Self::InsertEntry(name, op1, op2) => Self::InsertEntry(name, op1.bind_map_reads(map_subs), op2.bind_map_reads(map_subs)),
-            Self::DeleteEntry(name, op) => Self::DeleteEntry(name, op.bind_map_reads(map_subs)),
+            Self::SetEntry(name, op1, op2) => Self::SetEntry(name, op1.bind_env(env), op2.bind_env(env)),
+            Self::InsertEntry(name, op1, op2) => Self::InsertEntry(name, op1.bind_env(env), op2.bind_env(env)),
+            Self::DeleteEntry(name, op) => Self::DeleteEntry(name, op.bind_env(env)),
             Self::TupleCons(fields) => {
                 let mut new_fields = vec![];
                 for (key, value) in fields.into_iter() {
-                    let new_value = value.bind_map_reads(map_subs);
+                    let new_value = value.bind_env(env);
                     new_fields.push((key, new_value));
                 }
                 Self::TupleCons(new_fields)
             }
-            Self::TupleGet(name, op) => Self::TupleGet(name, op.bind_map_reads(map_subs)),
-            Self::TupleMerge(op1, op2) => Self::TupleMerge(op1.bind_map_reads(map_subs), op2.bind_map_reads(map_subs)),
-            Self::Hash160(op) => Self::Hash160(op.bind_map_reads(map_subs)),
-            Self::Sha256(op) => Self::Sha256(op.bind_map_reads(map_subs)),
-            Self::Sha512(op) => Self::Sha512(op.bind_map_reads(map_subs)),
-            Self::Sha512Trunc256(op) => Self::Sha512Trunc256(op.bind_map_reads(map_subs)),
-            Self::Keccak256(op) => Self::Keccak256(op.bind_map_reads(map_subs)),
-            Self::Secp256k1Recover(op1, op2) => Self::Secp256k1Recover(op1.bind_map_reads(map_subs), op2.bind_map_reads(map_subs)),
-            Self::Secp256k1Verify(op1, op2, op3) => Self::Secp256k1Verify(op1.bind_map_reads(map_subs), op2.bind_map_reads(map_subs), op3.bind_map_reads(map_subs)),
-            Self::ContractOf(op1) => Self::ContractOf(op1.bind_map_reads(map_subs)),
-            Self::PrincipalOf(op1) => Self::PrincipalOf(op1.bind_map_reads(map_subs)),
-            Self::GetBurnBlockInfo(prop, op) => Self::GetBurnBlockInfo(prop, op.bind_map_reads(map_subs)),
-            Self::IsOkay(op) => Self::IsOkay(op.bind_map_reads(map_subs)),
-            Self::IsErr(op) => Self::IsErr(op.bind_map_reads(map_subs)),
-            Self::IsSome(op) => Self::IsSome(op.bind_map_reads(map_subs)),
-            Self::IsNone(op) => Self::IsNone(op.bind_map_reads(map_subs)),
-            Self::UnwrapPanic(op) => Self::UnwrapPanic(op.bind_map_reads(map_subs)),
-            Self::UnwrapErrPanic(op) => Self::UnwrapErrPanic(op.bind_map_reads(map_subs)),
-            Self::ConsError(op) => Self::ConsError(op.bind_map_reads(map_subs)),
-            Self::ConsOkay(op) => Self::ConsOkay(op.bind_map_reads(map_subs)),
-            Self::ConsSome(op) => Self::ConsSome(op.bind_map_reads(map_subs)),
+            Self::TupleGet(name, op) => {
+                // An untouched unlocked STX balance reads as
+                // `(get unlocked (stx-account who))`; the caller's transfers
+                // are kept under the STX state name, so resolve it the way a
+                // token balance is resolved.
+                let op = op.bind_env(env);
+                if name.as_str() == "unlocked" && let Self::StxGetAccount(who) = &*op
+                    && let Ok(stx) = Continuation::stx_unlocked_state_name()
+                    && let Some(value) = env.maps.get(&stx).and_then(|m| m.get(&who.to_string()))
+                {
+                    value.clone()
+                }
+                else {
+                    Self::TupleGet(name, op)
+                }
+            }
+            Self::TupleMerge(op1, op2) => Self::TupleMerge(op1.bind_env(env), op2.bind_env(env)),
+            Self::If(c, a, b) => Self::If(c.bind_env(env), a.bind_env(env), b.bind_env(env)),
+            Self::Hash160(op) => Self::Hash160(op.bind_env(env)),
+            Self::Sha256(op) => Self::Sha256(op.bind_env(env)),
+            Self::Sha512(op) => Self::Sha512(op.bind_env(env)),
+            Self::Sha512Trunc256(op) => Self::Sha512Trunc256(op.bind_env(env)),
+            Self::Keccak256(op) => Self::Keccak256(op.bind_env(env)),
+            Self::Secp256k1Recover(op1, op2) => Self::Secp256k1Recover(op1.bind_env(env), op2.bind_env(env)),
+            Self::Secp256k1Verify(op1, op2, op3) => Self::Secp256k1Verify(op1.bind_env(env), op2.bind_env(env), op3.bind_env(env)),
+            Self::ContractOf(op1) => Self::ContractOf(op1.bind_env(env)),
+            Self::PrincipalOf(op1) => Self::PrincipalOf(op1.bind_env(env)),
+            Self::GetBurnBlockInfo(prop, op) => Self::GetBurnBlockInfo(prop, op.bind_env(env)),
+            Self::IsOkay(op) => Self::IsOkay(op.bind_env(env)),
+            Self::IsErr(op) => Self::IsErr(op.bind_env(env)),
+            Self::IsSome(op) => Self::IsSome(op.bind_env(env)),
+            Self::IsNone(op) => Self::IsNone(op.bind_env(env)),
+            Self::UnwrapPanic(op) => Self::UnwrapPanic(op.bind_env(env)),
+            Self::UnwrapErrPanic(op) => Self::UnwrapErrPanic(op.bind_env(env)),
+            Self::ConsError(op) => Self::ConsError(op.bind_env(env)),
+            Self::ConsOkay(op) => Self::ConsOkay(op.bind_env(env)),
+            Self::ConsSome(op) => Self::ConsSome(op.bind_env(env)),
             Self::GetTokenBalance(name, op) => {
                 // Token balances are kept in the same store as maps, under the
                 // token's name, so a caller's transfer resolves a callee's
                 // balance read the same way a map write resolves a map read.
                 // The one difference is that a balance is not optional: it
                 // substitutes to the value itself, not to `(some value)`.
-                let key = op.bind_map_reads(map_subs);
-                if let Some(value) = map_subs.get(&name).and_then(|m| m.get(&key.to_string())) {
+                let key = Self::bound_key(op.bind_env(env));
+                if let Some(value) = env.maps.get(&name).and_then(|m| m.get(&key.to_string())) {
                     value.clone()
                 }
                 else {
                     Self::GetTokenBalance(name, key)
                 }
             }
-            Self::GetNftOwner(name, op) => Self::GetNftOwner(name, op.bind_map_reads(map_subs)),
-            Self::TransferToken(name, op1, op2, op3) => Self::TransferToken(name, op1.bind_map_reads(map_subs), op2.bind_map_reads(map_subs), op3.bind_map_reads(map_subs)),
-            Self::TransferNft(name, op1, op2, op3) => Self::TransferNft(name, op1.bind_map_reads(map_subs), op2.bind_map_reads(map_subs), op3.bind_map_reads(map_subs)),
-            Self::MintToken(name, op1, op2) => Self::MintToken(name, op1.bind_map_reads(map_subs), op2.bind_map_reads(map_subs)),
-            Self::MintNft(name, op1, op2) => Self::MintNft(name, op1.bind_map_reads(map_subs), op2.bind_map_reads(map_subs)),
+            Self::GetNftOwner(name, op) => Self::GetNftOwner(name, op.bind_env(env)),
+            Self::TransferToken(name, op1, op2, op3) => Self::TransferToken(name, op1.bind_env(env), op2.bind_env(env), op3.bind_env(env)),
+            Self::TransferNft(name, op1, op2, op3) => Self::TransferNft(name, op1.bind_env(env), op2.bind_env(env), op3.bind_env(env)),
+            Self::MintToken(name, op1, op2) => Self::MintToken(name, op1.bind_env(env), op2.bind_env(env)),
+            Self::MintNft(name, op1, op2) => Self::MintNft(name, op1.bind_env(env), op2.bind_env(env)),
             Self::GetTokenSupply(name) => Self::GetTokenSupply(name),
-            Self::BurnToken(name, op) => Self::BurnToken(name, op.bind_map_reads(map_subs)),
-            Self::BurnNft(name, op1, op2) => Self::BurnNft(name, op1.bind_map_reads(map_subs), op2.bind_map_reads(map_subs)),
-            Self::GetStxBalance(op) => Self::GetStxBalance(op.bind_map_reads(map_subs)),
-            Self::StxTransfer(op1, op2, op3) => Self::StxTransfer(op1.bind_map_reads(map_subs), op2.bind_map_reads(map_subs), op3.bind_map_reads(map_subs)),
-            Self::StxTransferMemo(op1, op2, op3, op4) => Self::StxTransferMemo(op1.bind_map_reads(map_subs), op2.bind_map_reads(map_subs), op3.bind_map_reads(map_subs), op4.bind_map_reads(map_subs)),
-            Self::StxBurn(op1) => Self::StxBurn(op1.bind_map_reads(map_subs)),
-            Self::StxGetAccount(op1) => Self::StxGetAccount(op1.bind_map_reads(map_subs)),
-            Self::BitwiseAnd(ops) => Self::BitwiseAnd(Self::bind_map_reads_in_list(ops, map_subs)),
-            Self::BitwiseOr(ops) => Self::BitwiseOr(Self::bind_map_reads_in_list(ops, map_subs)),
-            Self::BitwiseXor(ops) => Self::BitwiseXor(Self::bind_map_reads_in_list(ops, map_subs)),
-            Self::BitwiseNot(op) => Self::BitwiseNot(op.bind_map_reads(map_subs)),
-            Self::BitwiseLShift(op1, op2) => Self::BitwiseLShift(op1.bind_map_reads(map_subs), op2.bind_map_reads(map_subs)),
-            Self::BitwiseRShift(op1, op2) => Self::BitwiseRShift(op1.bind_map_reads(map_subs), op2.bind_map_reads(map_subs)),
-            Self::Slice(op1, op2, op3) => Self::Slice(op1.bind_map_reads(map_subs), op2.bind_map_reads(map_subs), op3.bind_map_reads(map_subs)),
-            Self::ToConsensusBuff(op) => Self::ToConsensusBuff(op.bind_map_reads(map_subs)),
-            Self::FromConsensusBuff(ts, op) => Self::FromConsensusBuff(ts, op.bind_map_reads(map_subs)),
-            Self::ReplaceAt(op1, op2, op3) => Self::ReplaceAt(op1.bind_map_reads(map_subs), op2.bind_map_reads(map_subs), op3.bind_map_reads(map_subs)),
-            Self::GetStacksBlockInfo(name, op) => Self::GetStacksBlockInfo(name, op.bind_map_reads(map_subs)),
-            Self::GetTenureInfo(name, op) => Self::GetTenureInfo(name, op.bind_map_reads(map_subs)),
-            Self::ContractHash(op) => Self::ContractHash(op.bind_map_reads(map_subs)),
-            Self::ToAscii(op) => Self::ToAscii(op.bind_map_reads(map_subs)),
-            Self::RestrictAssets(op1, op2, op3) => Self::RestrictAssets(op1.bind_map_reads(map_subs), op2.bind_map_reads(map_subs), op3.bind_map_reads(map_subs)),
-            Self::AsContractSafe(op1, op2) => Self::AsContractSafe(op1.bind_map_reads(map_subs), op2.bind_map_reads(map_subs)),
-            Self::AllowanceWithStx(op) => Self::AllowanceWithStx(op.bind_map_reads(map_subs)),
-            Self::AllowanceWithFt(op1, name, op2) => Self::AllowanceWithFt(op1.bind_map_reads(map_subs), name, op2.bind_map_reads(map_subs)),
-            Self::AllowanceWithNft(op1, name, op2) => Self::AllowanceWithNft(op1.bind_map_reads(map_subs), name, op2.bind_map_reads(map_subs)),
-            Self::AllowanceWithStacking(op) => Self::AllowanceWithStacking(op.bind_map_reads(map_subs)),
+            Self::BurnToken(name, op) => Self::BurnToken(name, op.bind_env(env)),
+            Self::BurnNft(name, op1, op2) => Self::BurnNft(name, op1.bind_env(env), op2.bind_env(env)),
+            Self::GetStxBalance(op) => Self::GetStxBalance(op.bind_env(env)),
+            Self::StxTransfer(op1, op2, op3) => Self::StxTransfer(op1.bind_env(env), op2.bind_env(env), op3.bind_env(env)),
+            Self::StxTransferMemo(op1, op2, op3, op4) => Self::StxTransferMemo(op1.bind_env(env), op2.bind_env(env), op3.bind_env(env), op4.bind_env(env)),
+            Self::StxBurn(op1) => Self::StxBurn(op1.bind_env(env)),
+            Self::StxGetAccount(op1) => Self::StxGetAccount(op1.bind_env(env)),
+            Self::BitwiseAnd(ops) => Self::BitwiseAnd(Self::bind_env_in_list(ops, env)),
+            Self::BitwiseOr(ops) => Self::BitwiseOr(Self::bind_env_in_list(ops, env)),
+            Self::BitwiseXor(ops) => Self::BitwiseXor(Self::bind_env_in_list(ops, env)),
+            Self::BitwiseNot(op) => Self::BitwiseNot(op.bind_env(env)),
+            Self::BitwiseLShift(op1, op2) => Self::BitwiseLShift(op1.bind_env(env), op2.bind_env(env)),
+            Self::BitwiseRShift(op1, op2) => Self::BitwiseRShift(op1.bind_env(env), op2.bind_env(env)),
+            Self::Slice(op1, op2, op3) => Self::Slice(op1.bind_env(env), op2.bind_env(env), op3.bind_env(env)),
+            Self::ToConsensusBuff(op) => Self::ToConsensusBuff(op.bind_env(env)),
+            Self::FromConsensusBuff(ts, op) => Self::FromConsensusBuff(ts, op.bind_env(env)),
+            Self::ReplaceAt(op1, op2, op3) => Self::ReplaceAt(op1.bind_env(env), op2.bind_env(env), op3.bind_env(env)),
+            Self::GetStacksBlockInfo(name, op) => Self::GetStacksBlockInfo(name, op.bind_env(env)),
+            Self::GetTenureInfo(name, op) => Self::GetTenureInfo(name, op.bind_env(env)),
+            Self::ContractHash(op) => Self::ContractHash(op.bind_env(env)),
+            Self::ToAscii(op) => Self::ToAscii(op.bind_env(env)),
+            Self::RestrictAssets(op1, op2, op3) => Self::RestrictAssets(op1.bind_env(env), op2.bind_env(env), op3.bind_env(env)),
+            Self::AsContractSafe(op1, op2) => Self::AsContractSafe(op1.bind_env(env), op2.bind_env(env)),
+            Self::AllowanceWithStx(op) => Self::AllowanceWithStx(op.bind_env(env)),
+            Self::AllowanceWithFt(op1, name, op2) => Self::AllowanceWithFt(op1.bind_env(env), name, op2.bind_env(env)),
+            Self::AllowanceWithNft(op1, name, op2) => Self::AllowanceWithNft(op1.bind_env(env), name, op2.bind_env(env)),
+            Self::AllowanceWithStacking(op) => Self::AllowanceWithStacking(op.bind_env(env)),
             Self::AllowanceAll => Self::AllowanceAll,
-            Self::Secp256r1Verify(op1, op2, op3) => Self::Secp256r1Verify(op1.bind_map_reads(map_subs), op2.bind_map_reads(map_subs), op3.bind_map_reads(map_subs)),
+            Self::Secp256r1Verify(op1, op2, op3) => Self::Secp256r1Verify(op1.bind_env(env), op2.bind_env(env), op3.bind_env(env)),
             Self::VerifyMerkleProof(op1, op2, op3, op4, op5) => Self::VerifyMerkleProof(
-                op1.bind_map_reads(map_subs),
-                op2.bind_map_reads(map_subs),
-                op3.bind_map_reads(map_subs),
-                op4.bind_map_reads(map_subs),
-                op5.bind_map_reads(map_subs),
+                op1.bind_env(env),
+                op2.bind_env(env),
+                op3.bind_env(env),
+                op4.bind_env(env),
+                op5.bind_env(env),
             ),
             Self::GetBitcoinTxOutput(op1, op2) => Self::GetBitcoinTxOutput(
-                op1.bind_map_reads(map_subs),
-                op2.bind_map_reads(map_subs),
+                op1.bind_env(env),
+                op2.bind_env(env),
             ),
             Self::Panic => Self::Panic,
             Self::FunctionCall(name, args) => {
                 let mut new_args = vec![];
                 for arg in args.into_iter() {
-                    let new_arg = arg.bind_map_reads(map_subs);
+                    let new_arg = arg.bind_env(env);
                     new_args.push(new_arg);
                 }
                 Self::FunctionCall(name, new_args)
@@ -6189,166 +6704,6 @@ impl SymOp {
     }
 
 
-    pub fn bind_loaded_vars(self, subs: &HashMap<FullName, SymOp>) -> Box<SymOp> {
-        
-        let op = match self {
-            Self::Constant(v) => Self::Constant(v),
-            Self::Variable(v) => Self::Variable(v),
-            Self::LoadedDataVariable(name, op) => {
-                if let Some(replacement) = subs.get(&name) {
-                    replacement.clone()
-                }
-                else {
-                    Self::LoadedDataVariable(name, op.bind_loaded_vars(subs))
-                }
-            }
-            Self::Add(ops) => Self::Add(Self::bind_loaded_vars_in_list(ops, subs)),
-            Self::Subtract(ops) => Self::Subtract(Self::bind_loaded_vars_in_list(ops, subs)),
-            Self::Multiply(ops) => Self::Multiply(Self::bind_loaded_vars_in_list(ops, subs)),
-            Self::Divide(ops) => Self::Divide(Self::bind_loaded_vars_in_list(ops, subs)),
-            Self::ToInt(op) => Self::ToInt(op.bind_loaded_vars(subs)),
-            Self::ToUInt(op) => Self::ToUInt(op.bind_loaded_vars(subs)),
-            Self::Modulo(op1, op2) => Self::Modulo(op1.bind_loaded_vars(subs), op2.bind_loaded_vars(subs)),
-            Self::Power(base_op, exp_op) => Self::Power(base_op.bind_loaded_vars(subs), exp_op.bind_loaded_vars(subs)),
-            Self::Sqrti(op) => Self::Sqrti(op.bind_loaded_vars(subs)),
-            Self::Log2(op) => Self::Log2(op.bind_loaded_vars(subs)),
-            Self::And(ops) => Self::And(Self::bind_loaded_vars_in_list(ops, subs)),
-            Self::Or(ops) => Self::Or(Self::bind_loaded_vars_in_list(ops, subs)),
-            Self::Not(op) => Self::Not(op.bind_loaded_vars(subs)),
-            Self::Greater(x, y) => Self::Greater(x.bind_loaded_vars(subs), y.bind_loaded_vars(subs)),
-            Self::Geq(x, y) => Self::Geq(x.bind_loaded_vars(subs), y.bind_loaded_vars(subs)),
-            Self::Equals(ops) => Self::Equals(Self::bind_loaded_vars_in_list(ops, subs)),
-            Self::Leq(x, y) => Self::Leq(x.bind_loaded_vars(subs), y.bind_loaded_vars(subs)),
-            Self::Less(x, y) => Self::Less(x.bind_loaded_vars(subs), y.bind_loaded_vars(subs)),
-            Self::Append(list_op, val_op) => Self::Append(list_op.bind_loaded_vars(subs), val_op.bind_loaded_vars(subs)),
-            Self::Concat(ops) => Self::Concat(Self::bind_loaded_vars_in_list(ops, subs)),
-            Self::AsMaxLen(op1, op2) => Self::AsMaxLen(op1.bind_loaded_vars(subs), op2.bind_loaded_vars(subs)),
-            Self::Len(op) => Self::Len(op.bind_loaded_vars(subs)),
-            Self::ElementAt(op1, op2) => Self::ElementAt(op1.bind_loaded_vars(subs), op2.bind_loaded_vars(subs)),
-            Self::IndexOf(op1, op2) => Self::IndexOf(op1.bind_loaded_vars(subs), op2.bind_loaded_vars(subs)),
-            Self::BuffToIntLe(op) => Self::BuffToIntLe(op.bind_loaded_vars(subs)),
-            Self::BuffToUIntLe(op) => Self::BuffToUIntLe(op.bind_loaded_vars(subs)),
-            Self::BuffToIntBe(op) => Self::BuffToIntBe(op.bind_loaded_vars(subs)),
-            Self::BuffToUIntBe(op) => Self::BuffToUIntBe(op.bind_loaded_vars(subs)),
-            Self::IsStandard(op) => Self::IsStandard(op.bind_loaded_vars(subs)),
-            Self::PrincipalDestruct(op) => Self::PrincipalDestruct(op.bind_loaded_vars(subs)),
-            Self::PrincipalConstruct(op1, op2, op3_opt) => {
-                let new_op3_opt = if let Some(op3) = op3_opt {
-                    Some(op3.bind_loaded_vars(subs))
-                }
-                else {
-                    None
-                };
-                Self::PrincipalConstruct(op1.bind_loaded_vars(subs), op2.bind_loaded_vars(subs), new_op3_opt)
-            },
-            Self::StringToInt(op) => Self::StringToInt(op.bind_loaded_vars(subs)),
-            Self::StringToUInt(op) => Self::StringToUInt(op.bind_loaded_vars(subs)),
-            Self::IntToAscii(op) => Self::IntToAscii(op.bind_loaded_vars(subs)),
-            Self::IntToUtf8(op) => Self::IntToUtf8(op.bind_loaded_vars(subs)),
-            Self::ListCons(ops) => Self::ListCons(Self::bind_loaded_vars_in_list(ops, subs)),
-            Self::FetchVar(name) => Self::FetchVar(name),
-            Self::SetVar(name, op) => Self::SetVar(name, op.bind_loaded_vars(subs)),
-            Self::FetchEntry(name, op) => Self::FetchEntry(name, op.bind_loaded_vars(subs)),
-            Self::LoadedMapEntry(name, key_op, value_op_opt) => {
-                let new_value_op_opt = if let Some(op) = value_op_opt {
-                    Some(op.bind_loaded_vars(subs))
-                }
-                else {
-                    None
-                };
-                Self::LoadedMapEntry(name, key_op.bind_loaded_vars(subs), new_value_op_opt)
-            }
-            Self::SetEntry(name, op1, op2) => Self::SetEntry(name, op1.bind_loaded_vars(subs), op2.bind_loaded_vars(subs)),
-            Self::InsertEntry(name, op1, op2) => Self::InsertEntry(name, op1.bind_loaded_vars(subs), op2.bind_loaded_vars(subs)),
-            Self::DeleteEntry(name, op) => Self::DeleteEntry(name, op.bind_loaded_vars(subs)),
-            Self::TupleCons(fields) => {
-                let mut new_fields = vec![];
-                for (key, value) in fields.into_iter() {
-                    let new_value = value.bind_loaded_vars(subs);
-                    new_fields.push((key, new_value));
-                }
-                Self::TupleCons(new_fields)
-            }
-            Self::TupleGet(name, op) => Self::TupleGet(name, op.bind_loaded_vars(subs)),
-            Self::TupleMerge(op1, op2) => Self::TupleMerge(op1.bind_loaded_vars(subs), op2.bind_loaded_vars(subs)),
-            Self::Hash160(op) => Self::Hash160(op.bind_loaded_vars(subs)),
-            Self::Sha256(op) => Self::Sha256(op.bind_loaded_vars(subs)),
-            Self::Sha512(op) => Self::Sha512(op.bind_loaded_vars(subs)),
-            Self::Sha512Trunc256(op) => Self::Sha512Trunc256(op.bind_loaded_vars(subs)),
-            Self::Keccak256(op) => Self::Keccak256(op.bind_loaded_vars(subs)),
-            Self::Secp256k1Recover(op1, op2) => Self::Secp256k1Recover(op1.bind_loaded_vars(subs), op2.bind_loaded_vars(subs)),
-            Self::Secp256k1Verify(op1, op2, op3) => Self::Secp256k1Verify(op1.bind_loaded_vars(subs), op2.bind_loaded_vars(subs), op3.bind_loaded_vars(subs)),
-            Self::ContractOf(op1) => Self::ContractOf(op1.bind_loaded_vars(subs)),
-            Self::PrincipalOf(op1) => Self::PrincipalOf(op1.bind_loaded_vars(subs)),
-            Self::GetBurnBlockInfo(prop, op) => Self::GetBurnBlockInfo(prop, op.bind_loaded_vars(subs)),
-            Self::IsOkay(op) => Self::IsOkay(op.bind_loaded_vars(subs)),
-            Self::IsErr(op) => Self::IsErr(op.bind_loaded_vars(subs)),
-            Self::IsSome(op) => Self::IsSome(op.bind_loaded_vars(subs)),
-            Self::IsNone(op) => Self::IsNone(op.bind_loaded_vars(subs)),
-            Self::UnwrapPanic(op) => Self::UnwrapPanic(op.bind_loaded_vars(subs)),
-            Self::UnwrapErrPanic(op) => Self::UnwrapErrPanic(op.bind_loaded_vars(subs)),
-            Self::ConsError(op) => Self::ConsError(op.bind_loaded_vars(subs)),
-            Self::ConsOkay(op) => Self::ConsOkay(op.bind_loaded_vars(subs)),
-            Self::ConsSome(op) => Self::ConsSome(op.bind_loaded_vars(subs)),
-            Self::GetTokenBalance(name, op) => Self::GetTokenBalance(name, op.bind_loaded_vars(subs)),
-            Self::GetNftOwner(name, op) => Self::GetNftOwner(name, op.bind_loaded_vars(subs)),
-            Self::TransferToken(name, op1, op2, op3) => Self::TransferToken(name, op1.bind_loaded_vars(subs), op2.bind_loaded_vars(subs), op3.bind_loaded_vars(subs)),
-            Self::TransferNft(name, op1, op2, op3) => Self::TransferNft(name, op1.bind_loaded_vars(subs), op2.bind_loaded_vars(subs), op3.bind_loaded_vars(subs)),
-            Self::MintToken(name, op1, op2) => Self::MintToken(name, op1.bind_loaded_vars(subs), op2.bind_loaded_vars(subs)),
-            Self::MintNft(name, op1, op2) => Self::MintNft(name, op1.bind_loaded_vars(subs), op2.bind_loaded_vars(subs)),
-            Self::GetTokenSupply(name) => Self::GetTokenSupply(name),
-            Self::BurnToken(name, op) => Self::BurnToken(name, op.bind_loaded_vars(subs)),
-            Self::BurnNft(name, op1, op2) => Self::BurnNft(name, op1.bind_loaded_vars(subs), op2.bind_loaded_vars(subs)),
-            Self::GetStxBalance(op) => Self::GetStxBalance(op.bind_loaded_vars(subs)),
-            Self::StxTransfer(op1, op2, op3) => Self::StxTransfer(op1.bind_loaded_vars(subs), op2.bind_loaded_vars(subs), op3.bind_loaded_vars(subs)),
-            Self::StxTransferMemo(op1, op2, op3, op4) => Self::StxTransferMemo(op1.bind_loaded_vars(subs), op2.bind_loaded_vars(subs), op3.bind_loaded_vars(subs), op4.bind_loaded_vars(subs)),
-            Self::StxBurn(op1) => Self::StxBurn(op1.bind_loaded_vars(subs)),
-            Self::StxGetAccount(op1) => Self::StxGetAccount(op1.bind_loaded_vars(subs)),
-            Self::BitwiseAnd(ops) => Self::BitwiseAnd(Self::bind_loaded_vars_in_list(ops, subs)),
-            Self::BitwiseOr(ops) => Self::BitwiseOr(Self::bind_loaded_vars_in_list(ops, subs)),
-            Self::BitwiseXor(ops) => Self::BitwiseXor(Self::bind_loaded_vars_in_list(ops, subs)),
-            Self::BitwiseNot(op) => Self::BitwiseNot(op.bind_loaded_vars(subs)),
-            Self::BitwiseLShift(op1, op2) => Self::BitwiseLShift(op1.bind_loaded_vars(subs), op2.bind_loaded_vars(subs)),
-            Self::BitwiseRShift(op1, op2) => Self::BitwiseRShift(op1.bind_loaded_vars(subs), op2.bind_loaded_vars(subs)),
-            Self::Slice(op1, op2, op3) => Self::Slice(op1.bind_loaded_vars(subs), op2.bind_loaded_vars(subs), op3.bind_loaded_vars(subs)),
-            Self::ToConsensusBuff(op) => Self::ToConsensusBuff(op.bind_loaded_vars(subs)),
-            Self::FromConsensusBuff(ts, op) => Self::FromConsensusBuff(ts, op.bind_loaded_vars(subs)),
-            Self::ReplaceAt(op1, op2, op3) => Self::ReplaceAt(op1.bind_loaded_vars(subs), op2.bind_loaded_vars(subs), op3.bind_loaded_vars(subs)),
-            Self::GetStacksBlockInfo(name, op) => Self::GetStacksBlockInfo(name, op.bind_loaded_vars(subs)),
-            Self::GetTenureInfo(name, op) => Self::GetTenureInfo(name, op.bind_loaded_vars(subs)),
-            Self::ContractHash(op) => Self::ContractHash(op.bind_loaded_vars(subs)),
-            Self::ToAscii(op) => Self::ToAscii(op.bind_loaded_vars(subs)),
-            Self::RestrictAssets(op1, op2, op3) => Self::RestrictAssets(op1.bind_loaded_vars(subs), op2.bind_loaded_vars(subs), op3.bind_loaded_vars(subs)),
-            Self::AsContractSafe(op1, op2) => Self::AsContractSafe(op1.bind_loaded_vars(subs), op2.bind_loaded_vars(subs)),
-            Self::AllowanceWithStx(op) => Self::AllowanceWithStx(op.bind_loaded_vars(subs)),
-            Self::AllowanceWithFt(op1, name, op2) => Self::AllowanceWithFt(op1.bind_loaded_vars(subs), name, op2.bind_loaded_vars(subs)),
-            Self::AllowanceWithNft(op1, name, op2) => Self::AllowanceWithNft(op1.bind_loaded_vars(subs), name, op2.bind_loaded_vars(subs)),
-            Self::AllowanceWithStacking(op) => Self::AllowanceWithStacking(op.bind_loaded_vars(subs)),
-            Self::AllowanceAll => Self::AllowanceAll,
-            Self::Secp256r1Verify(op1, op2, op3) => Self::Secp256r1Verify(op1.bind_loaded_vars(subs), op2.bind_loaded_vars(subs), op3.bind_loaded_vars(subs)),
-            Self::VerifyMerkleProof(op1, op2, op3, op4, op5) => Self::VerifyMerkleProof(
-                op1.bind_loaded_vars(subs),
-                op2.bind_loaded_vars(subs),
-                op3.bind_loaded_vars(subs),
-                op4.bind_loaded_vars(subs),
-                op5.bind_loaded_vars(subs),
-            ),
-            Self::GetBitcoinTxOutput(op1, op2) => Self::GetBitcoinTxOutput(
-                op1.bind_loaded_vars(subs),
-                op2.bind_loaded_vars(subs),
-            ),
-            Self::Panic => Self::Panic,
-            Self::FunctionCall(name, args) => {
-                let mut new_args = vec![];
-                for arg in args.into_iter() {
-                    let new_arg = arg.bind_loaded_vars(subs);
-                    new_args.push(new_arg);
-                }
-                Self::FunctionCall(name, new_args)
-            }
-        };
-        Box::new(op)
-    }
 
 }
 
@@ -6642,6 +6997,99 @@ impl Predicate {
         }
     }
 
+    /// Split `preds` into the conjuncts they all share and what each one adds
+    /// on top: `(and C X)` and `(and C Y)` give `[C]` and `[X, Y]`. A
+    /// predicate that adds nothing has the residual `true`.
+    pub fn factor_common(preds: &[Predicate]) -> (Vec<Predicate>, Vec<Predicate>) {
+        let all_conjuncts : Vec<Vec<&Predicate>> = preds.iter().map(|p| Self::conjuncts(p)).collect();
+        let mut common : Vec<&Predicate> = vec![];
+        if let Some(first) = all_conjuncts.first() {
+            for candidate in first.iter() {
+                if common.contains(candidate) {
+                    continue;
+                }
+                if all_conjuncts[1..].iter().all(|cs| cs.contains(candidate)) {
+                    common.push(candidate);
+                }
+            }
+        }
+        let residuals : Vec<Predicate> = all_conjuncts
+            .iter()
+            .map(|cs| {
+                let mut residual : Vec<Box<Predicate>> = cs
+                    .iter()
+                    .filter(|c| !common.contains(c))
+                    .map(|c| Box::new((*c).clone()))
+                    .collect();
+                match residual.len() {
+                    0 => Self::True,
+                    1 => *residual.pop().expect("infallible: len checked"),
+                    _ => Self::And(residual),
+                }
+            })
+            .collect();
+        (common.into_iter().cloned().collect(), residuals)
+    }
+
+    /// What `p` adds on top of `base`, for a `p` derived from `base` by
+    /// adding conditions: the conjuncts of `p` that are not conjuncts of
+    /// `base`. Since `p` implies `base`, `p` is equivalent to
+    /// `(and base residual)`.
+    ///
+    /// A `base` in disjunctive normal form is refined term by term, so when
+    /// both are disjunctions of the same width and every term of `p` adds
+    /// the same thing to a distinct term of `base`, that is the residual.
+    /// Otherwise `p` is its own residual, which is always equivalent.
+    pub fn residual_after(p: &Predicate, base: &Predicate) -> Predicate {
+        fn residual_conjunction(p: &Predicate, base: &Predicate) -> Predicate {
+            let base_conjuncts = Predicate::conjuncts(base);
+            let mut residual : Vec<Box<Predicate>> = Predicate::conjuncts(p)
+                .into_iter()
+                .filter(|c| !base_conjuncts.contains(c))
+                .map(|c| Box::new(c.clone()))
+                .collect();
+            match residual.len() {
+                0 => Predicate::True,
+                1 => *residual.pop().expect("infallible: len checked"),
+                _ => Predicate::And(residual),
+            }
+        }
+        if let (Predicate::Or(p_terms), Predicate::Or(base_terms)) = (p, base) {
+            if p_terms.len() == base_terms.len() {
+                let mut residual : Option<Predicate> = None;
+                let mut used : Vec<bool> = vec![false; base_terms.len()];
+                let mut ok = true;
+                for term in p_terms.iter() {
+                    let term_conjuncts = Predicate::conjuncts(term);
+                    let base_term = base_terms.iter().enumerate().find(|(j, b)| {
+                        !used[*j] && Predicate::conjuncts(b).iter().all(|c| term_conjuncts.contains(c))
+                    });
+                    let Some((j, b)) = base_term else {
+                        ok = false;
+                        break;
+                    };
+                    used[j] = true;
+                    let r = residual_conjunction(term, b);
+                    match residual.as_ref() {
+                        Some(prev) if *prev != r => {
+                            ok = false;
+                            break;
+                        }
+                        Some(_) => {}
+                        None => residual = Some(r),
+                    }
+                }
+                if ok {
+                    if let Some(r) = residual {
+                        return r;
+                    }
+                }
+            }
+            return p.clone();
+        }
+        residual_conjunction(p, base)
+    }
+
     /// The disjunction of `preds`, with the conjuncts common to all of them
     /// factored out: `(or (and C X) (and C Y))` becomes `(and C (or X Y))`.
     ///
@@ -6811,9 +7259,24 @@ pub fn set_deadline(deadline: Option<std::time::Instant>) {
     DEADLINE.with(|d| d.set(deadline));
 }
 
-/// How long the budget was, for the message. Set alongside the deadline.
 thread_local! {
+    /// How long the budget was, for the message. Set alongside the deadline.
     static DEADLINE_SECS: std::cell::Cell<u64> = std::cell::Cell::new(0);
+}
+
+thread_local! {
+    /// Whether paths are being joined (see `Continuation::join`). Some
+    /// rewrites only pay off then: they trade a compact `(merge ..)` for a
+    /// constructor the joined formulae can be pushed into field by field.
+    static JOIN_PATHS: std::cell::Cell<bool> = std::cell::Cell::new(false);
+}
+
+pub fn set_join_paths(join: bool) {
+    JOIN_PATHS.with(|j| j.set(join));
+}
+
+pub fn join_paths() -> bool {
+    JOIN_PATHS.with(|j| j.get())
 }
 
 pub fn set_deadline_secs(secs: u64) {
@@ -6861,6 +7324,60 @@ thread_local! {
     static SIMPLIFIED: std::cell::RefCell<HashSet<(u64, u64)>> = std::cell::RefCell::new(HashSet::new());
     static FINGERPRINT_KEYS: (std::collections::hash_map::RandomState, std::collections::hash_map::RandomState) =
         (std::collections::hash_map::RandomState::new(), std::collections::hash_map::RandomState::new());
+}
+
+thread_local! {
+    /// Named formulas already rewritten in the rewrite pass under way, so a
+    /// definition shared by many uses is rewritten once (see
+    /// `SymOp::rewrite_named`).
+    static NAMED_REWRITES: std::cell::RefCell<HashMap<(u64, u64), SymOp>> = std::cell::RefCell::new(HashMap::new());
+    static REWRITE_DEPTH: std::cell::Cell<u32> = std::cell::Cell::new(0);
+    /// Destructors applied to named formulas, by destructor and name (see
+    /// `SymOp::project_named`). A name stands for one definition for the
+    /// life of the thread, so these never go stale.
+    static PROJECTIONS: std::cell::RefCell<HashMap<(String, (u64, u64)), SymOp>> = std::cell::RefCell::new(HashMap::new());
+}
+
+/// The caller's view of a callee's free names, for `SymOp::bind_env`: the
+/// values of the callee's symbols (arguments and globals) by symbol name, of
+/// the data vars it reads at entry, and of the map keys (and balances) it
+/// reads at entry, keyed by the key's string form. Every value is in the
+/// caller's terms.
+pub struct CallEnv<'a> {
+    pub symbols: HashMap<String, SymOp>,
+    pub vars: &'a HashMap<FullName, SymOp>,
+    pub maps: &'a HashMap<FullName, HashMap<String, SymOp>>,
+}
+
+/// A rewrite of a formula (binding symbols, loaded vars, or map reads) is a
+/// pass: the outermost call opens it, its recursive calls share it, and the
+/// memo of rewritten names is dropped when the outermost call returns.
+struct RewritePass;
+
+impl RewritePass {
+    fn enter() -> Self {
+        REWRITE_DEPTH.with(|d| {
+            if d.get() == 0 {
+                NAMED_REWRITES.with(|m| m.borrow_mut().clear());
+            }
+            d.set(d.get() + 1);
+        });
+        Self
+    }
+
+    fn lookup(n: (u64, u64)) -> Option<SymOp> {
+        NAMED_REWRITES.with(|m| m.borrow().get(&n).cloned())
+    }
+
+    fn record(n: (u64, u64), op: SymOp) {
+        NAMED_REWRITES.with(|m| m.borrow_mut().insert(n, op));
+    }
+}
+
+impl Drop for RewritePass {
+    fn drop(&mut self) {
+        REWRITE_DEPTH.with(|d| d.set(d.get() - 1));
+    }
 }
 
 fn fingerprint(op: &SymOp) -> (u64, u64) {
@@ -6917,6 +7434,10 @@ pub struct Continuation {
     /// reads a balance this path just changed could be replaced by a fresh
     /// symbol, and an invariant over that balance would hold for no reason.
     asset_written: bool,
+    /// the parents of the paths a combined or joined continuation stands in
+    /// for, beyond `parent`. A continuation descends from an ancestor along
+    /// `parent` and along each of these.
+    lineage: Vec<Rc<Continuation>>,
     /// internal identifier to ensure uniqueness
     pub id: u64,
     /// Path to the item in the contract being evaluated
@@ -7174,6 +7695,7 @@ impl Continuation {
     pub fn root(symbex: &Symbex, current_contract: PrincipalData) -> Self {
         let mut cont = Self {
             asset_written: false,
+            lineage: vec![],
             id: next_cont_id(),
             function_path: None,
             current_line: None,
@@ -7247,6 +7769,7 @@ impl Continuation {
             panicking: false,
             early_return: false,
             asset_written: parent.asset_written,
+            lineage: vec![],
         };
         debug!("Created continuation {} ({}) from parent {}: pred={}", cont.id, cont.function_path.as_ref().map(|s| s.as_str()).unwrap_or("unreachable"), parent_id, &cont.predicate);
         cont
@@ -7298,13 +7821,6 @@ impl Continuation {
         self.map_tombstones.clear();
     }
 
-    /// Bind this continuation's global constants to symbols
-    fn bind_globals(&self, symop: SymOp) -> SymOp {
-        *symop
-            .bind_symbol("tx-sender".into(), self.get_tx_sender())
-            .bind_symbol("contract-caller".into(), self.get_contract_caller())
-            .bind_symbol("tx-sponsor?".into(), self.get_tx_sponsor())
-    }
 
     /// Given a pre-evaluated "free" continuation representing a function (i.e. where all input and output
     /// variables are free), and given a parent continuation which "calls" this function (i.e.
@@ -7319,6 +7835,15 @@ impl Continuation {
         let mut bound_formulae = free.bound_formulae.clone();
         bound_formulae.extend(parent.bound_formulae.clone().into_iter());
 
+        // Arguments are bound by substitution, and a callee body may mention
+        // an argument at every turn. Bind a big one by name, so that each use
+        // costs a name rather than a copy, and the destructors applied to it
+        // look through the name (see `SymOp::project_named`).
+        let bound_formulae : HashMap<SymId, SymOp> = bound_formulae
+            .into_iter()
+            .map(|(sym_id, symop)| Ok((sym_id, SymOp::named(symop.simplify()?))))
+            .collect::<Result<_, Error>>()?;
+
         // The callee read each data var at its entry, which is the caller's
         // *current* value of that var at the call site: whatever the caller has
         // written (var_state), else the var's entry value (pre_var_state). Bind
@@ -7329,37 +7854,37 @@ impl Continuation {
         for (name, val) in parent.var_state.iter() {
             caller_vars.insert(name.clone(), val.clone());
         }
+        for val in caller_vars.values_mut() {
+            *val = SymOp::named(std::mem::replace(val, SymOp::Panic));
+        }
 
         // The same for map writes: a `(map-get? m k)` the callee makes of a key
         // the caller wrote should read back the caller's value. Keyed by the
-        // key's string form; see `bind_map_reads`.
+        // key's string form; see `SymOp::bind_env`.
         let mut caller_maps: HashMap<FullName, HashMap<String, SymOp>> = HashMap::new();
         for (map_name, entries) in parent.map_state.iter() {
             let slot = caller_maps.entry(map_name.clone()).or_insert_with(HashMap::new);
             for (key, value) in entries.iter() {
-                slot.insert(key.to_string(), value.clone());
+                slot.insert(key.to_string(), SymOp::named(value.clone()));
             }
         }
 
-        let mut free_predicate = free.predicate.clone().as_symop();
-        for (sym_id, symop) in bound_formulae.iter() {
-            debug!("Bind predicate symbol {sym_id} = {symop}");
-            free_predicate = *free_predicate.bind_symbol(sym_id.clone(), symop.clone());
-        }
-        free_predicate = parent.bind_globals(free_predicate);
-        free_predicate = *free_predicate.bind_loaded_vars(&caller_vars);
-        free_predicate = *free_predicate.bind_map_reads(&caller_maps);
+        // Everything the callee's formulas mention that the caller has a
+        // value for, bound in one pass (see `SymOp::bind_env`).
+        let mut symbols: HashMap<String, SymOp> = bound_formulae
+            .iter()
+            .map(|(sym_id, symop)| (sym_id.as_str().to_string(), symop.clone()))
+            .collect();
+        symbols.insert("tx-sender".to_string(), parent.get_tx_sender());
+        symbols.insert("contract-caller".to_string(), parent.get_contract_caller());
+        symbols.insert("tx-sponsor?".to_string(), parent.get_tx_sponsor());
+        let env = CallEnv { symbols, vars: &caller_vars, maps: &caller_maps };
+
+        let free_predicate = *free.predicate.clone().as_symop().bind_env(&env);
         let predicate = free_predicate.and(parent.predicate.clone().as_symop()).try_as_predicate()?.simplify()?;
 
-        let mut final_formula = free.final_formula.clone();
-        for (sym_id, symop) in bound_formulae.iter() {
-            debug!("Bind final formula symbol {sym_id} = {symop}");
-            final_formula = *final_formula.bind_symbol(sym_id.clone(), symop.clone());
-        }
-        final_formula = parent.bind_globals(final_formula);
-        final_formula = *final_formula.bind_loaded_vars(&caller_vars);
-        final_formula = *final_formula.bind_map_reads(&caller_maps);
-       
+        let final_formula = *free.final_formula.clone().bind_env(&env);
+
         let mut pre_var_state = parent.pre_var_state.clone();
         for (name, val) in free.pre_var_state.iter() {
             if parent.pre_var_state.contains_key(name) {
@@ -7370,41 +7895,23 @@ impl Continuation {
                 // skip already-set vars in the parent -- they're not new inputs
                 continue;
             }
-            let mut new_val = val.clone().simplify()?;
-            for (sym_id, symop) in bound_formulae.iter() {
-                let symop = symop.clone().simplify()?;
-                debug!("Bind pre-var (var-set {name}) symbol {sym_id} = {symop}");
-                new_val = new_val.bind_symbol(sym_id.clone(), symop).simplify()?;
-            }
+            let new_val = val.clone().bind_env(&env).simplify()?;
             pre_var_state.insert(name.clone(), new_val);
         }
         
         let mut var_state = parent.var_state.clone();
         for (name, val) in free.var_state.iter() {
-            let mut new_val = val.clone().simplify()?;
-            for (sym_id, symop) in bound_formulae.iter() {
-                let symop = symop.clone().simplify()?;
-                debug!("Bind var (var-set {name}) symbol {sym_id} = {symop}");
-                new_val = new_val.bind_symbol(sym_id.clone(), symop).simplify()?;
-            }
             // The callee's write is expressed over the vars it read at entry;
             // resolve those to the caller's current values so the composed
             // post-value is in the caller's terms.
-            new_val = new_val.bind_loaded_vars(&caller_vars).simplify()?;
-            new_val = new_val.bind_map_reads(&caller_maps).simplify()?;
+            let new_val = val.clone().bind_env(&env).simplify()?;
             var_state.insert(name.clone(), new_val);
         }
         
         let mut pre_map_state = parent.pre_map_state.clone();
         for (map_name, map_info) in free.pre_map_state.iter() {
             for key_sym in map_info.iter() {
-                let mut new_key_sym = key_sym.clone();
-                for (sym_id, symop) in bound_formulae.iter() {
-                    let symop = symop.clone().simplify()?;
-                    debug!("Bind (pre-map-write {map_name} {key_sym}) symbol {sym_id} = {symop}");
-                    new_key_sym = new_key_sym.bind_symbol(sym_id.clone(), symop.clone()).simplify()?;
-                }
-                new_key_sym = parent.bind_globals(new_key_sym);
+                let new_key_sym = key_sym.clone().bind_env(&env).simplify()?;
                 if let Some(new_map_info) = pre_map_state.get_mut(map_name) {
                     new_map_info.insert(new_key_sym);
                 }
@@ -7419,16 +7926,8 @@ impl Continuation {
         let mut map_state = parent.map_state.clone();
         for (map_name, map_info) in free.map_state.iter() {
             for (key_sym, val_sym) in map_info.iter() {
-                let mut new_key_sym = key_sym.clone();
-                let mut new_val_sym = val_sym.clone();
-                for (sym_id, symop) in bound_formulae.iter() {
-                    let symop = symop.clone().simplify()?;
-                    debug!("Bind (map-write {map_name} {key_sym}) symbol {sym_id} = {symop}");
-                    new_key_sym = new_key_sym.bind_symbol(sym_id.clone(), symop.clone()).simplify()?;
-                    new_val_sym = new_val_sym.bind_symbol(sym_id.clone(), symop.clone()).simplify()?;
-                }
-                new_key_sym = parent.bind_globals(new_key_sym);
-                new_val_sym = parent.bind_globals(new_val_sym);
+                let new_key_sym = key_sym.clone().bind_env(&env).simplify()?;
+                let new_val_sym = val_sym.clone().bind_env(&env).simplify()?;
                 if let Some(new_map_info) = map_state.get_mut(map_name) {
                     new_map_info.insert(new_key_sym, new_val_sym);
                 }
@@ -7443,13 +7942,7 @@ impl Continuation {
         let mut map_tombstones = parent.map_tombstones.clone();
         for (map_name, map_info) in free.map_tombstones.iter() {
             for key_sym in map_info.iter() {
-                let mut new_key_sym = key_sym.clone();
-                for (sym_id, symop) in bound_formulae.iter() {
-                    let symop = symop.clone().simplify()?;
-                    debug!("Bind (map-delete {map_name} {key_sym}) symbol {sym_id} = {symop}");
-                    new_key_sym = new_key_sym.bind_symbol(sym_id.clone(), symop.clone()).simplify()?;
-                }
-                new_key_sym = parent.bind_globals(new_key_sym);
+                let new_key_sym = key_sym.clone().bind_env(&env).simplify()?;
                 if let Some(new_map_info) = map_tombstones.get_mut(map_name) {
                     new_map_info.insert(new_key_sym);
                 }
@@ -7485,6 +7978,7 @@ impl Continuation {
 
         let cont = Self {
             asset_written: parent.asset_written || free.asset_written,
+            lineage: vec![],
             id: next_cont_id(),
             function_path: Some(function_path),
             current_line: free.current_line.clone(),
@@ -7588,7 +8082,7 @@ impl Continuation {
     /// Contract maps are namespaced by the contract that declares them, so STX
     /// gets a reserved name of its own under the boot address, which no user
     /// contract can name and therefore cannot collide with.
-    fn stx_unlocked_state_name() -> Result<FullName, Error> {
+    pub fn stx_unlocked_state_name() -> Result<FullName, Error> {
         let contract = QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.stx-state")
             .map_err(|e| Error::Bug(format!("Cannot build the STX state name: {e}")))?;
         Ok(FullName(contract, "unlocked".try_into()?))
@@ -8369,6 +8863,7 @@ impl Continuation {
         let mut final_formulae = vec![self.final_formula.clone()];
         let mut pre_map_state = self.pre_map_state.clone();
         let mut pre_var_state = self.pre_var_state.clone();
+        let mut lineage = self.lineage.clone();
         
         for other in others.into_iter() {
             // assert baseline combination conditions
@@ -8388,6 +8883,9 @@ impl Continuation {
             final_reachable_var_writes.extend(other.reachable_var_writes.into_iter());
             
             let other_old_pred = other.predicate.clone();
+
+            lineage.extend(other.parent.iter().cloned());
+            lineage.extend(other.lineage.iter().cloned());
 
             paths.push(other_function_path);
             preds.push(Box::new(other_old_pred));
@@ -8457,11 +8955,380 @@ impl Continuation {
             caller: self.caller,
             dropped_formulae: self.dropped_formulae.clone(),
             final_formula: merge_final_formulae(final_formulae),
+            lineage,
             ..self
         };
 
         info!("Combined continuations {} to produce {}: Joined predicates\n{}", ids.into_iter().map(|i| i.to_string()).collect::<Vec<_>>().join(","), combined.id, preds.into_iter().map(|p| p.to_string()).collect::<Vec<_>>().join("\n"));
         Ok(combined)
+    }
+
+    /// The bindings in scope at this continuation, resolved through the
+    /// parent chain the way `lookup_formula` does, minus the ones a scope
+    /// exit has dropped. Walking up from the leaf, the first mention of a
+    /// name -- a binding or a drop -- decides: Clarity has no shadowing, so a
+    /// drop met before a binding is that binding's own scope exit, and a
+    /// binding met before a drop is a later `let` reusing the name.
+    fn scoped_env(&self) -> HashMap<SymId, SymOp> {
+        let mut env = HashMap::new();
+        let mut seen : HashSet<SymId> = HashSet::new();
+        let mut cursor = self;
+        loop {
+            for id in cursor.dropped_formulae.iter() {
+                seen.insert(id.clone());
+            }
+            for (id, op) in cursor.bound_formulae.iter() {
+                if seen.insert(id.clone()) {
+                    env.insert(id.clone(), op.clone());
+                }
+            }
+            match cursor.parent.as_ref() {
+                Some(parent) => cursor = parent,
+                None => break,
+            }
+        }
+        env
+    }
+
+    /// A hash over everything `can_join_with` requires to be equal, so that
+    /// candidates can be bucketed before the pairwise check.
+    pub fn join_key_hash(&self) -> u64 {
+        let mut h = DefaultHasher::new();
+        self.caller.as_ref().map(|c| c.id).hash(&mut h);
+        self.get_tx_sender().hash(&mut h);
+        self.get_contract_caller().hash(&mut h);
+        self.get_tx_sponsor().hash(&mut h);
+        self.get_current_contract().to_string().hash(&mut h);
+        unordered_digest(self.map_state.iter().map(|(k, v)| {
+            standalone_hash(&(k, unordered_digest(v.keys().map(|mk| standalone_hash(mk)))))
+        })).hash(&mut h);
+        unordered_digest(self.map_tombstones.iter().map(|(k, v)| {
+            standalone_hash(&(k, unordered_digest(v.iter().map(|op| standalone_hash(op)))))
+        })).hash(&mut h);
+        h.finish()
+    }
+
+    /// Can `self` and `other` be joined into one continuation (see `join`)?
+    ///
+    /// Both must still be running (a halted path keeps its own identity: the
+    /// caller decides what an early return or a panic means), be in the same
+    /// call with the same principals, have written the same map keys and
+    /// deleted the same ones, and each data var one of them wrote must have
+    /// a value in the other -- either written, or its value at entry.
+    pub fn can_join_with(&self, other: &Continuation) -> bool {
+        if self.halted() || other.halted() {
+            return false;
+        }
+        if self.caller.as_ref().map(|c| c.id) != other.caller.as_ref().map(|c| c.id) {
+            return false;
+        }
+        if self.get_tx_sender() != other.get_tx_sender()
+            || self.get_contract_caller() != other.get_contract_caller()
+            || self.get_tx_sponsor() != other.get_tx_sponsor()
+            || self.get_current_contract() != other.get_current_contract()
+            || self.map_tombstones != other.map_tombstones
+            || self.map_state.len() != other.map_state.len()
+        {
+            return false;
+        }
+        for (name, entries) in self.map_state.iter() {
+            let Some(other_entries) = other.map_state.get(name) else {
+                return false;
+            };
+            if entries.len() != other_entries.len() || !entries.keys().all(|k| other_entries.contains_key(k)) {
+                return false;
+            }
+        }
+        if self.var_state.keys().any(|name| other.inner_lookup_data_var(name).is_none())
+            || other.var_state.keys().any(|name| self.inner_lookup_data_var(name).is_none())
+        {
+            return false;
+        }
+        true
+    }
+
+    /// `(if c1 v1 (if c2 v2 ... vn))`, or just the value when every path
+    /// computed the same one. `conds` and `vals` are in path order; the last
+    /// path is the default, since the paths are exhaustive under the joined
+    /// predicate.
+    fn ite_chain(conds: &[SymOp], mut vals: Vec<SymOp>) -> Result<SymOp, Error> {
+        if vals.iter().all(|v| *v == vals[0]) {
+            return Ok(vals.swap_remove(0));
+        }
+        let mut acc = vals.pop().expect("infallible: at least one value");
+        while let Some(val) = vals.pop() {
+            let cond = conds[vals.len()].clone();
+            acc = SymOp::If(Box::new(cond), Box::new(val), Box::new(acc));
+        }
+        Ok(acc.simplify()?.name_leaves())
+    }
+
+    /// Join several continuations into one whose values branch on which path
+    /// was taken, instead of keeping one continuation per path.
+    ///
+    /// The paths of a symbolic execution are mutually exclusive: every fork
+    /// splits on a condition and its negation. So where `combine` merges
+    /// paths that computed the *same* thing, `join` merges paths that
+    /// computed different things and records the difference in the value:
+    /// the joined continuation is reachable under the disjunction of the
+    /// paths' conditions, and each value it carries -- result, bindings in
+    /// scope, data vars, map entries -- is `(if r1 v1 (if r2 v2 ... vn))`,
+    /// where `ri` is what path `i` added to the condition they all share.
+    /// Under path `i`'s condition the chain picks `vi`, so nothing observable
+    /// changes; what changes is that a function with `k` forks in sequence
+    /// yields one continuation rather than `2^k`.
+    ///
+    /// Only running paths join (see `can_join_with`); a path that returned
+    /// early or panicked is left alone for the caller to interpret.
+    /// Does some chain of ancestors of this continuation pass through the
+    /// continuation `id`? The chain forks at a combined or joined
+    /// continuation, which keeps the parents of the paths it absorbed in
+    /// `lineage`.
+    fn descends_from_any(&self, id: u64) -> bool {
+        let mut seen : HashSet<u64> = HashSet::new();
+        let mut work : Vec<&Continuation> = vec![self];
+        while let Some(c) = work.pop() {
+            if c.id == id {
+                return true;
+            }
+            if !seen.insert(c.id) {
+                continue;
+            }
+            if let Some(p) = c.parent.as_ref() {
+                work.push(p.as_ref());
+            }
+            for l in c.lineage.iter() {
+                work.push(l.as_ref());
+            }
+        }
+        false
+    }
+
+    /// Does every chain of ancestors of this continuation pass through the
+    /// continuation `id`?
+    fn descends_from_all(&self, id: u64) -> bool {
+        let mut seen : HashSet<u64> = HashSet::new();
+        let mut work : Vec<&Continuation> = vec![self];
+        while let Some(c) = work.pop() {
+            if c.id == id {
+                continue;
+            }
+            if !seen.insert(c.id) {
+                continue;
+            }
+            if c.parent.is_none() && c.lineage.is_empty() {
+                return false;
+            }
+            if let Some(p) = c.parent.as_ref() {
+                work.push(p.as_ref());
+            }
+            for l in c.lineage.iter() {
+                work.push(l.as_ref());
+            }
+        }
+        true
+    }
+
+    /// The deepest ancestor of the first candidate that every candidate
+    /// descends from along every chain: the point where the paths being
+    /// joined forked apart.
+    fn join_root(cands: &[&Continuation]) -> Option<Rc<Continuation>> {
+        let mut cursor = cands[0].parent.clone();
+        while let Some(anc) = cursor {
+            if cands.iter().all(|c| c.descends_from_all(anc.id)) {
+                return Some(anc);
+            }
+            cursor = anc.parent.clone();
+        }
+        None
+    }
+
+    /// Join `cands` into one continuation whose state is an `If` chain over
+    /// the paths' conditions. `others` are the remaining continuations of
+    /// the same evaluation: the joined path condition is the condition at
+    /// the fork the candidates descend from, minus whatever the paths that
+    /// were not joined (halted ones, mostly) took from it.
+    ///
+    /// The evaluation of an expression returns every feasible path from its
+    /// starting continuation, so the leaves under the fork are exactly the
+    /// candidates and those of `others` that descend from it; the
+    /// candidates' conditions are then the fork's condition with the
+    /// excluded paths' conditions negated. That keeps the joined condition
+    /// the size of the fork's condition instead of a disjunction of every
+    /// path's, which would otherwise be distributed into disjunctive normal
+    /// form at every later fork.
+    pub fn join(cands: &[&Continuation], others: &[&Continuation]) -> Result<Continuation, Error> {
+        assert!(cands.len() >= 2, "join needs at least two continuations");
+        for other in cands[1..].iter() {
+            assert!(cands[0].can_join_with(other), "Cannot join continuations {} and {}", cands[0].id, other.id);
+        }
+
+        let preds : Vec<Predicate> = cands.iter().map(|c| c.predicate.clone()).collect();
+        let root = Self::join_root(cands);
+        let (residuals, predicate) = match root.as_ref() {
+            Some(root) => {
+                let root_pred = root.predicate.clone().simplify()?;
+                let residuals : Vec<Predicate> = preds.iter().map(|p| Predicate::residual_after(p, &root_pred)).collect();
+                let mut conjuncts : Vec<Box<Predicate>> = Predicate::conjuncts(&root_pred).into_iter().map(|c| Box::new(c.clone())).collect();
+                let mut excluded = 0;
+                for other in others.iter() {
+                    if other.descends_from_any(root.id) {
+                        conjuncts.push(Box::new(Predicate::Not(Box::new(Predicate::residual_after(&other.predicate, &root_pred)))));
+                        excluded += 1;
+                    }
+                }
+                debug!("Join root of {} is {} with {} excluded siblings", cands.iter().map(|c| c.id.to_string()).collect::<Vec<_>>().join(","), root.id, excluded);
+                let predicate = match conjuncts.len() {
+                    0 => Predicate::True,
+                    1 => *conjuncts.pop().expect("infallible: len checked"),
+                    _ => Predicate::And(conjuncts),
+                };
+                (residuals, predicate.simplify()?)
+            }
+            None => {
+                let (_common, residuals) = Predicate::factor_common(&preds);
+                let preds : Vec<Box<Predicate>> = preds.iter().map(|p| Box::new(p.clone())).collect();
+                (residuals, Predicate::factored_or(preds).simplify()?)
+            }
+        };
+
+        // A path that added nothing to the shared condition covers every
+        // other path, so it goes last, as the default of the chain.
+        let mut order : Vec<usize> = (0..cands.len()).collect();
+        order.sort_by_key(|i| residuals[*i] == Predicate::True);
+        let cands : Vec<&Continuation> = order.iter().map(|i| cands[*i]).collect();
+        let conds : Vec<SymOp> = order.iter().map(|i| residuals[*i].clone().as_symop()).collect();
+
+        let first = cands[0];
+        let ids : Vec<u64> = cands.iter().map(|c| c.id).collect();
+
+        // values every path agrees on stay where they are; the ones that
+        // differ are rebound on the joined continuation, which is looked up
+        // before the chain
+        let envs : Vec<HashMap<SymId, SymOp>> = cands.iter().map(|c| c.scoped_env()).collect();
+        let mut bound_formulae = first.bound_formulae.clone();
+        for (id, val) in envs[0].iter() {
+            let mut vals = vec![val.clone()];
+            let mut in_scope_everywhere = true;
+            for env in envs[1..].iter() {
+                match env.get(id) {
+                    Some(v) => vals.push(v.clone()),
+                    None => {
+                        in_scope_everywhere = false;
+                        break;
+                    }
+                }
+            }
+            if !in_scope_everywhere || vals.iter().all(|v| *v == vals[0]) {
+                continue;
+            }
+            bound_formulae.insert(id.clone(), Self::ite_chain(&conds, vals)?);
+        }
+
+        let mut var_names : Vec<FullName> = vec![];
+        for c in cands.iter() {
+            for name in c.var_state.keys() {
+                if !var_names.contains(name) {
+                    var_names.push(name.clone());
+                }
+            }
+        }
+        let mut var_state = first.var_state.clone();
+        for name in var_names.iter() {
+            let mut vals = vec![];
+            for c in cands.iter() {
+                let Some(val) = c.inner_lookup_data_var(name) else {
+                    return Err(Error::Bug(format!("join: data var {name} has no value in continuation {}", c.id)));
+                };
+                vals.push(val.clone());
+            }
+            var_state.insert(name.clone(), Self::ite_chain(&conds, vals)?);
+        }
+
+        let mut map_state = HashMap::new();
+        for (map_name, entries) in first.map_state.iter() {
+            let mut joined_entries = HashMap::new();
+            for key in entries.keys() {
+                let mut vals = vec![];
+                for c in cands.iter() {
+                    let Some(val) = c.map_state.get(map_name).and_then(|e| e.get(key)) else {
+                        return Err(Error::Bug(format!("join: map entry {map_name}[{key}] is missing in continuation {}", c.id)));
+                    };
+                    vals.push(val.clone());
+                }
+                joined_entries.insert(key.clone(), Self::ite_chain(&conds, vals)?);
+            }
+            map_state.insert(map_name.clone(), joined_entries);
+        }
+
+        let final_formula = Self::ite_chain(&conds, cands.iter().map(|c| c.final_formula.clone()).collect())?;
+
+        let mut var_accesses = HashSet::new();
+        let mut map_accesses = HashSet::new();
+        let mut reachable_map_reads = HashSet::new();
+        let mut reachable_map_writes = HashSet::new();
+        let mut reachable_var_reads = HashSet::new();
+        let mut reachable_var_writes = HashSet::new();
+        let mut pre_map_state : HashMap<FullName, HashSet<SymOp>> = HashMap::new();
+        let mut pre_var_state : HashMap<FullName, SymOp> = HashMap::new();
+        let mut asset_written = false;
+        for c in cands.iter() {
+            let snapshot = c.snapshot_access_state(None);
+            var_accesses.extend(snapshot.var_accesses.into_iter());
+            map_accesses.extend(snapshot.map_accesses.into_iter());
+            reachable_map_reads.extend(c.reachable_map_reads.iter().cloned());
+            reachable_map_writes.extend(c.reachable_map_writes.iter().cloned());
+            reachable_var_reads.extend(c.reachable_var_reads.iter().cloned());
+            reachable_var_writes.extend(c.reachable_var_writes.iter().cloned());
+            for (map_name, keys) in c.pre_map_state.iter() {
+                pre_map_state.entry(map_name.clone()).or_insert_with(HashSet::new).extend(keys.iter().cloned());
+            }
+            for (name, val) in c.pre_var_state.iter() {
+                pre_var_state.entry(name.clone()).or_insert_with(|| val.clone());
+            }
+            asset_written = asset_written || c.asset_written;
+        }
+
+        let mut lineage = first.lineage.clone();
+        for c in cands[1..].iter() {
+            lineage.extend(c.parent.iter().cloned());
+            lineage.extend(c.lineage.iter().cloned());
+        }
+        let joined = Self {
+            id: next_cont_id(),
+            function_path: Some(format!("{}.JOIN({})", first.get_function_path(), ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(","))),
+            current_line: first.current_line.clone(),
+            current_function: first.current_function.clone(),
+            bound_formulae,
+            dropped_formulae: first.dropped_formulae.clone(),
+            predicate,
+            final_formula,
+            tx_sender: Some(first.get_tx_sender()),
+            contract_caller: Some(first.get_contract_caller()),
+            tx_sponsor: Some(first.get_tx_sponsor()),
+            current_contract: Some(first.get_current_contract()),
+            parent: first.parent.clone(),
+            caller: first.caller.clone(),
+            pre_var_state,
+            var_state,
+            pre_map_state,
+            map_state,
+            map_tombstones: first.map_tombstones.clone(),
+            map_accesses,
+            var_accesses,
+            reachable_map_reads,
+            reachable_map_writes,
+            reachable_var_reads,
+            reachable_var_writes,
+            panicking: false,
+            early_return: false,
+            asset_written,
+            lineage,
+        };
+        info!("Joined continuations {} to produce {}", ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(","), joined.id);
+        debug!("Joined continuation {} ({}): result={} chars, predicate={} chars",
+            joined.id, joined.get_function_path(), joined.final_formula.to_string().len(), joined.predicate.to_string().len());
+        Ok(joined)
     }
 }
 
@@ -9161,6 +10028,9 @@ pub struct Symbex {
     evaluated_functions: HashMap<FullName, Vec<Continuation>>,
     /// combine continuations that have the same halting states and final formulae
     combine_continuations: bool,
+    /// join continuations that differ, recording the difference as an `(if ..)` in
+    /// their values (see `Continuation::join`)
+    join_continuations: bool,
     /// @clairvoyance program context
     command_context: CommandContext
 }
@@ -9423,11 +10293,93 @@ impl Symbex {
                 }
             }
 
+            if self.join_continuations {
+                return self.join_pass(combined);
+            }
             return combined;
+        }
+        else if self.join_continuations && !past_deadline {
+            return self.join_pass(filtered_conts);
         }
         else {
             return filtered_conts;
         }
+    }
+
+    /// Join the running continuations that can be joined (see
+    /// `Continuation::join`), leaving the rest as they are. Like combining,
+    /// this is an optimisation: if a join fails (most often the deadline,
+    /// raised from a simplify inside it) the set is handed back untouched.
+    fn join_pass(&self, conts: Vec<Continuation>) -> Vec<Continuation> {
+        if conts.len() < 2 {
+            return conts;
+        }
+        let keys : Vec<Option<u64>> = conts
+            .iter()
+            .map(|c| if c.halted() { None } else { Some(c.join_key_hash()) })
+            .collect();
+        let mut by_key : HashMap<u64, Vec<usize>> = HashMap::new();
+        for (i, key) in keys.iter().enumerate() {
+            if let Some(key) = key {
+                by_key.entry(*key).or_insert_with(Vec::new).push(i);
+            }
+        }
+
+        // greedy grouping: each continuation joins the first group it fits
+        let mut group_of : Vec<Option<usize>> = vec![None; conts.len()];
+        let mut groups : Vec<Vec<usize>> = vec![];
+        for i in 0..conts.len() {
+            let Some(key) = keys[i] else {
+                continue;
+            };
+            if group_of[i].is_some() {
+                continue;
+            }
+            let g = groups.len();
+            groups.push(vec![i]);
+            group_of[i] = Some(g);
+            for j in by_key.get(&key).map(|v| v.as_slice()).unwrap_or(&[]).iter().copied() {
+                if j <= i || group_of[j].is_some() {
+                    continue;
+                }
+                if conts[i].can_join_with(&conts[j]) {
+                    groups[g].push(j);
+                    group_of[j] = Some(g);
+                }
+            }
+        }
+
+        let mut joined : Vec<Option<Continuation>> = vec![];
+        for group in groups.iter() {
+            if group.len() < 2 {
+                joined.push(None);
+                continue;
+            }
+            let cands : Vec<&Continuation> = group.iter().map(|i| &conts[*i]).collect();
+            let others : Vec<&Continuation> = (0..conts.len()).filter(|i| !group.contains(i)).map(|i| &conts[i]).collect();
+            match Continuation::join(&cands, &others) {
+                Ok(c) => joined.push(Some(c)),
+                Err(e) => {
+                    warn!("Could not join continuations, keeping them apart: {e:?}");
+                    return conts;
+                }
+            }
+        }
+
+        let mut out = vec![];
+        for (i, cont) in conts.into_iter().enumerate() {
+            match group_of[i] {
+                // the group's joined continuation stands in for every
+                // member, and is emitted where its first member was
+                Some(g) if groups[g].len() >= 2 => {
+                    if let Some(j) = joined[g].take() {
+                        out.push(j);
+                    }
+                }
+                _ => out.push(cont),
+            }
+        }
+        out
     }
     
     /// Apply all (@clairvoyance ..) commands for a symbolic expression and its computed
@@ -12783,26 +13735,81 @@ impl Symbex {
                                     let Some(target_func_name) = lv.get(2).ok_or_else(|| Error::Bug("No function name".into()))?.match_atom() else {
                                         return Err(Error::Bug(format!("contract-call function name not found: {:?}", &lv.get(2))));
                                     };
-                                    let target_func_name_and_args = lv.get(2..).ok_or_else(|| Error::Bug("No function args".into()))?;
+                                    let arg_symexps = lv.get(3..).unwrap_or(&[]);
 
-                                    let mut cc_cont = Continuation::from_parent(Rc::new(continuation), function_name.clone(), body.span.start_line);
-
-                                    let old_contract_caller = cc_cont.get_contract_caller();
-                                    let old_current_contract = cc_cont.get_current_contract();
-
-                                    cc_cont.contract_caller = Some(SymOp::Constant(Value::Principal(cc_cont.get_current_contract())));
-                                    cc_cont.current_contract = Some(contract_principal.clone());
-
-                                    let mut conts = match self.eval_contract_function(cc_cont, target_func_name, target_func_name_and_args, body.span.start_line)? {
-                                        Ok(conts) => conts,
-                                        Err(_) => {
-                                            return Err(Error::Bug(format!("contract-call? to unknown user-defined function {target_func_name} in {contract_principal}")));
+                                    // The arguments belong to the caller: a
+                                    // `current-contract`, `contract-caller`
+                                    // or `var-get` among them means the
+                                    // caller's, so they are evaluated before
+                                    // the switch to the callee. Each value is
+                                    // then bound to an atom of its own and the
+                                    // call is made with those atoms, so the
+                                    // callee's paths never evaluate an
+                                    // argument expression in the wrong
+                                    // contract.
+                                    let parent_func = continuation.function_path.clone().unwrap_or("".to_string());
+                                    let mut arg_conts = vec![(continuation, vec![])];
+                                    for (i, symexp) in arg_symexps.iter().enumerate() {
+                                        let mut next_arg_conts = vec![];
+                                        for (cont, symops) in arg_conts.into_iter() {
+                                            if cont.halted() {
+                                                next_arg_conts.push((cont, symops));
+                                                continue;
+                                            }
+                                            let evaled = self.eval(Continuation::from_parent(Rc::new(cont), format!("{parent_func}/{function_name}.arg[{i}]"), symexp.span.start_line), symexp)?;
+                                            for evaled_cont in evaled.into_iter() {
+                                                let mut branch_symops : Vec<SymOp> = symops.clone();
+                                                if !evaled_cont.halted() {
+                                                    branch_symops.push(evaled_cont.final_formula.clone());
+                                                }
+                                                next_arg_conts.push((evaled_cont, branch_symops));
+                                            }
                                         }
-                                    };
+                                        arg_conts = next_arg_conts;
+                                    }
 
-                                    for cont in conts.iter_mut() {
-                                        cont.contract_caller = Some(old_contract_caller.clone());
-                                        cont.current_contract = Some(old_current_contract.clone());
+                                    let mut bound_names = vec![];
+                                    let mut bound_args = vec![lv[2].clone()];
+                                    for (i, symexp) in arg_symexps.iter().enumerate() {
+                                        let name : ClarityName = format!("contract-call-arg-{i}").as_str().try_into()?;
+                                        let mut atom = SymbolicExpression::atom(name.clone());
+                                        atom.span = symexp.span.clone();
+                                        bound_names.push(name);
+                                        bound_args.push(atom);
+                                    }
+
+                                    let mut conts = vec![];
+                                    for (cont, symops) in arg_conts.into_iter() {
+                                        if cont.halted() {
+                                            conts.push(cont);
+                                            continue;
+                                        }
+                                        let mut cc_cont = Continuation::from_parent(Rc::new(cont), function_name.clone(), body.span.start_line);
+
+                                        let old_contract_caller = cc_cont.get_contract_caller();
+                                        let old_current_contract = cc_cont.get_current_contract();
+
+                                        for (name, symop) in bound_names.iter().zip(symops.into_iter()) {
+                                            cc_cont.bind_symop(name, symop.simplify()?);
+                                        }
+                                        cc_cont.contract_caller = Some(SymOp::Constant(Value::Principal(cc_cont.get_current_contract())));
+                                        cc_cont.current_contract = Some(contract_principal.clone());
+
+                                        let called = match self.eval_contract_function(cc_cont, target_func_name, &bound_args, body.span.start_line)? {
+                                            Ok(conts) => conts,
+                                            Err(_) => {
+                                                return Err(Error::Bug(format!("contract-call? to unknown user-defined function {target_func_name} in {contract_principal}")));
+                                            }
+                                        };
+
+                                        for mut called_cont in called.into_iter() {
+                                            called_cont.contract_caller = Some(old_contract_caller.clone());
+                                            called_cont.current_contract = Some(old_current_contract.clone());
+                                            for name in bound_names.iter() {
+                                                called_cont.unbind(name);
+                                            }
+                                            conts.push(called_cont);
+                                        }
                                     }
                                     conts
                                 }
@@ -13163,6 +14170,7 @@ impl Symbex {
             drop_early_returns: HashSet::new(),
             evaluated_functions: HashMap::new(),
             combine_continuations: true,
+            join_continuations: false,
             command_context: CommandContext::new()
         };
         Ok(symbex)
@@ -13218,6 +14226,17 @@ impl Symbex {
    
     pub fn combine_continuations(mut self, combine: bool) -> Self {
         self.combine_continuations = combine;
+        self
+    }
+
+    /// Join the paths that a function's forks produce into one continuation
+    /// per call, with `(if ..)`-valued results (see `Continuation::join`).
+    /// Turns the path count of a function from exponential in its forks to
+    /// linear, at the price of larger formulae. Also switches the simplifier
+    /// into join mode (see `set_join_paths`).
+    pub fn join_continuations(mut self, join: bool) -> Self {
+        self.join_continuations = join;
+        set_join_paths(join);
         self
     }
 

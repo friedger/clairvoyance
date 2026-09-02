@@ -1818,7 +1818,7 @@ fn test_bind_symbol() {
     let symop = SymOp::ToInt(vu("x"));
     let simplified = symop
         .clone()
-        .bind_symbol("x".try_into().unwrap(), *cu(3))
+        .bind_symbol(&"x".try_into().unwrap(), &*cu(3))
         .simplify()
         .unwrap();
 
@@ -1831,7 +1831,7 @@ fn test_bind_symbol() {
     let symop = SymOp::ToInt(vu("x"));
     let simplified = symop
         .clone()
-        .bind_symbol("x".try_into().unwrap(), *add2(vu("y"), cu(3)))
+        .bind_symbol(&"x".try_into().unwrap(), &*add2(vu("y"), cu(3)))
         .simplify()
         .unwrap();
 
@@ -1844,8 +1844,8 @@ fn test_bind_symbol() {
     let symop = add(vec![vu("x"), vu("y"), cu(3)]);
     let simplified = symop
         .clone()
-        .bind_symbol("x".try_into().unwrap(), *cu(1))
-        .bind_symbol("y".try_into().unwrap(), *cu(2))
+        .bind_symbol(&"x".try_into().unwrap(), &*cu(1))
+        .bind_symbol(&"y".try_into().unwrap(), &*cu(2))
         .simplify()
         .unwrap();
 
@@ -1858,7 +1858,7 @@ fn test_bind_symbol() {
     let symop = lm("foo", add2(vu("x"), cu(3)), add2(vu("y"), cu(6)));
     let simplified = symop
         .clone()
-        .bind_symbol("y".try_into().unwrap(), *cu(5))
+        .bind_symbol(&"y".try_into().unwrap(), &*cu(5))
         .simplify()
         .unwrap();
 
@@ -6383,4 +6383,30 @@ fn test_induct_discriminates_across_contracts() {
 #[test]
 fn test_induct_or_is_not_and() {
     assert_verdicts("or-invariant.clar", &[], 4, 0, 4);
+}
+
+/// The arguments of a `contract-call?` are the caller's: `current-contract`
+/// among them is the caller, not the callee. The engine once switched
+/// contracts before evaluating them, so an invariant that read the token's
+/// balance of `current-contract` read the token's balance of *itself* --
+/// consistently with a mutator that did the same, which is why `deposit`
+/// proved either way. The two mutators that tell the difference are checked
+/// one at a time, since the totals happen to match.
+#[test]
+fn test_induct_contract_call_args_are_the_callers() {
+    let dep = concat!(
+        "SP000000000000000000002Q6VF78.token:",
+        env!("CARGO_MANIFEST_DIR"),
+        "/../examples/caller-context-token.clar"
+    );
+    assert_verdicts("caller-context.clar", &["--dep", dep], 2, 0, 2);
+    assert_verdicts("caller-context.clar", &["--dep", dep, "--mutator", "deposit-via-caller"], 1, 0, 0);
+    assert_verdicts("caller-context.clar", &["--dep", dep, "--mutator", "mint-to-token"], 0, 0, 1);
+}
+
+#[test]
+fn test_induct_arguments_are_bound_at_the_call_site() {
+    // cash-out passes `debit` the balance it read before zeroing the record;
+    // the amount must not be re-read against the zeroed record.
+    assert_verdicts("stale-argument.clar", &[], 2, 0, 0);
 }

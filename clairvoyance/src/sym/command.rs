@@ -356,7 +356,7 @@ impl CommandContext {
     pub fn parse_symop(&self, expr: &SymbolicExpression) -> Result<SymOp, Error> {
         let mut symop = SymOp::try_from(expr)?;
         for (name, op) in self.defined_formulae.iter() {
-            symop = *symop.bind_symbol(name.clone().into(), op.clone());
+            symop = *symop.bind_symbol(&name.clone().into(), op);
         }
         Ok(symop)
     }

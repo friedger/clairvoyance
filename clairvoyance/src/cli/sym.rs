@@ -23,6 +23,8 @@ use crate::sym::Symbex;
 use crate::sym::Continuation;
 use crate::sym::Callgraph;
 use crate::sym::FullName;
+use crate::sym::SymOp;
+use crate::sym::Predicate;
 use crate::core::Error;
 use crate::cli;
 
@@ -58,6 +60,10 @@ fn exec_user_function(
     // current path. This one *can* hide a write, so anything reasoning about
     // state across a call has to leave it off.
     skip_causally_independent: bool,
+    // Join the paths a function forks into back into one continuation with
+    // `(if ..)`-valued results, instead of one continuation per path. See
+    // `Continuation::join`.
+    join_paths: bool,
     step_budget: Option<u64>,
     time_budget_secs: Option<u64>
 ) -> Result<Vec<Continuation>, Error> {
@@ -81,7 +87,8 @@ fn exec_user_function(
         .with_contract_caller(contract_caller)
         .with_function_call_exploration(!skip_functions)
         .skip_pure(skip_pure)
-        .skip_causally_independent(skip_causally_independent);
+        .skip_causally_independent(skip_causally_independent)
+        .join_continuations(join_paths);
     symbex.step_budget = step_budget;
     if let Some(secs) = time_budget_secs {
         symbex.time_budget_secs = secs;
@@ -529,6 +536,7 @@ fn cli_eval_user_function(argv: &[String]) -> (i32, String) {
         skip_functions,
         !full_explore_opt.is_some(),
         !full_explore_opt.is_some(),
+        false,
         step_budget,
         time_budget
     ) {
@@ -669,17 +677,27 @@ fn function_params(
 const INDUCT_PRE_SENTINEL: &str = "u340282366920938463463374607431768211454";
 const INDUCT_POST_SENTINEL: &str = "u340282366920938463463374607431768211455";
 
-/// Build a harness function, appended to the contract, that assumes the
-/// invariant on entry, runs the mutator with fresh symbolic arguments, and
-/// asserts the invariant still holds. If the invariant can fail afterwards,
-/// the harness returns the post-sentinel error on that path.
-///
-///   (define-public (HARNESS <mut-params> <inv-params>)
-///       (begin
-///           (asserts! (INV <inv-args>) (err PRE))     ;; assume it held on entry
-///           (unwrap-panic (MUT <mut-args>))           ;; run the mutator
-///           (asserts! (INV <inv-args>) (err POST))    ;; it must still hold
-///           (ok true)))
+
+/// One NOT PROVEN line: the mutator, why the solver did not close it, and the
+/// condition under which the post-check fails. A big sub-formula the engine
+/// named prints by its name; `full_conditions` spells the names out beneath.
+fn print_not_proven(mutator: &str, violation: &Predicate, why: &str, full_conditions: bool) {
+    let cond = format!("{violation}");
+    let cond = cond.split_whitespace().collect::<Vec<_>>().join(" ");
+    let cond = if !full_conditions && cond.len() > 160 {
+        format!("{}... (--full-conditions for the rest)", &cond[..160])
+    } else {
+        cond
+    };
+    print_now(&format!("  NOT PROVEN {mutator}  ({why}; fails when: {cond})\n"));
+    if full_conditions {
+        for (n, def) in violation.clone().as_symop().names() {
+            let def = format!("{def}").split_whitespace().collect::<Vec<_>>().join(" ");
+            print_now(&format!("             where n{:016x}{:016x} = {def}\n", n.0, n.1));
+        }
+    }
+}
+
 /// Print a line of the report as soon as it is known, rather than collecting
 /// the whole report and showing it at the end.
 fn print_now(line: &str) {
@@ -687,12 +705,73 @@ fn print_now(line: &str) {
     let _ = std::io::Write::flush(&mut std::io::stdout());
 }
 
+/// The leaves of a result and the condition each is reached under: `(err (if
+/// c a b))` is `(err a)` when `c` and `(err b)` when not. `None` is
+/// unconditional. Only `if` and the response constructors are looked
+/// through, which is what the induction harness's sentinels can hide in.
+fn split_ites(formula: &SymOp) -> Vec<(Option<Predicate>, SymOp)> {
+    fn guard_and(guard: &Option<Predicate>, cond: Predicate) -> Option<Predicate> {
+        Some(match guard {
+            Some(g) => g.clone().and(cond),
+            None => cond,
+        })
+    }
+    fn walk(formula: &SymOp, guard: Option<Predicate>, out: &mut Vec<(Option<Predicate>, SymOp)>) {
+        match formula {
+            SymOp::If(c, a, b) => {
+                // A condition the predicate language cannot express is
+                // dropped, which keeps the branch and only loses the guard
+                // that might have ruled it out: never a missed violation.
+                let (then_guard, else_guard) = match (**c).clone().try_as_predicate() {
+                    Ok(p) => (guard_and(&guard, p.clone()), guard_and(&guard, Predicate::Not(Box::new(p)))),
+                    Err(_) => (guard.clone(), guard.clone()),
+                };
+                walk(a, then_guard, out);
+                walk(b, else_guard, out);
+            }
+            SymOp::ConsError(inner) if matches!(**inner, SymOp::If(..)) => {
+                let mut leaves = vec![];
+                walk(inner, guard, &mut leaves);
+                out.extend(leaves.into_iter().map(|(g, leaf)| (g, SymOp::ConsError(Box::new(leaf)))));
+            }
+            SymOp::ConsOkay(inner) if matches!(**inner, SymOp::If(..)) => {
+                let mut leaves = vec![];
+                walk(inner, guard, &mut leaves);
+                out.extend(leaves.into_iter().map(|(g, leaf)| (g, SymOp::ConsOkay(Box::new(leaf)))));
+            }
+            leaf => out.push((guard, leaf.clone())),
+        }
+    }
+    let mut out = vec![];
+    walk(formula, None, &mut out);
+    out
+}
+
+/// Build a harness function, appended to the contract, that assumes the
+/// invariant on entry, runs the mutator with fresh symbolic arguments, and
+/// asserts the invariant still holds. If the invariant can fail afterwards,
+/// the harness returns the post-sentinel error on that path.
+///
+///   (define-public (HARNESS <mut-params> <inv-params> <assumed-params>)
+///       (begin
+///           (asserts! (INV <inv-args>) (err PRE))     ;; assume it held on entry
+///           (asserts! (A1 <a1-args>) (err PRE))       ;; and the other invariants
+///           ...
+///           (unwrap-panic (MUT <mut-args>))           ;; run the mutator
+///           (asserts! (INV <inv-args>) (err POST))    ;; it must still hold
+///           (ok true)))
+///
+/// `assumed` are the other invariants taken to hold on entry (`--assume`).
+/// An assumed invariant shares the checked one's arguments where the types
+/// line up -- the member the invariant is about is the member the others are
+/// assumed for -- and gets fresh ones otherwise.
 fn build_induction_harness(
     harness_name: &str,
     mutator: &str,
     mut_param_types: &[String],
     invariant: &str,
     inv_param_types: &[String],
+    assumed: &[(String, Vec<String>)],
 ) -> String {
     let mut sig = String::new();
     let mut mut_args = String::new();
@@ -705,10 +784,28 @@ fn build_induction_harness(
         sig.push_str(&format!(" (i{i} {ty})"));
         inv_args.push_str(&format!(" i{i}"));
     }
+    let mut assumptions = String::new();
+    for (j, (name, param_types)) in assumed.iter().enumerate() {
+        let mut args = String::new();
+        for (k, ty) in param_types.iter().enumerate() {
+            if inv_param_types.get(k) == Some(ty) {
+                args.push_str(&format!(" i{k}"));
+            }
+            else {
+                sig.push_str(&format!(" (a{j}_{k} {ty})"));
+                args.push_str(&format!(" a{j}_{k}"));
+            }
+        }
+        assumptions.push_str(&format!(
+            "    (asserts! ({name}{args}) (err {pre}))\n",
+            pre = INDUCT_PRE_SENTINEL,
+        ));
+    }
     format!(
         "\n(define-public ({harness_name}{sig})\n  \
            (begin\n    \
-             (asserts! ({invariant}{inv_args}) (err {pre}))\n    \
+             (asserts! ({invariant}{inv_args}) (err {pre}))\n\
+             {assumptions}    \
              (unwrap-panic ({mutator}{mut_args}))\n    \
              (asserts! ({invariant}{inv_args}) (err {post}))\n    \
              (ok true)))\n",
@@ -823,6 +920,7 @@ fn cli_check(argv: &[String]) -> (i32, String) {
             skip_functions.clone(),
             !full_explore_opt.is_some(),
             !full_explore_opt.is_some(),
+            false,
             step_budget,
             time_budget,
         );
@@ -961,12 +1059,35 @@ fn cli_induct(argv: &[String]) -> (i32, String) {
     while let Ok(Some(name)) = cli::consume_arg(&mut remaining_args, &["--mutator"], true) {
         mutators.push(name);
     }
+    // The other invariants, taken to hold on entry. An invariant is often
+    // preserved only because of another -- a member cannot be settled past
+    // an epoch that does not exist because epochs are only ever created at
+    // the pool's count -- and checking each alone proves neither. Assuming
+    // the rest is the usual way out: the *conjunction* is what is shown
+    // inductive, and it is only shown so once every invariant in it holds
+    // under the same assumptions.
+    let mut assumed = vec![];
+    while let Ok(Some(name)) = cli::consume_arg(&mut remaining_args, &["--assume"], true) {
+        assumed.push(name);
+    }
+    let assume_all = match cli::consume_arg(&mut remaining_args, &["--assume-all"], false) {
+        Ok(v) => v.is_some(),
+        Err(e) => return (1, e),
+    };
 
     // An SMT solver decides the paths the simplifier cannot. It may only ever
     // turn NOT PROVEN into HOLDS -- see the `smt` module on why `Unsat` is the
     // only trustworthy answer -- so running without one is always safe.
     let Ok(no_smt) = cli::consume_arg(&mut remaining_args, &["--no-smt"], false) else {
         return (1, "Could not parse --no-smt".into());
+    };
+    // Path joining is what lets a mutator with a long chain of forks (a
+    // settlement loop, say) finish at all; it changes the shape of the
+    // formulae but not what they mean. `--no-join` is there to compare
+    // against, and for a contract where the joined formulae grow faster than
+    // the paths did.
+    let Ok(no_join) = cli::consume_arg(&mut remaining_args, &["--no-join"], false) else {
+        return (1, "Could not parse --no-join".into());
     };
     let solver_override = match cli::consume_arg(&mut remaining_args, &["--solver"], true) {
         Ok(v) => v,
@@ -1015,6 +1136,16 @@ fn cli_induct(argv: &[String]) -> (i32, String) {
     if invariants.is_empty() {
         invariants = readonlys.iter().filter(|n| n.starts_with("invariant-")).cloned().collect();
     }
+    if assume_all {
+        assumed = readonlys.iter().filter(|n| n.starts_with("invariant-")).cloned().collect();
+    }
+    let mut assumed_with_params = vec![];
+    for name in assumed.iter() {
+        match function_params(&contract_id, &src, name) {
+            Ok(Some(p)) => assumed_with_params.push((name.clone(), p)),
+            _ => return (1, format!("--assume {name}: no such read-only function")),
+        }
+    }
     if mutators.is_empty() {
         mutators = publics.clone();
     }
@@ -1046,6 +1177,9 @@ fn cli_induct(argv: &[String]) -> (i32, String) {
          (does each mutator preserve each invariant?)\n\
          decided by: {engine}"
     );
+    if !assumed.is_empty() {
+        println!("assuming on entry: {}", assumed.join(", "));
+    }
     let _ = std::io::Write::flush(&mut std::io::stdout());
 
     for inv in invariants.iter() {
@@ -1060,7 +1194,9 @@ fn cli_induct(argv: &[String]) -> (i32, String) {
                 _ => { print_now(&format!("  SKIP       {mutator}  (not found)\n")); n_skipped += 1; continue; }
             };
             let harness_name = format!("clv-induct-{mutator}-{inv}");
-            let harness = build_induction_harness(&harness_name, mutator, &mut_params, inv, &inv_params);
+            // The invariant under check is assumed by the harness already.
+            let assumed_here : Vec<(String, Vec<String>)> = assumed_with_params.iter().filter(|(n, _)| n != inv).cloned().collect();
+            let harness = build_induction_harness(&harness_name, mutator, &mut_params, inv, &inv_params, &assumed_here);
             let src2 = format!("{src}{harness}");
 
             let res = exec_user_function(
@@ -1080,44 +1216,84 @@ fn cli_induct(argv: &[String]) -> (i32, String) {
                 // caught; examples/inductive.clar is the cheapest check.
                 true,
                 false,
+                no_join.is_none(),
                 step_budget,
                 time_budget,
             );
             match res {
                 Ok(conts) => {
-                    let violations: Vec<_> = conts.iter()
-                        .filter(|c| format!("{}", c.final_formula) == post_err)
-                        .collect();
+                    // The conditions under which the harness returns the
+                    // post-condition sentinel. Usually one per continuation
+                    // whose result *is* the sentinel; with path joining a
+                    // result can be `(if c (ok true) (err POST))`, and then
+                    // the condition is the continuation's together with the
+                    // branch's.
+                    let mut violations: Vec<Predicate> = vec![];
+                    for c in conts.iter() {
+                        for (guard, leaf) in split_ites(&c.final_formula) {
+                            if format!("{leaf}") != post_err {
+                                continue;
+                            }
+                            let cond = match guard {
+                                Some(g) => c.predicate.clone().and(g),
+                                None => c.predicate.clone(),
+                            };
+                            let cond = cond.clone().simplify().unwrap_or(cond);
+                            if cond != Predicate::False {
+                                violations.push(cond);
+                            }
+                        }
+                    }
                     if violations.is_empty() {
                         n_holds += 1;
                         print_now(&format!("  HOLDS      {mutator}\n"));
-                    } else if violations.iter().any(|c| format!("{}", c.predicate).trim() == "true") {
+                    } else if violations.iter().any(|p| format!("{p}").trim() == "true") {
                         n_violated += 1;
                         print_now(&format!("  VIOLATED   {mutator}  (unconditionally)\n"));
-                    } else if solver.as_ref().is_some_and(|s| {
+                    } else {
                         // The simplifier could not rule these paths out. Ask a
                         // solver. Only `Unsat` counts: the translation is an
                         // over-approximation, so `Sat` proves nothing (see the
                         // `smt` module). Every violating path must be
-                        // infeasible for the invariant to be preserved.
-                        violations.iter().all(|c| {
-                            crate::smt::predicate_is_unsat(&c.predicate, s) == crate::smt::Answer::Unsat
-                        })
-                    }) {
-                        n_holds += 1;
-                        n_holds_smt += 1;
-                        print_now(&format!("  HOLDS      {mutator}  (by solver)\n"));
-                    } else {
-                        n_unproven += 1;
-                        let cond = format!("{}", violations[0].predicate);
-                        let cond = cond.split_whitespace().collect::<Vec<_>>().join(" ");
-                        let cond = if !full_conditions && cond.len() > 160 {
-                            format!("{}... (--full-conditions for the rest)", &cond[..160])
+                        // infeasible for the invariant to be preserved, so
+                        // stop at the first one that is not.
+                        let mut undecided = 0;
+                        let mut answer = None;
+                        if let Some(s) = solver.as_ref() {
+                            for (i, p) in violations.iter().enumerate() {
+                                let a = crate::smt::predicate_is_unsat(p, s);
+                                if a != crate::smt::Answer::Unsat {
+                                    undecided = i;
+                                    answer = Some(a);
+                                    break;
+                                }
+                            }
+                        } else {
+                            answer = Some(crate::smt::Answer::Unknown);
                         }
-                        else {
-                            cond
-                        };
-                        print_now(&format!("  NOT PROVEN {mutator}  (fails when: {cond})\n"));
+                        match answer {
+                            None => {
+                                n_holds += 1;
+                                n_holds_smt += 1;
+                                print_now(&format!("  HOLDS      {mutator}  (by solver)\n"));
+                            }
+                            Some(answer) => {
+                                n_unproven += 1;
+                                // Say what the solver made of it: `sat` means
+                                // the over-approximation has a model, which
+                                // may or may not be a real path; `unknown`
+                                // means it ran out of time or could not
+                                // start, and a bigger --solver-timeout might
+                                // decide it.
+                                let why = match (solver.as_ref(), answer) {
+                                    (None, _) => "no solver".to_string(),
+                                    (Some(_), crate::smt::Answer::Sat) => "solver: sat".to_string(),
+                                    (Some(_), _) => "solver: unknown".to_string(),
+                                };
+                                let violation = &violations[undecided];
+                                print_not_proven(mutator, violation, &why, full_conditions);
+                            }
+                        }
                     }
                 }
                 Err(Error::TimedOut(secs)) => {
@@ -1272,8 +1448,9 @@ fn sym_help() -> String {
      \x20            read-only named invariant-* is used; with no --mutator, every public\n\
      \x20            function. Reports UNFINISHED for a pair that ran past --max-steps.\n\
      \x20            Options: --invariant NAME, --mutator NAME (both repeatable),\n\
-     \x20            --solver PATH, --no-smt, --time-budget SECONDS, --max-steps N,\n\
-     \x20            --full-conditions.\n\
+     \x20            --assume NAME (repeatable) or --assume-all to take the other\n\
+     \x20            invariants as holding on entry, --solver PATH, --no-smt, --no-join,\n\
+     \x20            --time-budget SECONDS, --max-steps N, --full-conditions.\n\
      \x20 exec-func  Symbolically execute FUNCTION and print every terminating state\n\
      \x20            (path predicate, return value, and state writes). Also enforces any\n\
      \x20            (@clairvoyance ...) spec, like `check`, but prints the raw states.\n\
@@ -1304,6 +1481,9 @@ fn sym_help() -> String {
      \x20                              else z3 or cvc5 if one is on PATH.\n\
      \x20 --no-smt                     (induct only) do not use a solver, even if one is\n\
      \x20                              installed.\n\
+     \x20 --no-join                    (induct only) keep one path per fork instead of\n\
+     \x20                              joining the paths of a call into one (if ..)-valued\n\
+     \x20                              result. Slower on branchy code; for comparison.\n\
      \x20 --time-budget SECONDS        Give up after this long and report the run as\n\
      \x20                              unfinished, rather than exploring forever.\n\
      \x20                              Defaults to 60s, per (invariant, mutator) pair for\n\

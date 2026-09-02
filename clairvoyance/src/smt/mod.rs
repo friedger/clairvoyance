@@ -238,7 +238,22 @@ impl<'a> Encoder<'a> {
                 | SymOp::IsErr(..)
                 | SymOp::IsSome(..)
                 | SymOp::IsNone(..)
-        )
+        ) || matches!(op, SymOp::If(_, a, b) if Self::looks_bool(a) || Self::looks_bool(b))
+          || matches!(op, SymOp::Named(_, def) if Self::looks_bool(def))
+    }
+
+    /// A named formula: an uninterpreted constant like any other leaf, plus
+    /// the fact that it equals its definition, asserted once per name.
+    fn named(&mut self, op: &SymOp, def: &SymOp, is_bool: bool) -> SExpr {
+        let key = (is_bool, op.to_string());
+        if let Some(existing) = self.leaves.get(&key) {
+            return *existing;
+        }
+        let constant = self.leaf(op, is_bool);
+        let value = if is_bool { self.to_bool(def) } else { self.to_int(def) };
+        let defined = self.ctx.eq_many(vec![constant, value]);
+        self.side.push(defined);
+        constant
     }
 
     fn to_int(&mut self, op: &SymOp) -> SExpr {
@@ -291,6 +306,13 @@ impl<'a> Encoder<'a> {
                     _ => self.leaf(op, false),
                 }
             }
+            SymOp::If(c, a, b) => {
+                let c = self.to_bool(c);
+                let a = self.to_int(a);
+                let b = self.to_int(b);
+                self.ctx.ite(c, a, b)
+            }
+            SymOp::Named(_, def) => self.named(op, def, false),
             other => self.leaf(other, false),
         }
     }
@@ -298,6 +320,13 @@ impl<'a> Encoder<'a> {
     fn to_bool(&mut self, op: &SymOp) -> SExpr {
         match op {
             SymOp::Constant(Value::Bool(true)) => self.ctx.true_(),
+            SymOp::If(c, a, b) => {
+                let c = self.to_bool(c);
+                let a = self.to_bool(a);
+                let b = self.to_bool(b);
+                self.ctx.ite(c, a, b)
+            }
+            SymOp::Named(_, def) => self.named(op, def, true),
             SymOp::Constant(Value::Bool(false)) => self.ctx.false_(),
             SymOp::And(ops) => {
                 let xs = self.bools(ops);
@@ -309,6 +338,20 @@ impl<'a> Encoder<'a> {
             }
             SymOp::Not(inner) => {
                 let x = self.to_bool(inner);
+                self.ctx.not(x)
+            }
+            // Each of these is exactly the negation of its partner, so encode
+            // the pair through one leaf: `(is-none x)` is `(not (is-some x))`,
+            // and `(is-err x)` is `(not (is-ok x))`. Two opaque leaves would
+            // let the solver set both true.
+            SymOp::IsNone(inner) => {
+                let some = SymOp::IsSome(inner.clone());
+                let x = self.leaf(&some, true);
+                self.ctx.not(x)
+            }
+            SymOp::IsErr(inner) => {
+                let ok = SymOp::IsOkay(inner.clone());
+                let x = self.leaf(&ok, true);
                 self.ctx.not(x)
             }
             SymOp::Greater(a, b) => {
@@ -349,6 +392,14 @@ impl<'a> Encoder<'a> {
 pub fn predicate_is_unsat(predicate: &Predicate, solver: &Solver) -> Answer {
     let mut builder = ContextBuilder::new();
     builder.solver(&solver.program).solver_args(&solver.args);
+    // `CLAIRVOYANCE_SMT_DUMP=dir` keeps every query as SMT-LIB in that
+    // directory, one file per query, for looking at what the solver was asked.
+    if let Ok(dir) = std::env::var("CLAIRVOYANCE_SMT_DUMP") {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let path = std::path::Path::new(&dir).join(format!("query-{n:04}.smt2"));
+        builder.replay_file(std::fs::File::create(path).ok());
+    }
     let mut ctx = match builder.build() {
         Ok(ctx) => ctx,
         Err(e) => {
@@ -383,7 +434,7 @@ pub fn predicate_is_unsat(predicate: &Predicate, solver: &Solver) -> Answer {
         return Answer::Unknown;
     }
 
-    match ctx.check() {
+    let answer = match ctx.check() {
         Ok(Response::Unsat) => Answer::Unsat,
         Ok(Response::Sat) => Answer::Sat,
         Ok(Response::Unknown) => Answer::Unknown,
@@ -391,5 +442,7 @@ pub fn predicate_is_unsat(predicate: &Predicate, solver: &Solver) -> Answer {
             debug!("SMT: solver error: {e}");
             Answer::Unknown
         }
-    }
+    };
+    debug!("SMT: {answer:?} for {predicate}");
+    answer
 }
