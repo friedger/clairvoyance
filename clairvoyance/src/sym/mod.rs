@@ -1089,12 +1089,12 @@ impl SymOp {
     
     pub fn or(self, other: SymOp) -> Self {
         match self {
-            Self::And(mut ops) => {
+            Self::Or(mut ops) => {
                 ops.push(Box::new(other));
-                Self::And(ops)
+                Self::Or(ops)
             }
             x => {
-                Self::And(vec![Box::new(x), Box::new(other)])
+                Self::Or(vec![Box::new(x), Box::new(other)])
             }
         }
     }

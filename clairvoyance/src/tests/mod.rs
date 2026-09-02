@@ -6375,14 +6375,12 @@ fn test_induct_discriminates_across_contracts() {
 }
 
 
-/// The `or`-invariant gap, pinned so a fix is noticed rather than silently
-/// changing behaviour. `invariant-as-if` decides all three mutators; the `or`
-/// spelling of the same property decides none of them. Totals across both:
-/// 2 holds (the `if` form on the two preserving mutators), 4 not-proven.
-///
-/// If this starts failing because the counts went up, the gap is fixed: update
-/// the example's header and these numbers.
+/// `SymOp::or` once built an `And`, so a Clarity `or` was evaluated as `and`
+/// everywhere. Both spellings of the invariant must decide the three plain
+/// mutators the same way (2 holds, 1 not-proven each), and `guarded-break`,
+/// whose `or` guard hides a violating write behind one disjunct, must not come
+/// back HOLDS for either.
 #[test]
-fn test_induct_known_gap_or_invariant() {
-    assert_verdicts("known-gap-or-invariant.clar", &[], 2, 0, 4);
+fn test_induct_or_is_not_and() {
+    assert_verdicts("or-invariant.clar", &[], 4, 0, 4);
 }

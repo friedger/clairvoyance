@@ -252,14 +252,6 @@ Clairvoyance is young, and it is honest about what it cannot yet do:
   compose into the caller. What is not resolved is a read of an *uninitialized*
   slot the caller did not write, and symbolic-key aliasing, so `sym induct`
   reasons best about invariants over data vars and fixed map keys.
-- **An invariant written as a bare `or` is not decided.** Its body is not
-  re-evaluated against what the mutator wrote, so every mutator comes back NOT
-  PROVEN with the same residual — the condition under which the invariant held
-  on *entry*, which says nothing about the mutator. It fails safe: the wrong
-  answer is always NOT PROVEN, never HOLDS. Writing the same property as an
-  `if`, or as `(not (and ...))`, decides it correctly, and
-  [`examples/known-gap-or-invariant.clar`](examples/known-gap-or-invariant.clar)
-  shows the two side by side.
 - **Not every term reaches the solver.** The translation to SMT is a deliberate
   over-approximation: an operation it does not model (hashes, `sqrti`, signed
   division, buffers and sequences) becomes a fresh uninterpreted constant. That
